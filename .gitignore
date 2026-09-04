@@ -2,6 +2,9 @@
 .env
 .env.*
 
+# Local-only files
+src/models.py
+
 # Agent outputs - not tracked in git
 data/
 papers/
