@@ -1,4 +1,6 @@
-# AI Research & Replication Multi-Agent System
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -911,8 +913,6 @@ A failed or imperfect reproduction is still useful research information.
 
 # Repository Organization
 
-A possible initial repository structure is:
-
 ```text
 project-root/
 │
@@ -920,8 +920,11 @@ project-root/
 ├── README.md
 ├── .gitignore
 ├── requirements.txt
+├── run.py                  ← entry point: python run.py "topic"
 │
 ├── src/
+│   ├── config.py           ← env vars, model constants
+│   ├── models.py           ← model registry (all OpenRouter model IDs)
 │   ├── agents/
 │   │   ├── master_agent.py
 │   │   ├── intake_agent.py
@@ -945,50 +948,68 @@ project-root/
 │   │
 │   └── main.py
 │
-├── data/
-│   ├── raw/
-│   └── processed/
-│
-├── papers/
-│   ├── candidates/
-│   └── parent/
-│
-├── replication/
-│   ├── original/
-│   ├── configs/
-│   └── results/
-│
-├── experiments/
-│
-├── reports/
-│
-├── presentations/
-│
-├── logs/
-│
+├── data/raw, data/processed    ← gitignored
+├── papers/candidates, papers/parent  ← gitignored
+├── replication/                ← gitignored
+├── experiments/                ← gitignored
+├── reports/                    ← gitignored
+├── presentations/              ← gitignored
+├── logs/                       ← gitignored (includes project_state.json)
 └── tests/
 ```
 
-This structure may evolve as the architecture becomes clearer.
+---
 
-Do not create unnecessary complexity before it is needed.
+# Run Commands
+
+```bash
+# Activate virtual environment (Windows)
+.venv\Scripts\Activate.ps1
+
+# Run the system interactively
+python run.py
+
+# Run with topic as argument
+python run.py "machine learning for detecting credit card fraud"
+
+# Reset project state and start fresh
+python run.py --reset "new topic"
+
+# Run tests
+pytest
+
+# Run a single test
+pytest tests/test_file.py::test_function_name
+```
+
+---
+
+# Model Usage
+
+Models are defined in `src/models.py` and configured in `src/config.py`.
+
+```python
+DEFAULT_MODEL  # Free model — use during development (no credits required)
+FAST_MODEL     # anthropic/claude-haiku-4.5 — lightweight tasks
+CAPABLE_MODEL  # anthropic/claude-sonnet-4.5 — research, validation, reports
+```
+
+Agents import `DEFAULT_MODEL` from `src/config`. Switch `DEFAULT_MODEL` in `config.py` once OpenRouter credits are loaded.
+
+## Web Search Providers
+
+Agents that search the web use one of two providers:
+
+1. **SerpentAPI** (`SERPENT_API_KEY`) — primary. Use unless rate-limited.
+2. **BraveSearchAPI** (`BRAVE_API_KEY`) — fallback. Limited to **1,000 requests/month**, resets on the **1st of each month**.
+
+Always attempt SerpentAPI first. On rate-limit error, fall back to Brave and log the switch.
 
 ---
 
 # Secrets
 
-Never commit:
-
-* Slack bot tokens
-* API keys
-* Database passwords
-* GitHub tokens
-* Private credentials
-* `.env` files
-
-Use environment variables.
-
-Example:
+All credentials are stored in `.env` (gitignored). See `.env.example` for required variable names:
 
 ```text
 OPENROUTER_API_KEY=
@@ -998,93 +1019,25 @@ SLACK_BOT_TOKEN=
 SLACK_CHANNEL_ID=
 ```
 
-Store these in `.env`.
-
-The `.env` file must remain excluded by `.gitignore`.
-
-Provide an `.env.example` containing variable names but no real credentials.
-
----
-
-# Web Search Providers
-
-Agents that need to search the web must use one of two providers, loaded from environment variables.
-
-## Provider Priority
-
-1. **SerpentAPI** — primary provider. Use this unless rate-limited.
-2. **BraveSearchAPI** — fallback. Limited to **1,000 requests per month**, resetting on the **1st of each month**. Use only when SerpentAPI is unavailable or rate-limited.
-
-## Usage Rule
-
-Always attempt SerpentAPI first. If SerpentAPI returns a rate-limit error, switch to BraveSearchAPI for that request and log the fallback so usage can be monitored.
-
-Do not default to BraveSearchAPI simply because it is easier — preserve its monthly quota.
-
-## Environment Variables
-
-```text
-SERPENT_API_KEY=    # Primary search provider
-BRAVE_API_KEY=      # Fallback — 1,000 req/month, resets 1st of month
-```
-
 ---
 
 # Development Philosophy
 
-Build incrementally.
+Build incrementally. Do not attempt to build the entire multi-agent platform at once.
 
-Do not attempt to build the entire multi-agent platform at once.
+## Milestones
 
-Recommended development sequence:
-
-## Milestone 1
-
-Create a command-line program that accepts a research topic.
-
-## Milestone 2
-
-Implement one Research Agent that can return structured paper candidates.
-
-## Milestone 3
-
-Add paper validation.
-
-## Milestone 4
-
-Add Parent Paper selection.
-
-## Milestone 5
-
-Add the Master Agent.
-
-## Milestone 6
-
-Add Slack status reporting.
-
-## Milestone 7
-
-Add code discovery.
-
-## Milestone 8
-
-Add replication workflow.
-
-## Milestone 9
-
-Add experiment management.
-
-## Milestone 10
-
-Add report generation.
-
-## Milestone 11
-
-Add presentation generation.
-
-Do not overengineer early versions.
-
-A functioning simple system is preferable to a complicated system that cannot complete the workflow.
+1. CLI entry point that accepts a research topic ✅
+2. Research Agent — returns structured paper candidates
+3. Paper validation
+4. Parent Paper selection
+5. Master Agent
+6. Slack status reporting
+7. Code discovery
+8. Replication workflow
+9. Experiment management
+10. Report generation
+11. Presentation generation
 
 ---
 
@@ -1098,48 +1051,26 @@ When working in this repository:
 4. Keep modules focused.
 5. Prefer readable Python over clever abstractions.
 6. Add type hints when useful.
-7. Use clear names.
-8. Avoid unnecessary dependencies.
-9. Keep secrets out of source control.
-10. Preserve baseline research implementations.
-11. Never fabricate research information.
-12. Do not silently alter experimental results.
-13. Maintain reproducibility.
-14. Explain significant architecture decisions.
-15. Run relevant tests before declaring work complete.
-16. Do not claim something works unless it has actually been tested.
-17. When a command fails, inspect the actual error before modifying unrelated code.
-18. Avoid large unrelated refactors while implementing a specific feature.
-19. Keep Git commits logically scoped.
-20. Protect the academic integrity of the project above convenience.
+7. Preserve baseline research implementations.
+8. Never fabricate research information.
+9. Do not silently alter experimental results.
+10. Maintain reproducibility.
+11. Run relevant tests before declaring work complete.
+12. Do not claim something works unless it has actually been tested.
+13. When a command fails, inspect the actual error before modifying unrelated code.
+14. Avoid large unrelated refactors while implementing a specific feature.
+15. Keep Git commits logically scoped.
+16. Protect the academic integrity of the project above convenience.
 
 ---
 
 # Current Priority
 
-Unless another task is explicitly provided, focus first on establishing the core architecture.
+Unless another task is explicitly provided, focus on the next incomplete milestone.
 
-The first working prototype should demonstrate:
+Milestone 1 (CLI + Intake Agent) is complete.
 
-```text
-User provides topic
-        ↓
-Master Agent
-        ↓
-Research Agent
-        ↓
-At least 5 candidate papers
-        ↓
-Validation Agent
-        ↓
-Parent Paper recommendation
-        ↓
-Master Agent review
-        ↓
-Slack status updates
-```
-
-Do not begin building report-generation or presentation-generation systems before the research and orchestration pipeline works reliably.
+Next: **Milestone 2** — Research Agent that searches for and returns structured academic paper candidates.
 
 ---
 
