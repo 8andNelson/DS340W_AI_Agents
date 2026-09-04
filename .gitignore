@@ -1,3 +1,19 @@
+# Secrets
+.env
+.env.*
+
+# Agent outputs - not tracked in git
+data/
+papers/
+replication/
+experiments/
+reports/
+presentations/
+logs/
+
+# Keep directory structure
+!**/.gitkeep
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -6,10 +22,6 @@ __pycache__/
 .venv/
 venv/
 env/
-
-# Environment variables / secrets
-.env
-.env.*
 
 # VS Code
 .vscode/
@@ -29,9 +41,6 @@ dist/
 .pytest_cache/
 .coverage
 htmlcov/
-
-# Logs
-*.log
 
 # OS files
 .DS_Store

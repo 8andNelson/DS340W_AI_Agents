@@ -1,0 +1,6 @@
+anthropic
+slack_sdk
+python-dotenv
+requests
+beautifulsoup4
+pytest
