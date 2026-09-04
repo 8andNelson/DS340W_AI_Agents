@@ -1,7 +1,7 @@
 import json
 import re
 import requests
-from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, FAST_MODEL
+from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL
 
 
 SYSTEM_PROMPT = """You are a research intake assistant for an academic AI research system.
@@ -32,7 +32,7 @@ def _call_openrouter(prompt: str) -> str:
             "Content-Type": "application/json",
         },
         json={
-            "model": FAST_MODEL,
+            "model": DEFAULT_MODEL,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
