@@ -214,7 +214,10 @@ def run(papers: list) -> dict:
         except Exception as e:
             print(f"  WARNING: LLM assessment failed for batch — {e}")
             for p in batch:
-                p.setdefault("validation_status", "UNVERIFIED")
+                # Layer 1 already set validation_status="PENDING" via setdefault,
+                # so setdefault here would be a no-op — force the fallback status
+                # explicitly so papers don't stay stuck at PENDING.
+                p["validation_status"] = "UNVERIFIED"
                 p.setdefault("validated_peer_reviewed", p.get("peer_reviewed", False))
                 p.setdefault("validated_has_dataset", bool(p.get("dataset")))
                 p.setdefault("validated_has_results", bool(p.get("results_summary")))

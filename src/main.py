@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from src.agents import intake_agent, research_agent, validation_agent
+from src.agents import intake_agent, research_agent, validation_agent, paper_selection_agent
 from src.orchestration.state_manager import update_state, reset_state
 
 
@@ -27,6 +27,33 @@ def _print_papers(papers: list) -> None:
             print(f"       Method: {p['methodology']}")
         if p.get("paper_url"):
             print(f"       URL: {p['paper_url']}")
+
+
+def _print_parent_paper_recommendation(rec: dict) -> None:
+    print(f"\n--- Parent Paper Comparison ({rec['candidate_pool_size']} candidates from '{rec['candidate_pool_source']}') ---")
+    if rec.get("degraded"):
+        print(f"  WARNING: {rec['degraded_reason']}")
+
+    for row in rec["comparison_table"]:
+        print(f"\n  {row['title'][:70]}")
+        print(f"    Year: {row['publication_year']} | Peer-reviewed: {row['peer_reviewed']} | Composite score: {row['composite_score']:.2f}")
+        print(f"    Methodology clarity: {row['methodology_clarity']} | Implementation clarity: {row['implementation_clarity']}")
+        print(f"    Dataset: {row['dataset_availability']} | Code available: {row['code_availability']}")
+        print(f"    Reproducibility: {row['reproducibility_difficulty']} | Compute: {row['computing_resources_estimate']}")
+
+    audit = rec["code_availability_audit"]
+    print(f"\n  Code availability audit: {audit['count_with_code']} of {rec['candidate_pool_size']} candidates have code.")
+    if audit["policy_violation"]:
+        print(f"    NOTE: {audit['note']}")
+
+    chosen = rec["recommended_parent_paper"]
+    print(f"\n>>> RECOMMENDED PARENT PAPER: {chosen['title']}")
+    print(f"    {chosen['year']} | {chosen['venue'] or 'Unknown venue'}")
+    print(f"    URL: {chosen.get('paper_url', '')}")
+    print(f"    Expected difficulty: {rec['expected_difficulty']}")
+    if rec.get("code_availability_deciding_factor"):
+        print("    NOTE: code availability was a deciding factor in this ranking.")
+    print(f"\n  Justification:\n  {rec['justification']}")
 
 
 def main():
@@ -147,7 +174,32 @@ def main():
 
     print("\n[State] Phase -> PAPER_VALIDATION")
     print("[State] Saved to logs/project_state.json")
-    print("\nMilestone 3 complete. Ready for Parent Paper selection (Milestone 4).")
+
+    # --- Milestone 4: Parent Paper Selection Agent ---
+    try:
+        recommendation = paper_selection_agent.run(validation_results)
+    except Exception as e:
+        print(f"\n[Paper Selection Agent] ERROR: {e}")
+        sys.exit(1)
+
+    if recommendation["status"] == "NO_CANDIDATES":
+        print("\n[Paper Selection Agent] No non-rejected papers available to select a Parent Paper from.")
+        print("  Consider re-running Research/Validation with broader search terms.")
+        update_state({"phase": "PARENT_PAPER_SELECTION", "parent_paper": None})
+        sys.exit(1)
+
+    _print_parent_paper_recommendation(recommendation)
+
+    update_state({
+        "papers": validation_results["all"],
+        "parent_paper": recommendation["recommended_parent_paper"],
+        "parent_paper_approved": False,
+        "phase": "PARENT_PAPER_SELECTION",
+    })
+
+    print("\n[State] Phase -> PARENT_PAPER_SELECTION")
+    print("[State] Saved to logs/project_state.json")
+    print("\nMilestone 4 complete. Parent Paper recommended — awaiting Master Agent / human approval (Milestone 5).")
 
 
 if __name__ == "__main__":
