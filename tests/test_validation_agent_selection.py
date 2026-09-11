@@ -1,6 +1,6 @@
 import unittest
 
-from src.agents import paper_selection_agent
+from src.agents import validation_agent
 
 
 def make_paper(**overrides) -> dict:
@@ -81,7 +81,7 @@ class TestDeterministicRanking(unittest.TestCase):
         )
 
         results = validation_results_from(verified=[weak, strong])
-        rec = paper_selection_agent.run(results)
+        rec = validation_agent.rank_and_recommend(results)
 
         self.assertEqual(rec["status"], "OK")
         self.assertEqual(rec["recommended_parent_paper"]["title"], "Strong Candidate")
@@ -103,7 +103,7 @@ class TestDeterministicRanking(unittest.TestCase):
         code_weak_3 = make_paper(title="Code Weak 3", methodology="Brief.", validated_reproducibility=1, has_code=True)
 
         results = validation_results_from(verified=[code_weak_1, code_weak_2, code_weak_3, no_code_strong])
-        rec = paper_selection_agent.run(results)
+        rec = validation_agent.rank_and_recommend(results)
 
         self.assertTrue(rec["code_availability_audit"]["policy_violation"])
         self.assertEqual(rec["code_availability_audit"]["count_with_code"], 3)
@@ -117,7 +117,7 @@ class TestFallbackBehavior(unittest.TestCase):
         papers = [make_paper(title=f"Paper {i}", validation_status="UNVERIFIED") for i in range(5)]
         results = validation_results_from(unverified=papers)
 
-        rec = paper_selection_agent.run(results)
+        rec = validation_agent.rank_and_recommend(results)
 
         self.assertEqual(rec["candidate_pool_source"], "unverified")
         self.assertTrue(rec["degraded"])
@@ -137,7 +137,7 @@ class TestFallbackBehavior(unittest.TestCase):
         ]
         results = validation_results_from(all_papers=pending_papers)
 
-        rec = paper_selection_agent.run(results)
+        rec = validation_agent.rank_and_recommend(results)
 
         self.assertEqual(rec["candidate_pool_source"], "all_non_rejected")
         self.assertTrue(rec["degraded"])
@@ -148,7 +148,7 @@ class TestFallbackBehavior(unittest.TestCase):
         rejected = [make_paper(title=f"Rejected {i}", validation_status="REJECTED") for i in range(3)]
         results = validation_results_from(rejected=rejected)
 
-        rec = paper_selection_agent.run(results)
+        rec = validation_agent.rank_and_recommend(results)
 
         self.assertEqual(rec["status"], "NO_CANDIDATES")
         self.assertIsNone(rec["recommended_parent_paper"])
@@ -167,7 +167,7 @@ class TestNoHallucination(unittest.TestCase):
         )
         results = validation_results_from(verified=[paper])
 
-        rec = paper_selection_agent.run(results)
+        rec = validation_agent.rank_and_recommend(results)
         row = rec["comparison_table"][0]
 
         self.assertTrue(row["reproducibility_estimated"])

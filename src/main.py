@@ -3,8 +3,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from src.agents import intake_agent, research_agent, validation_agent, paper_selection_agent
-from src.orchestration.state_manager import update_state, reset_state
+from src.agents import master_agent
+from src.orchestration.state_manager import reset_state
 
 
 BANNER = """
@@ -27,6 +27,27 @@ def _print_papers(papers: list) -> None:
             print(f"       Method: {p['methodology']}")
         if p.get("paper_url"):
             print(f"       URL: {p['paper_url']}")
+
+
+def _print_validation_summary(result: dict) -> None:
+    verified = result["verified"]
+    unverified = result["unverified"]
+    rejected = result["rejected"]
+
+    print(f"\n--- Validation Results ---")
+    print(f"  VERIFIED:   {len(verified)}")
+    print(f"  UNVERIFIED: {len(unverified)}")
+    print(f"  REJECTED:   {len(rejected)}")
+
+    if rejected:
+        print("\n  Rejected papers:")
+        for p in rejected:
+            print(f"    - {p['title'][:65]} | {p.get('rejection_reason', '')}")
+
+    if unverified:
+        print("\n  Unverified papers (flagged for human review):")
+        for p in unverified:
+            print(f"    - {p['title'][:65]} | {p.get('validation_notes', '')}")
 
 
 def _print_parent_paper_recommendation(rec: dict) -> None:
@@ -75,131 +96,33 @@ def main():
         print("Error: No research topic provided.")
         sys.exit(1)
 
-    # --- Milestone 1: Intake Agent ---
     print(f"\nTopic: {topic}")
-    print("\n[Intake Agent] Analyzing topic...")
+    print("\n[Master Agent] Starting supervised pipeline (Intake -> Research -> Validation & Selection)...")
 
-    try:
-        structured = intake_agent.run(topic)
-    except Exception as e:
-        print(f"\n[Intake Agent] ERROR: {e}")
+    result = master_agent.run_pipeline(topic)
+
+    if not result["success"]:
+        print(f"\nPipeline halted at phase {result['phase']}. Master Agent could not get "
+              f"a passing result after retrying. See corrections above and logs/master_agent_log.json.")
         sys.exit(1)
 
-    structured["project_topic"] = topic
+    if result["structured"]:
+        s = result["structured"]
+        print(f"\n  Domain:   {s.get('domain', 'N/A')}")
+        print(f"  ML Task:  {s.get('ml_task', 'N/A')}")
+        print(f"  Keywords: {', '.join(s.get('keywords', []))}")
 
-    update_state({
-        "project_topic": topic,
-        "research_question": structured.get("domain", ""),
-        "phase": "TOPIC_ANALYSIS",
-    })
+    if result["papers"]:
+        _print_papers(result["papers"])
 
-    print(f"  Domain:   {structured.get('domain', 'N/A')}")
-    print(f"  ML Task:  {structured.get('ml_task', 'N/A')}")
-    print(f"  Keywords: {', '.join(structured.get('keywords', []))}")
+    validation_result = result["validation_result"]
+    _print_validation_summary(validation_result)
+    _print_parent_paper_recommendation(validation_result)
 
-    # --- Milestone 2: Research Agent ---
-    try:
-        papers = research_agent.run(structured)
-    except Exception as e:
-        print(f"\n[Research Agent] ERROR: {e}")
-        sys.exit(1)
-
-    if not papers:
-        print("\n[Research Agent] No qualifying papers found. Exiting.")
-        sys.exit(1)
-
-    update_state({
-        "papers": papers,
-        "phase": "LITERATURE_SEARCH",
-    })
-
-    _print_papers(papers)
-
-    qualifying = [p for p in papers if p.get("peer_reviewed") and p.get("year", 0) >= 2022]
-    print(f"\n[Research Agent] {len(qualifying)} papers meet peer-review + date requirements.")
-    if len(qualifying) < 5:
-        print(f"  WARNING: Need at least 5 qualifying papers. Found {len(qualifying)}.")
-    else:
-        print(f"  [OK] Minimum 5-paper requirement met.")
-
-    # --- Milestone 3: Validation Agent ---
-    try:
-        validation_results = validation_agent.run(papers)
-    except Exception as e:
-        print(f"\n[Validation Agent] ERROR: {e}")
-        sys.exit(1)
-
-    verified = validation_results["verified"]
-    unverified = validation_results["unverified"]
-    rejected = validation_results["rejected"]
-
-    print(f"\n--- Validation Results ---")
-    print(f"  VERIFIED:   {len(verified)}")
-    print(f"  UNVERIFIED: {len(unverified)}")
-    print(f"  REJECTED:   {len(rejected)}")
-
-    if rejected:
-        print("\n  Rejected papers:")
-        for p in rejected:
-            print(f"    - {p['title'][:65]} | {p.get('rejection_reason', '')}")
-
-    if unverified:
-        print("\n  Unverified papers (flagged for human review):")
-        for p in unverified:
-            print(f"    - {p['title'][:65]} | {p.get('validation_notes', '')}")
-
-    print(f"\n  Top verified candidates:")
-    for i, p in enumerate(verified[:5], 1):
-        repro = p.get("validated_reproducibility", 0)
-        score = p.get("parent_paper_score", 0)
-        dataset = p.get("dataset") or p.get("validated_has_dataset") and "mentioned" or "unknown"
-        print(f"\n  [{i}] {p['title']}")
-        print(f"       {p['year']} | {p['venue'] or 'Unknown venue'}")
-        print(f"       Reproducibility: {repro}/5 | Score: {score}/10")
-        print(f"       Dataset: {dataset}")
-        print(f"       {p.get('validation_notes', '')}")
-        if p.get("paper_url"):
-            print(f"       URL: {p['paper_url']}")
-
-    update_state({
-        "papers": validation_results["all"],
-        "phase": "PAPER_VALIDATION",
-    })
-
-    if len(verified) < 5:
-        print(f"\n  WARNING: Only {len(verified)} verified papers. Need at least 5.")
-        print("  Consider running with a different topic or broader search terms.")
-    else:
-        print(f"\n  [OK] {len(verified)} verified papers ready for Parent Paper selection.")
-
-    print("\n[State] Phase -> PAPER_VALIDATION")
+    print("\n[State] Phase -> MASTER_APPROVAL")
+    print("[State] parent_paper_approved -> True")
     print("[State] Saved to logs/project_state.json")
-
-    # --- Milestone 4: Parent Paper Selection Agent ---
-    try:
-        recommendation = paper_selection_agent.run(validation_results)
-    except Exception as e:
-        print(f"\n[Paper Selection Agent] ERROR: {e}")
-        sys.exit(1)
-
-    if recommendation["status"] == "NO_CANDIDATES":
-        print("\n[Paper Selection Agent] No non-rejected papers available to select a Parent Paper from.")
-        print("  Consider re-running Research/Validation with broader search terms.")
-        update_state({"phase": "PARENT_PAPER_SELECTION", "parent_paper": None})
-        sys.exit(1)
-
-    _print_parent_paper_recommendation(recommendation)
-
-    update_state({
-        "papers": validation_results["all"],
-        "parent_paper": recommendation["recommended_parent_paper"],
-        "parent_paper_approved": False,
-        "phase": "PARENT_PAPER_SELECTION",
-    })
-
-    print("\n[State] Phase -> PARENT_PAPER_SELECTION")
-    print("[State] Saved to logs/project_state.json")
-    print("\nMilestone 4 complete. Parent Paper recommended — awaiting Master Agent / human approval (Milestone 5).")
+    print("\nParent Paper approved by Master Agent. Ready for Code Discovery (Milestone 7).")
 
 
 if __name__ == "__main__":

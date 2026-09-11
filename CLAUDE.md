@@ -318,17 +318,25 @@ The current recommended architecture is:
 
 ## 1. Master Agent
 
-The Master Agent is the orchestrator.
+The Master Agent is the orchestrator. It is the boss of the pipeline: it is
+the only module that invokes the other specialized agents, and it holds each
+one accountable for doing its job correctly.
 
 Responsibilities:
 
 * Receive the user's project topic.
 * Break the request into tasks.
-* Delegate tasks to specialized agents.
+* Invoke each specialized agent itself (Intake, Research, Validation & Parent
+  Paper Selection, and later stages) rather than merely reviewing output
+  handed to it.
 * Track agent progress.
-* Validate agent outputs.
-* Reject incorrect work.
-* Ask agents to retry when necessary.
+* Independently check every agent's output against the hard academic
+  requirements in this document.
+* Reject incorrect work, with a specific, logged reason.
+* When an agent's output fails a check, retry that agent once automatically
+  before giving up — no human prompt required.
+* If the retry also fails, halt the pipeline with a final logged rejection
+  rather than silently advancing on bad output.
 * Resolve disagreements between agents.
 * Ensure academic requirements are followed.
 * Ensure the Parent Paper satisfies all constraints.
@@ -339,7 +347,17 @@ Responsibilities:
 
 The Master Agent should not blindly trust another agent.
 
-The Master Agent should review important outputs before approving them.
+The Master Agent should review important outputs before approving them, and
+should never re-do another agent's scoring or ranking work itself — its job
+is supervision (run it, check it, retry it, approve/reject it), not
+re-selection. For example, it does not re-rank candidate papers; it checks
+that the Validation Agent's ranking followed the rules.
+
+Every agent invocation — pass or fail — produces two records: a structured
+log entry (`logs/master_agent_log.json`, Slack-ready) and a saveable,
+human-readable report of what that agent actually produced
+(`logs/agent_reports/<agent>_attempt<N>.txt`), so the full supervision trail
+can be reviewed after the fact.
 
 ---
 
@@ -418,11 +436,16 @@ Suggested paper record:
 
 ---
 
-# 4. Paper Validation Agent
+# 4. Validation & Parent Paper Selection Agent
 
-The Validation Agent independently checks the Research Agent's findings.
+This agent independently checks the Research Agent's findings, then ranks
+the resulting qualifying papers and recommends a single Parent Paper.
+Validation and selection are one agent's responsibility (`validation_agent.py`
+— `run()` validates and calls `rank_and_recommend()` internally) because
+selecting a Parent Paper is meaningless without first confirming which
+papers actually qualify.
 
-Responsibilities:
+Validation responsibilities:
 
 * Verify publication dates.
 * Verify peer-reviewed status.
@@ -437,11 +460,7 @@ Responsibilities:
 
 The Validation Agent should operate independently from the Research Agent whenever possible.
 
----
-
-# 5. Parent Paper Selection Agent
-
-Responsibilities:
+Selection responsibilities (run only on the validated candidate pool):
 
 * Rank qualifying papers.
 * Compare reproducibility.
@@ -454,11 +473,14 @@ Responsibilities:
 
 It must explain *why* the recommended Parent Paper is better than alternatives.
 
-The Master Agent makes the final approval.
+The Master Agent does not re-rank candidates itself — it independently
+reviews this agent's recommendation against the hard constraints above and
+makes the final approval, retrying this agent once if the recommendation
+fails a check.
 
 ---
 
-# 6. Code Discovery Agent
+# 5. Code Discovery Agent
 
 Once a Parent Paper is approved, search for implementation resources.
 
@@ -480,7 +502,7 @@ Do not assume a repository implements the paper simply because it has a similar 
 
 ---
 
-# 7. Replication / Coding Agent
+# 6. Replication / Coding Agent
 
 Responsibilities:
 
@@ -501,7 +523,7 @@ Any necessary modification should be documented.
 
 ---
 
-# 8. Evaluation Agent
+# 7. Evaluation Agent
 
 Responsibilities:
 
@@ -530,7 +552,7 @@ The Evaluation Agent must distinguish between:
 
 ---
 
-# 9. Experiment Agent
+# 8. Experiment Agent
 
 This agent should become active only after baseline reproduction succeeds.
 
@@ -559,7 +581,7 @@ The experiment stage should produce original analysis rather than simply rerunni
 
 ---
 
-# 10. Report Agent
+# 9. Report Agent
 
 After implementation and experimentation are complete, the Report Agent generates the final research paper/report.
 
@@ -590,7 +612,7 @@ Graphs, tables, and metrics should come from actual experiments whenever possibl
 
 ---
 
-# 11. Presentation Agent
+# 10. Presentation Agent
 
 The Presentation Agent produces slides summarizing the completed project.
 
@@ -734,13 +756,11 @@ Possible statuses:
 
 ---
 
-# Human Oversight
+# Autonomous Operation
 
-The user remains the final human authority.
+The system is designed to run unattended for extended periods (including overnight) without blocking on a human prompt at any workflow stage.
 
-The system should pause for human approval at major irreversible or academically important decisions when appropriate.
-
-Important approval checkpoints include:
+The Master Agent is the final internal authority. It reviews agent outputs, enforces the academic requirements in this document, and approves or rejects work itself — it does not pause execution to wait on a person before advancing the workflow, including at decisions such as:
 
 * Final Parent Paper selection
 * Major change in project research question
@@ -748,7 +768,7 @@ Important approval checkpoints include:
 * Major experimental direction changes
 * Final report submission version
 
-The system may automate routine steps without requiring approval for every action.
+Every Master Agent approval or rejection must still be logged with its full rationale (state file, Slack, etc.) so the user can review the decision trail after the fact. Autonomy is about not blocking on a prompt — it is not a license to skip logging, skip the academic-requirement checks elsewhere in this document, or hide a rejected/degraded result.
 
 ---
 
@@ -797,7 +817,7 @@ PAPER_VALIDATION
     ↓
 PARENT_PAPER_SELECTION
     ↓
-HUMAN / MASTER APPROVAL
+MASTER_APPROVAL
     ↓
 CODE_DISCOVERY
     ↓
@@ -929,8 +949,7 @@ project-root/
 │   │   ├── master_agent.py
 │   │   ├── intake_agent.py
 │   │   ├── research_agent.py
-│   │   ├── validation_agent.py
-│   │   ├── paper_selection_agent.py
+│   │   ├── validation_agent.py     ← also performs Parent Paper selection (rank_and_recommend)
 │   │   ├── code_discovery_agent.py
 │   │   ├── replication_agent.py
 │   │   ├── evaluation_agent.py
@@ -954,7 +973,8 @@ project-root/
 ├── experiments/                ← gitignored
 ├── reports/                    ← gitignored
 ├── presentations/              ← gitignored
-├── logs/                       ← gitignored (includes project_state.json)
+├── logs/                       ← gitignored (project_state.json, master_agent_log.json,
+│                                  agent_reports/ — Master Agent's per-attempt run reports)
 └── tests/
 ```
 
@@ -1028,10 +1048,10 @@ Build incrementally. Do not attempt to build the entire multi-agent platform at 
 ## Milestones
 
 1. CLI entry point that accepts a research topic ✅
-2. Research Agent — returns structured paper candidates
-3. Paper validation
-4. Parent Paper selection
-5. Master Agent
+2. Research Agent — returns structured paper candidates ✅
+3. Paper validation ✅
+4. Parent Paper selection ✅
+5. Master Agent ✅
 6. Slack status reporting
 7. Code discovery
 8. Replication workflow
@@ -1068,9 +1088,14 @@ When working in this repository:
 
 Unless another task is explicitly provided, focus on the next incomplete milestone.
 
-Milestone 1 (CLI + Intake Agent) is complete.
+Milestones 1-5 are complete:
+* Milestone 1 — CLI entry point + Intake Agent
+* Milestone 2 — Research Agent (`src/agents/research_agent.py`)
+* Milestone 3 — Paper Validation Agent, 3-layer verification (`src/agents/validation_agent.py`)
+* Milestone 4 — Parent Paper Selection, deterministic comparison ranking, merged into the Validation Agent (`src/agents/validation_agent.py::rank_and_recommend`; `paper_selection_agent.py` was retired)
+* Milestone 5 — Master Agent, now the pipeline orchestrator/supervisor: it invokes Intake, Research, and Validation & Selection itself, independently checks each stage's output, retries a failing stage once, and halts with a logged rejection if the retry also fails (`src/agents/master_agent.py`)
 
-Next: **Milestone 2** — Research Agent that searches for and returns structured academic paper candidates.
+Next: **Milestone 6** — Slack status reporting. Wire up `src/slack/slack_client.py` and `src/slack/message_formatter.py` so agent status updates and Master Agent corrections/approvals (see `logs/master_agent_log.json`, already produced in the `[Master Agent] / ACTION / TARGET / ISSUE / DECISION / NEXT` format, plus the per-attempt reports in `logs/agent_reports/`) get posted to the configured Slack channel per the "Slack Integration" and "Master Agent Slack Requirement" sections above.
 
 ---
 
