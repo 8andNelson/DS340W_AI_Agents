@@ -1,16 +1,15 @@
-How to Use This GitHub Repo
+ How to Use This GitHub Repo
 
   1. Get the code
 
   git clone https://github.com/8andNelson/DS340W_AI_Agents.git
+
+  2. Navigate into the cloned folder and set up a virtual environment
+
+  The .venv folder is intentionally left out of the repo (it's in .gitignore), so it has to be created locally after
+  cloning:
+
   cd DS340W_AI_Agents
-
-  If you already have it cloned and just need the latest changes:
-
-  git pull origin main
-
-  2. Create a virtual environment
-
   python -m venv .venv
 
   3. Activate the virtual environment
