@@ -48,3 +48,7 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Kept locally only, not tracked in the repo
+CLAUDE.md
+README.md
