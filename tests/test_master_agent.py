@@ -133,6 +133,68 @@ class TestValidationAndSelectionChecks(MasterAgentTestCase):
         self.assertEqual(blockers, [])
 
 
+def make_dataset_candidate(**overrides) -> dict:
+    candidate = {
+        "name": "Some Dataset",
+        "matches_parent_paper": True,
+        "match_explanation": "Confirmed via official page.",
+        "source": "Kaggle",
+        "source_url": "https://kaggle.com/some-dataset",
+        "access_method": "direct download",
+        "license": "CC0",
+        "format": "CSV",
+        "entry_count": 5000,
+        "verified": True,
+        "verification_method": "brave_search",
+        "notes": "",
+    }
+    candidate.update(overrides)
+    return candidate
+
+
+def make_data_result(**overrides) -> dict:
+    selected = overrides.pop("selected_datasets", [make_dataset_candidate()])
+    total = overrides.pop("total_entries", sum(d.get("entry_count", 0) for d in selected))
+    result = {
+        "status": "OK" if total >= 10000 else ("DEGRADED" if selected else "NOT_FOUND"),
+        "target_entries": 10000,
+        "total_entries": total,
+        "target_met": total >= 10000,
+        "datasets_considered": len(selected),
+        "selected_datasets": selected,
+        "master_dataset": selected[0] if len(selected) == 1 else None,
+        "is_combined": len(selected) > 1,
+        "warnings": [],
+        "notes": "",
+    }
+    result.update(overrides)
+    return result
+
+
+class TestDataChecks(MasterAgentTestCase):
+    """_check_data is Master Agent's independent review of data_agent.run()'s
+    dataset pool -- it only blocks when zero usable datasets were found."""
+
+    def test_approves_result_that_met_the_target(self):
+        blockers = master_agent._check_data(make_data_result(
+            selected_datasets=[make_dataset_candidate(entry_count=12000)],
+        ))
+        self.assertEqual(blockers, [])
+
+    def test_approves_degraded_result_with_at_least_one_dataset(self):
+        blockers = master_agent._check_data(make_data_result(
+            selected_datasets=[make_dataset_candidate(entry_count=3000)],
+        ))
+        self.assertEqual(blockers, [])
+
+    def test_rejects_zero_datasets(self):
+        blockers = master_agent._check_data(make_data_result(
+            selected_datasets=[], warnings=["Parent Paper does not state a dataset."],
+        ))
+        self.assertTrue(blockers)
+        self.assertEqual(blockers[0]["target"], "Data Agent")
+
+
 class TestIntakeAndResearchChecks(MasterAgentTestCase):
     def test_check_intake_rejects_empty_structured_request(self):
         blockers = master_agent._check_intake({"domain": "", "keywords": [], "search_queries": []})
@@ -236,6 +298,73 @@ class TestSupervise(MasterAgentTestCase):
         self.assertEqual(len(report_files), 2)
         self.assertIn("report for bad", report_files[0].read_text())
         self.assertIn("report for good", report_files[1].read_text())
+
+
+def make_validation_result(ranked_pool: list) -> dict:
+    return {
+        "status": "OK",
+        "candidate_pool_source": "verified",
+        "candidate_pool_size": len(ranked_pool),
+        "degraded": False,
+        "degraded_reason": "",
+        "comparison_table": [],
+        "ranked_pool": ranked_pool,
+        "code_availability_audit": {"count_with_code": 0, "titles_with_code": [], "policy_violation": False, "note": ""},
+        "recommended_parent_paper": ranked_pool[0],
+        "all": ranked_pool,
+        "runner_ups": [],
+        "justification": "Because it's the best.",
+        "expected_difficulty": "Low",
+        "code_availability_deciding_factor": False,
+    }
+
+
+class TestDataAgentPipelineWiring(MasterAgentTestCase):
+    """run_pipeline's Stage 4: Data Agent runs right after Parent Paper
+    approval, caches the ranked pool, and only blocks on zero datasets."""
+
+    def _run(self, data_agent_result: dict):
+        ranked_pool = [
+            {"title": "Parent Paper", "dataset": "DS1"},
+            {"title": "Runner Up", "dataset": "DS2"},
+        ]
+        validation_result = make_validation_result(ranked_pool)
+
+        with patch.object(master_agent, "_check_intake", return_value=[]), \
+             patch.object(master_agent, "_check_research", return_value=[]), \
+             patch.object(master_agent, "_check_validation_and_selection", return_value=[]), \
+             patch("src.agents.intake_agent.run", return_value={
+                 "domain": "fraud", "keywords": ["fraud"], "search_queries": ["fraud ML"],
+             }), \
+             patch("src.agents.research_agent.run", return_value=[
+                 {"title": "Parent Paper", "peer_reviewed": True, "year": 2023}
+             ]), \
+             patch("src.agents.validation_agent.run", return_value=validation_result), \
+             patch("src.agents.data_agent.run", return_value=data_agent_result) as data_run, \
+             patch("src.orchestration.state_manager.update_state") as update_state, \
+             patch("src.orchestration.dataset_cache.cache_validated_papers") as cache_papers:
+            result = master_agent.run_pipeline("credit card fraud detection")
+
+        return result, ranked_pool, data_run, update_state, cache_papers
+
+    def test_advances_to_data_discovery_on_success(self):
+        data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
+        result, ranked_pool, data_run, update_state, cache_papers = self._run(data_result)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["phase"], "DATA_DISCOVERY")
+        self.assertEqual(result["dataset_result"], data_result)
+        cache_papers.assert_called_once_with(ranked_pool)
+        data_run.assert_called_once_with(ranked_pool[0], ranked_pool)
+
+    def test_halts_on_zero_datasets(self):
+        data_result = make_data_result(selected_datasets=[], warnings=["nothing found"])
+        result, ranked_pool, data_run, update_state, cache_papers = self._run(data_result)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["phase"], "DATA_DISCOVERY")
+        self.assertTrue(result["blockers"])
+        self.assertEqual(result["blockers"][0]["target"], "Data Agent")
 
 
 class TestWriteReport(MasterAgentTestCase):

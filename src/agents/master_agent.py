@@ -2,12 +2,13 @@
 Master Agent (Milestone 5+).
 
 Orchestrates and supervises the pipeline. Master Agent is the only module
-that invokes intake_agent, research_agent, and validation_agent (which now
-also performs Parent Paper selection -- see validation_agent.rank_and_recommend).
-It does not re-score or re-select papers itself; that logic stays inside the
-specialized agents. Master Agent's job is to act as the boss: run each agent,
-independently check its output against the hard academic requirements in
-CLAUDE.md, and hold it accountable when it fails.
+that invokes intake_agent, research_agent, validation_agent (which now also
+performs Parent Paper selection -- see validation_agent.rank_and_recommend),
+and data_agent (which builds a >=10k-entry dataset pool for the Parent
+Paper). It does not re-score, re-select, or re-search anything itself; that
+logic stays inside the specialized agents. Master Agent's job is to act as
+the boss: run each agent, independently check its output against the hard
+academic requirements in CLAUDE.md, and hold it accountable when it fails.
 
 For every stage:
   1. Run the agent.
@@ -115,6 +116,25 @@ def _format_validation_report(result: dict) -> str:
         lines.append(f"Justification:\n{result.get('justification', '')}")
     else:
         lines.append(f"No Parent Paper recommended. Reason: {result.get('degraded_reason', '')}")
+    return "\n".join(lines)
+
+
+def _format_data_report(result: dict) -> str:
+    lines = [
+        "[Data Agent] Dataset pool for Parent Paper replication",
+        f"Status:        {result.get('status', '')}",
+        f"Search stage:  {result.get('search_stage', '')}",
+        f"Total entries: {result.get('total_entries', 0)} / {result.get('target_entries', 10000)} "
+        f"(target met: {result.get('target_met', False)})",
+        f"Datasets used: {len(result.get('selected_datasets', []))} "
+        f"(considered {result.get('datasets_considered', 0)} papers)",
+    ]
+    for d in result.get("selected_datasets", []):
+        label = d.get("display_name") or d.get("name", "")
+        lines.append(f"  - {label} ({d.get('source', '')}): {d.get('entry_count', '?')} entries -> {d.get('name', '')}")
+    if result.get("warnings"):
+        lines.append("Warnings:")
+        lines.extend(f"  - {w}" for w in result["warnings"])
     return "\n".join(lines)
 
 
@@ -232,6 +252,25 @@ def _check_validation_and_selection(recommendation: dict) -> list:
     return blockers
 
 
+def _check_data(result: dict) -> list:
+    """
+    Data Agent is only blocked when it found zero usable datasets. A
+    DEGRADED result (1+ usable datasets but under the entry target) is
+    approved and passed through -- the shortfall is still visible in the
+    saved report and the returned dataset_result, per CLAUDE.md's Results
+    Integrity policy of surfacing real outcomes rather than hiding them.
+    """
+    if not result.get("selected_datasets"):
+        return [_log_entry(
+            "Correction", "Data Agent",
+            "Data Agent found zero usable datasets (verified, >= 100 entries) across the Parent "
+            f"Paper and its ranked alternates. Warnings: {'; '.join(result.get('warnings', [])) or 'none reported'}.",
+            "Rejected",
+            "Re-run Data Agent; if it fails again, halt for manual dataset review.",
+        )]
+    return []
+
+
 def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int = MAX_ATTEMPTS):
     """
     Invoke run_fn() up to max_attempts times, independently checking its
@@ -314,10 +353,10 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
 
 def run_pipeline(topic: str) -> dict:
     """
-    Drive the full pipeline (Intake -> Research -> Validation & Selection),
-    supervising every stage. Master Agent invokes each agent itself, checks
-    its output, retries once on failure, and halts (with a logged rejection)
-    if the retry also fails.
+    Drive the full pipeline (Intake -> Research -> Validation & Selection ->
+    Data Agent), supervising every stage. Master Agent invokes each agent
+    itself, checks its output, retries once on failure, and halts (with a
+    logged rejection) if the retry also fails.
 
     Returns:
         {
@@ -327,13 +366,15 @@ def run_pipeline(topic: str) -> dict:
           "papers": list | None,
           "validation_result": dict | None,
           "parent_paper": dict | None,
+          "dataset_result": dict | None,
           "blockers": [...],   # non-empty only when success is False
         }
     """
     # Imported here (not at module load) so master_agent stays the sole
     # orchestrator without creating an import cycle with src.main.
-    from src.agents import intake_agent, research_agent, validation_agent
+    from src.agents import intake_agent, research_agent, validation_agent, data_agent
     from src.orchestration.state_manager import update_state
+    from src.orchestration import dataset_cache
 
     result = {
         "success": False,
@@ -342,6 +383,7 @@ def run_pipeline(topic: str) -> dict:
         "papers": None,
         "validation_result": None,
         "parent_paper": None,
+        "dataset_result": None,
         "blockers": [],
     }
 
@@ -401,11 +443,36 @@ def run_pipeline(topic: str) -> dict:
         "parent_paper_approved": True,
         "phase": "MASTER_APPROVAL",
     })
+    result["validation_result"] = validation_result
+    result["parent_paper"] = validation_result["recommended_parent_paper"]
+
+    # --- Stage 4: Data Agent (dataset pool discovery + verification) ---
+    dataset_cache.cache_validated_papers(validation_result["ranked_pool"])
+
+    dataset_result, blockers = _supervise(
+        "Data Agent",
+        lambda: data_agent.run(validation_result["recommended_parent_paper"], validation_result["ranked_pool"]),
+        _check_data,
+        _format_data_report,
+    )
+    if blockers:
+        update_state({"phase": "DATA_DISCOVERY"})
+        result.update(phase="DATA_DISCOVERY", blockers=blockers)
+        return result
+
+    update_state({
+        "dataset": {
+            "selected_datasets": dataset_result["selected_datasets"],
+            "total_entries": dataset_result["total_entries"],
+            "target_met": dataset_result["target_met"],
+            "is_combined": dataset_result["is_combined"],
+        },
+        "phase": "DATA_DISCOVERY",
+    })
 
     result.update(
         success=True,
-        phase="MASTER_APPROVAL",
-        validation_result=validation_result,
-        parent_paper=validation_result["recommended_parent_paper"],
+        phase="DATA_DISCOVERY",
+        dataset_result=dataset_result,
     )
     return result

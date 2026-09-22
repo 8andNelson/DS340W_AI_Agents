@@ -11,7 +11,7 @@ DEFAULT_STATE = {
     "parent_paper": None,
     "parent_paper_approved": False,
     "code_repository": "",
-    "dataset": "",
+    "dataset": None,
     "baseline_status": "",
     "baseline_results": {},
     "experiments": [],
