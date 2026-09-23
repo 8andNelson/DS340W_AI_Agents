@@ -419,6 +419,7 @@ class TestResolveEntryCount(unittest.TestCase):
         hf_mock.assert_not_called()
         fetch_mock.assert_not_called()
         self.assertEqual(candidate["entry_count"], 999)
+        self.assertEqual(candidate["entry_count_source"], "search result")
 
     def test_huggingface_lookup_short_circuits_page_fetch(self):
         candidate = make_candidate(entry_count=None, source_url="https://huggingface.co/datasets/foo/bar")
@@ -429,6 +430,7 @@ class TestResolveEntryCount(unittest.TestCase):
         hf_mock.assert_called_once_with("https://huggingface.co/datasets/foo/bar")
         fetch_mock.assert_not_called()
         self.assertEqual(candidate["entry_count"], 12345)
+        self.assertEqual(candidate["entry_count_source"], "Hugging Face API")
 
     def test_falls_back_to_page_text_when_hf_lookup_fails(self):
         candidate = make_candidate(entry_count=None, source_url="https://example.com/dataset")
@@ -440,6 +442,7 @@ class TestResolveEntryCount(unittest.TestCase):
         fetch_mock.assert_called_once_with("https://example.com/dataset")
         extract_mock.assert_called_once()
         self.assertEqual(candidate["entry_count"], 42000)
+        self.assertEqual(candidate["entry_count_source"], "the dataset's own page")
 
     def test_stays_none_when_nothing_found(self):
         candidate = make_candidate(entry_count=None, source_url="https://example.com/dataset")
@@ -449,6 +452,41 @@ class TestResolveEntryCount(unittest.TestCase):
             data_agent._resolve_entry_count(candidate, "Some Dataset")
 
         self.assertIsNone(candidate["entry_count"])
+        self.assertEqual(candidate.get("entry_count_source", ""), "")
+
+
+class TestDescribeProvenance(unittest.TestCase):
+    """_describe_provenance turns a candidate's verification_method and
+    entry_count_source into a human-readable, per-candidate explanation of
+    how it was found -- this is what makes the console log dynamic instead
+    of a fixed phrase for every dataset."""
+
+    def test_describes_fresh_search_and_stated_count(self):
+        candidate = make_candidate(verification_method="brave_search", entry_count_source="search result")
+        desc = data_agent._describe_provenance(candidate)
+        self.assertIn("Brave search", desc)
+        self.assertIn("stated in the search result", desc)
+
+    def test_describes_exploration_search_and_huggingface_count(self):
+        candidate = make_candidate(verification_method="exploration_site", entry_count_source="Hugging Face API")
+        desc = data_agent._describe_provenance(candidate)
+        self.assertIn("curated dataset-directory search", desc)
+        self.assertIn("Hugging Face's dataset API", desc)
+
+    def test_describes_cache_hit_and_page_derived_count(self):
+        candidate = make_candidate(verification_method="cache_hit", entry_count_source="the dataset's own page")
+        desc = data_agent._describe_provenance(candidate)
+        self.assertIn("reused from an earlier search", desc)
+        self.assertIn("dataset's own page", desc)
+
+    def test_two_different_candidates_produce_two_different_descriptions(self):
+        a = make_candidate(verification_method="brave_search", entry_count_source="search result")
+        b = make_candidate(verification_method="exploration_site", entry_count_source="the dataset's own page")
+        self.assertNotEqual(data_agent._describe_provenance(a), data_agent._describe_provenance(b))
+
+    def test_unknown_or_missing_provenance_fields_produce_empty_string(self):
+        candidate = make_candidate(verification_method="", entry_count_source="")
+        self.assertEqual(data_agent._describe_provenance(candidate), "")
 
 
 class TestHuggingFaceLookup(unittest.TestCase):

@@ -70,6 +70,7 @@ _CANDIDATE_DEFAULTS = {
     "license": "",
     "format": "",
     "entry_count": None,
+    "entry_count_source": "",  # how entry_count was determined -- see _resolve_entry_count
     "usability_score": None,
     "verified": False,
     "verification_method": "",
@@ -278,16 +279,54 @@ def _resolve_entry_count(candidate: dict, dataset_name: str) -> None:
     """Best-effort fill-in for entry_count when the search snippet didn't
     state one: try Hugging Face's structured API first (exact, no LLM),
     then fall back to reading the actual dataset page. Never fabricates a
-    value -- if neither finds a stated count, entry_count stays None."""
+    value -- if neither finds a stated count, entry_count stays None.
+
+    Also records entry_count_source, so the console log and saved reports
+    can say exactly how each dataset's count was determined -- this varies
+    per candidate, since one dataset's count might already be in the search
+    snippet while another's only turns up on Hugging Face or the page
+    itself."""
     if isinstance(candidate.get("entry_count"), int):
+        if not candidate.get("entry_count_source"):
+            candidate["entry_count_source"] = "search result"
         return
     source_url = candidate.get("source_url", "")
     count = _lookup_huggingface_entry_count(source_url)
-    if count is None:
-        page_text = _fetch_page_text(source_url)
-        count = _extract_entry_count_from_page(page_text, dataset_name or candidate.get("name", ""))
     if count is not None:
         candidate["entry_count"] = count
+        candidate["entry_count_source"] = "Hugging Face API"
+        return
+    page_text = _fetch_page_text(source_url)
+    count = _extract_entry_count_from_page(page_text, dataset_name or candidate.get("name", ""))
+    if count is not None:
+        candidate["entry_count"] = count
+        candidate["entry_count_source"] = "the dataset's own page"
+
+
+_VERIFICATION_METHOD_DESCRIPTIONS = {
+    "cache_hit": "reused from an earlier search",
+    "brave_search": "found via Brave search for the paper's stated dataset name",
+    "exploration_site": "found via a curated dataset-directory search",
+}
+
+_ENTRY_COUNT_SOURCE_DESCRIPTIONS = {
+    "search result": "count stated in the search result",
+    "Hugging Face API": "count read from Hugging Face's dataset API",
+    "the dataset's own page": "count found by reading the dataset's own page",
+}
+
+
+def _describe_provenance(candidate: dict) -> str:
+    """Human-readable account of how THIS candidate, specifically, was
+    located and how its entry count was determined. Varies per candidate --
+    a cache hit, a fresh Brave search, or a curated exploration search each
+    describe differently, and the entry count itself might come from the
+    search snippet, Hugging Face's API, or the dataset's own page."""
+    parts = [
+        _VERIFICATION_METHOD_DESCRIPTIONS.get(candidate.get("verification_method", ""), ""),
+        _ENTRY_COUNT_SOURCE_DESCRIPTIONS.get(candidate.get("entry_count_source", ""), ""),
+    ]
+    return "; ".join(p for p in parts if p)
 
 
 def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
@@ -456,8 +495,11 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
         selected_datasets.append(candidate)
         seen_links.add(link_key)
         total_entries += candidate["entry_count"]
+        provenance = _describe_provenance(candidate)
+        detail = f" ({provenance})" if provenance else ""
         print(f"[Data Agent] Added '{candidate.get('display_name') or candidate['name']}' "
-              f"({candidate['entry_count']} entries) from {candidate['name']}; running total {total_entries}.")
+              f"({candidate['entry_count']} entries) from {candidate['name']}{detail}; "
+              f"running total {total_entries}.")
         return True
 
     # --- Stage 1: Parent Paper's own dataset ---
@@ -467,8 +509,11 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
         datasets_considered += 1
 
     if _usable(parent_candidate, SINGLE_DATASET_THRESHOLD):
+        provenance = _describe_provenance(parent_candidate)
+        detail = f" ({provenance})" if provenance else ""
         print(f"[Data Agent] Parent Paper's own dataset alone meets the target "
-              f"({parent_candidate['entry_count']} entries). Using it as the sole dataset.")
+              f"({parent_candidate['entry_count']} entries) from {parent_candidate['name']}{detail}. "
+              f"Using it as the sole dataset.")
         return {
             "status": "OK",
             "target_entries": TARGET_ENTRIES,
