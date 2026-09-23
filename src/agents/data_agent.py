@@ -457,7 +457,7 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
         seen_links.add(link_key)
         total_entries += candidate["entry_count"]
         print(f"[Data Agent] Added '{candidate.get('display_name') or candidate['name']}' "
-              f"({candidate['entry_count']} entries); running total {total_entries}.")
+              f"({candidate['entry_count']} entries) from {candidate['name']}; running total {total_entries}.")
         return True
 
     # --- Stage 1: Parent Paper's own dataset ---
