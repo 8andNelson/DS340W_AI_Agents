@@ -100,6 +100,8 @@ _CANDIDATE_DEFAULTS = {
     "verification_method": "",
     "local_csv_path": "",   # set once downloaded and converted -- see _download_and_convert_to_csv
     "download_status": "",  # "" until attempted; "ok" or "failed: <reason>" after
+    "reproducibility_fit": None,  # None until checked -- see _check_reproducibility_fit
+    "reproducibility_notes": "",
     "notes": "",
 }
 
@@ -471,6 +473,72 @@ def _download_and_convert_to_csv(candidate: dict) -> bool:
     return True
 
 
+def _check_reproducibility_fit(candidate: dict, parent_paper: dict) -> tuple[bool, str]:
+    """Check whether the actual downloaded dataset's columns are things a
+    researcher could recognize and verify against the Parent Paper's
+    methodology -- catches a dataset that's topically in-scope and
+    successfully downloaded, but whose real structure (e.g. anonymized PCA
+    components like V1..V28) can't be confirmed to match what the paper
+    describes needing.
+
+    Defaults to (True, ...) -- fails open on any technical error or when
+    the Parent Paper has no methodology/abstract text to check against at
+    all, since this check should never block the pipeline over a transient
+    failure or missing paper metadata; it only rejects when the LLM can
+    make an actual, grounded judgment call."""
+    methodology = (parent_paper or {}).get("methodology") or ""
+    abstract = (parent_paper or {}).get("abstract") or ""
+    if not methodology and not abstract:
+        return True, "not checked -- Parent Paper has no methodology/abstract text to verify against"
+
+    try:
+        sample = pd.read_csv(candidate["local_csv_path"], nrows=5)
+    except Exception as e:
+        return True, f"not checked -- could not re-read downloaded file ({e})"
+
+    columns_desc = "\n".join(
+        f"  - {col} ({sample[col].dtype}): sample values {sample[col].head(3).tolist()}"
+        for col in sample.columns
+    )
+
+    prompt = f"""You are checking whether a downloaded dataset's actual columns are usable for reproducing a specific research paper's methodology.
+
+Paper title: "{parent_paper.get('title', '')}"
+Paper methodology: "{methodology[:1200]}"
+Paper abstract: "{abstract[:800]}"
+
+The dataset's actual columns (from the real downloaded file):
+{columns_desc}
+
+Determine whether these columns are things a researcher could recognize and verify against the paper's stated methodology (e.g. named features the methodology describes, or a comparable target/label column).
+
+Anonymized or opaque columns (PCA components, generic names like V1/V2/col_1/feature_3) are ONLY an acceptable fit if the paper's own methodology explicitly describes using that same anonymized or PCA-transformed structure -- not merely because the topic matches.
+
+Return ONLY valid JSON: {{"fit": <true or false>, "explanation": "<1-2 sentences>"}}"""
+
+    try:
+        response = requests.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}]},
+            timeout=60,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        match = re.search(r"\{[\s\S]*\}", content)
+        data = json.loads(match.group(0)) if match else json.loads(content)
+        fit = data.get("fit")
+        explanation = str(data.get("explanation", ""))
+        if isinstance(fit, bool):
+            return fit, explanation
+        return True, "not checked -- LLM response did not include a usable verdict"
+    except Exception as e:
+        return True, f"not checked -- reproducibility check failed ({e})"
+
+
 _VERIFICATION_METHOD_DESCRIPTIONS = {
     "cache_hit": "reused from an earlier search",
     "brave_search": "found via Brave search for the paper's stated dataset name",
@@ -489,22 +557,30 @@ def _describe_provenance(candidate: dict) -> str:
     located and how its entry count was determined. Varies per candidate --
     a cache hit, a fresh Brave search, or a curated exploration search each
     describe differently, and the entry count itself might come from the
-    search snippet, Hugging Face's API, or the dataset's own page."""
+    search snippet, Hugging Face's API, or the dataset's own page. Also
+    surfaces the reproducibility-fit explanation when one was actually
+    checked (mainly relevant for a rejected candidate, so its reason
+    doesn't silently disappear into "no usable dataset found")."""
     parts = [
         _VERIFICATION_METHOD_DESCRIPTIONS.get(candidate.get("verification_method", ""), ""),
         _ENTRY_COUNT_SOURCE_DESCRIPTIONS.get(candidate.get("entry_count_source", ""), ""),
     ]
+    notes = candidate.get("reproducibility_notes", "")
+    if notes and not notes.startswith("not checked"):
+        parts.append(f"reproducibility fit: {notes}")
     return "; ".join(p for p in parts if p)
 
 
 def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
-                      scope_description: str, query_builder, top_k: int = 1) -> dict:
+                      scope_description: str, query_builder, parent_paper: dict = None,
+                      top_k: int = 1) -> dict:
     """
     Search, extract, verify, and scope-check candidates for a dataset name,
-    checking the cache first. Only a reachable, in-scope candidate is
-    cached or returned as usable -- failures are never cached, so a later
-    retry (Stage 3, with a different query_builder) genuinely re-searches
-    instead of replaying a cached miss.
+    checking the cache first. Only a reachable, in-scope, downloadable
+    candidate that also passes the reproducibility-fit check is cached or
+    returned as usable -- failures are never cached, so a later retry
+    (Stage 3, with a different query_builder) genuinely re-searches instead
+    of replaying a cached miss.
     """
     cached = dataset_cache.get_cached_dataset(dataset_name)
     if cached is not None:
@@ -534,8 +610,16 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
         if not c.get("in_scope"):
             continue
         if _download_and_convert_to_csv(c):
-            dataset_cache.cache_dataset(dataset_name, c)
-            return c
+            fit, explanation = _check_reproducibility_fit(c, parent_paper)
+            c["reproducibility_fit"] = fit
+            c["reproducibility_notes"] = explanation
+            if fit:
+                dataset_cache.cache_dataset(dataset_name, c)
+                return c
+            label = c.get("display_name") or c.get("name", "")
+            print(f"[Data Agent] '{label}' downloaded but rejected: {explanation}")
+            best_in_scope = c
+            continue
         # Reachable and in scope, but couldn't actually be downloaded --
         # still try to report an approximate entry count for transparency,
         # but keep it uncached (so a later run, or a different paper naming
@@ -553,7 +637,7 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
     )
 
 
-def _find_and_verify_dataset_for_paper(paper: dict, scope_description: str) -> dict | None:
+def _find_and_verify_dataset_for_paper(paper: dict, scope_description: str, parent_paper: dict = None) -> dict | None:
     """Find and verify the dataset a specific paper claims to use. Returns
     None if the paper states no dataset name at all."""
     dataset_name = (paper.get("dataset") or "").strip()
@@ -562,7 +646,7 @@ def _find_and_verify_dataset_for_paper(paper: dict, scope_description: str) -> d
     dataset_source = (paper.get("dataset_source") or "").strip()
     return _resolve_dataset(
         dataset_name, dataset_source, paper.get("title", ""), scope_description,
-        query_builder=_build_query, top_k=3,
+        query_builder=_build_query, parent_paper=parent_paper, top_k=3,
     )
 
 
@@ -597,7 +681,7 @@ def _usability_score(candidate: dict) -> float:
     return round(score, 2)
 
 
-def _search_exploration_sites(scope_description: str) -> list:
+def _search_exploration_sites(scope_description: str, parent_paper: dict = None) -> list:
     """Stage 3: last-resort generic search against curated dataset
     directories, scored on usability since there's no paper to match."""
     if not scope_description:
@@ -619,7 +703,13 @@ def _search_exploration_sites(scope_description: str) -> list:
             continue
         c["name"] = c.get("source_url", "")
         if c.get("in_scope"):
-            if not _download_and_convert_to_csv(c):
+            if _download_and_convert_to_csv(c):
+                fit, explanation = _check_reproducibility_fit(c, parent_paper)
+                c["reproducibility_fit"] = fit
+                c["reproducibility_notes"] = explanation
+                if not fit:
+                    print(f"[Data Agent] '{c['display_name']}' downloaded but rejected: {explanation}")
+            else:
                 _resolve_entry_count(c, c.get("display_name", ""))
         c["usability_score"] = _usability_score(c)
         resolved.append(c)
@@ -634,6 +724,7 @@ def _usable(candidate: dict | None, min_entries: int) -> bool:
         and candidate.get("verified")
         and candidate.get("in_scope")
         and candidate.get("local_csv_path")
+        and candidate.get("reproducibility_fit", True)
         and isinstance(candidate.get("entry_count"), int)
         and candidate["entry_count"] >= min_entries
     )
@@ -676,7 +767,7 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
     # --- Stage 1: Parent Paper's own dataset ---
     parent_candidate = None
     if parent_paper:
-        parent_candidate = _find_and_verify_dataset_for_paper(parent_paper, scope_description)
+        parent_candidate = _find_and_verify_dataset_for_paper(parent_paper, scope_description, parent_paper)
         datasets_considered += 1
 
     if parent_candidate is None:
@@ -696,7 +787,7 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
         if len(selected_datasets) >= MAX_DATASETS:
             break
         datasets_considered += 1
-        try_add(_find_and_verify_dataset_for_paper(paper, scope_description))
+        try_add(_find_and_verify_dataset_for_paper(paper, scope_description, parent_paper))
 
     if selected_datasets:
         search_stage = "paper_traversal"
@@ -708,7 +799,7 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
         search_stage = "exploration_sites"
         print("[Data Agent] No usable dataset found among candidate papers; "
               "searching generally for datasets relevant to the project scope...")
-        for candidate in _search_exploration_sites(scope_description):
+        for candidate in _search_exploration_sites(scope_description, parent_paper):
             if len(selected_datasets) >= MAX_DATASETS:
                 break
             try_add(candidate)

@@ -81,7 +81,7 @@ class TestRunAlgorithm(unittest.TestCase):
         second = make_paper(title="Second", dataset="Second Dataset")
         second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=2000)
 
-        def fake_find(paper, _scope):
+        def fake_find(paper, _scope, _parent=None):
             return big if paper["title"] == "Parent" else second_candidate
 
         with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
@@ -97,7 +97,7 @@ class TestRunAlgorithm(unittest.TestCase):
         alt = make_paper(title="Alt", dataset="Alt Dataset")
         alt_candidate = make_link_candidate("https://kaggle.com/alt", entry_count=12000)
 
-        def fake_find(paper, _scope):
+        def fake_find(paper, _scope, _parent=None):
             if paper["title"] == "Parent":
                 return None  # no dataset name -> nothing to search
             return alt_candidate
@@ -117,7 +117,7 @@ class TestRunAlgorithm(unittest.TestCase):
 
         calls = []
 
-        def fake_find(paper, _scope):
+        def fake_find(paper, _scope, _parent=None):
             calls.append(paper["title"])
             if paper["title"] == "Parent":
                 return small
@@ -138,7 +138,7 @@ class TestRunAlgorithm(unittest.TestCase):
         second = make_paper(title="Second", dataset="Second Dataset")
         second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=7000)
 
-        def fake_find(paper, _scope):
+        def fake_find(paper, _scope, _parent=None):
             return mid if paper["title"] == "Parent" else second_candidate
 
         with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
@@ -156,7 +156,7 @@ class TestRunAlgorithm(unittest.TestCase):
         third = make_paper(title="Third", dataset="Unique Dataset")
         third_candidate = make_link_candidate("https://kaggle.com/unique", entry_count=7000)
 
-        def fake_find(paper, _scope):
+        def fake_find(paper, _scope, _parent=None):
             if paper["title"] == "Parent":
                 return shared
             if paper["title"] == "Dup":
@@ -180,7 +180,7 @@ class TestRunAlgorithm(unittest.TestCase):
             for i in range(4)
         }
 
-        def fake_find(paper, _scope):
+        def fake_find(paper, _scope, _parent=None):
             return candidates[paper["dataset"]]
 
         with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
@@ -203,7 +203,7 @@ class TestRunAlgorithm(unittest.TestCase):
         }
         checked = []
 
-        def fake_find(paper, _scope):
+        def fake_find(paper, _scope, _parent=None):
             checked.append(paper["dataset"])
             return candidates[paper["dataset"]]
 
@@ -248,7 +248,8 @@ class TestEscalationStages(unittest.TestCase):
             data_agent.run(parent, [parent])
 
         explore_mock.assert_called_once()
-        (scope_arg,), _kwargs = explore_mock.call_args
+        call_args = explore_mock.call_args
+        scope_arg = call_args.args[0]
         self.assertNotIn("Elusive Dataset", scope_arg)
         self.assertIn("Parent", scope_arg)
 
@@ -412,6 +413,39 @@ class TestResolveDataset(unittest.TestCase):
         self.assertFalse(data_agent._usable(candidate, 1))
         cache_dataset.assert_not_called()
 
+    def test_reproducibility_fit_failure_leaves_candidate_unusable_and_uncached(self):
+        """A candidate that downloads fine but fails the reproducibility-fit
+        check (e.g. anonymized columns the LLM can't confirm against the
+        Parent Paper) is rejected and not cached, same as any other gate."""
+        llm_response = self._llm_response(
+            '[{"name": "Anonymized Dataset", "source": "Kaggle", "in_scope": true, '
+            '"source_url": "https://kaggle.com/anon", "entry_count": null}]'
+        )
+
+        def fake_download(candidate):
+            candidate["local_csv_path"] = "data/raw/anon.csv"
+            candidate["entry_count"] = 50000
+            candidate["entry_count_source"] = "downloaded file"
+            return True
+
+        with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
+             patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
+             patch("src.search.brave_search.search", return_value=[
+                 {"title": "Anonymized Dataset", "url": "https://kaggle.com/anon", "description": ""}
+             ]), \
+             patch("requests.post", return_value=llm_response), \
+             patch.object(data_agent, "_check_url_reachable", return_value=(True, 200)), \
+             patch.object(data_agent, "_download_and_convert_to_csv", side_effect=fake_download), \
+             patch.object(data_agent, "_check_reproducibility_fit", return_value=(False, "columns are anonymized")):
+            candidate = data_agent._resolve_dataset(
+                "Anonymized Dataset", "", "", "", query_builder=data_agent._build_query,
+                parent_paper={"title": "P", "methodology": "named features"},
+            )
+
+        self.assertEqual(candidate["reproducibility_fit"], False)
+        self.assertFalse(data_agent._usable(candidate, 1))
+        cache_dataset.assert_not_called()
+
     def test_second_candidate_tried_when_first_is_unreachable(self):
         """top_k > 1 lets a later LLM-ranked candidate rescue a dataset name
         whose top result turns out to be dead, instead of giving up on it."""
@@ -518,6 +552,22 @@ class TestEntryCountFloor(unittest.TestCase):
         download success is a required gate alongside the others."""
         candidate = make_candidate(entry_count=50000, local_csv_path="")
         self.assertFalse(data_agent._usable(candidate, data_agent.MIN_ENTRIES_TO_CONSIDER))
+
+    def test_reproducibility_unfit_candidate_is_never_usable(self):
+        """A downloaded, verified, in-scope candidate that failed the
+        reproducibility-fit check (e.g. anonymized/opaque columns that
+        can't be verified against the paper) is still rejected."""
+        candidate = make_candidate(entry_count=50000, reproducibility_fit=False)
+        self.assertFalse(data_agent._usable(candidate, data_agent.MIN_ENTRIES_TO_CONSIDER))
+
+    def test_unchecked_reproducibility_fit_defaults_to_usable(self):
+        """A candidate that was never checked (reproducibility_fit still
+        None, e.g. because it was rejected earlier for unreachability) does
+        not itself block usability -- existing tests that don't set the
+        field must keep passing."""
+        candidate = make_candidate(entry_count=50000)
+        self.assertNotIn("reproducibility_fit", candidate)  # make_candidate doesn't set it
+        self.assertTrue(data_agent._usable(candidate, data_agent.MIN_ENTRIES_TO_CONSIDER))
 
 
 class TestResolveEntryCount(unittest.TestCase):
@@ -779,6 +829,101 @@ class TestDownloadAndConvertToCsv(unittest.TestCase):
         get_mock.assert_not_called()
         self.assertTrue(ok)
         self.assertEqual(candidate["entry_count"], 2)
+
+
+class TestReproducibilityFitCheck(unittest.TestCase):
+    """_check_reproducibility_fit: verifies the actual downloaded columns
+    against the Parent Paper's methodology, catching e.g. anonymized/PCA
+    columns (V1..V28) that can't be confirmed to match what the paper
+    describes needing. Fails open (returns True) on anything it can't
+    actually judge -- missing paper text, or a technical error -- and only
+    rejects when the LLM makes a real, grounded call."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write_csv(self, columns_and_rows: dict) -> str:
+        path = Path(self._tmpdir) / "sample.csv"
+        pd.DataFrame(columns_and_rows).to_csv(path, index=False)
+        return str(path)
+
+    def _llm_response(self, content_json: str) -> MagicMock:
+        response = MagicMock()
+        response.json.return_value = {"choices": [{"message": {"content": content_json}}]}
+        response.raise_for_status = lambda: None
+        return response
+
+    def test_no_methodology_or_abstract_skips_the_check(self):
+        candidate = make_candidate(local_csv_path=self._write_csv({"amount": [1, 2]}))
+        with patch("requests.post") as post_mock:
+            fit, explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P", "methodology": "", "abstract": ""})
+        post_mock.assert_not_called()
+        self.assertTrue(fit)
+        self.assertIn("not checked", explanation)
+
+    def test_anonymized_columns_rejected_when_paper_does_not_mention_them(self):
+        candidate = make_candidate(local_csv_path=self._write_csv({
+            "Time": [0, 1], "V1": [-1.35, 0.2], "V2": [-0.07, 1.1], "Amount": [149.6, 2.6], "Class": [0, 1],
+        }))
+        parent_paper = {
+            "title": "Fraud detection using merchant category and transaction location",
+            "methodology": "We use named features including merchant category code, transaction "
+                            "location, and cardholder age to train a gradient boosted tree.",
+            "abstract": "",
+        }
+        llm_response = self._llm_response(
+            '{"fit": false, "explanation": "Columns are anonymized PCA components (V1, V2) with no '
+            'stated meaning; the paper describes named features not present here."}'
+        )
+        with patch("requests.post", return_value=llm_response):
+            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
+
+        self.assertFalse(fit)
+        self.assertIn("PCA", explanation)
+
+    def test_anonymized_columns_accepted_when_paper_describes_pca_features(self):
+        candidate = make_candidate(local_csv_path=self._write_csv({
+            "Time": [0, 1], "V1": [-1.35, 0.2], "Amount": [149.6, 2.6], "Class": [0, 1],
+        }))
+        parent_paper = {
+            "title": "Credit card fraud detection with PCA-transformed features",
+            "methodology": "We use the standard ULB dataset's 28 PCA-transformed components (V1-V28) "
+                            "along with Time and Amount.",
+            "abstract": "",
+        }
+        llm_response = self._llm_response('{"fit": true, "explanation": "Paper explicitly uses these PCA components."}')
+        with patch("requests.post", return_value=llm_response):
+            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
+
+        self.assertTrue(fit)
+
+    def test_unreadable_local_file_fails_open(self):
+        candidate = make_candidate(local_csv_path=str(Path(self._tmpdir) / "does_not_exist.csv"))
+        parent_paper = {"title": "P", "methodology": "Uses named clinical features.", "abstract": ""}
+        with patch("requests.post") as post_mock:
+            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
+        post_mock.assert_not_called()
+        self.assertTrue(fit)
+        self.assertIn("not checked", explanation)
+
+    def test_llm_failure_fails_open(self):
+        candidate = make_candidate(local_csv_path=self._write_csv({"amount": [1, 2]}))
+        parent_paper = {"title": "P", "methodology": "Uses named transaction features.", "abstract": ""}
+        with patch("requests.post", side_effect=RuntimeError("network down")):
+            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
+        self.assertTrue(fit)
+        self.assertIn("not checked", explanation)
+
+    def test_malformed_llm_json_fails_open(self):
+        candidate = make_candidate(local_csv_path=self._write_csv({"amount": [1, 2]}))
+        parent_paper = {"title": "P", "methodology": "Uses named transaction features.", "abstract": ""}
+        llm_response = self._llm_response("not valid json at all")
+        with patch("requests.post", return_value=llm_response):
+            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
+        self.assertTrue(fit)
 
 
 class TestDownloadHuggingfaceCsv(unittest.TestCase):
