@@ -56,18 +56,22 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL
+from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, KAGGLE_USERNAME, KAGGLE_KEY
 from src.search import brave_search
 from src.orchestration import dataset_cache
 from src.agents.validation_agent import _check_url_reachable
 
 TARGET_ENTRIES = 10000
-MIN_ENTRIES_TO_CONSIDER = 100
+MIN_ENTRIES_TO_CONSIDER = 1  # any real, non-empty download counts -- the
+                             # 10,000+ target is enforced on the merged
+                             # master CSV by the Cleaning Agent, not per
+                             # individual dataset here
 MAX_DATASETS = 5
-RESULTS_PER_QUERY = 10
+RESULTS_PER_QUERY = 25
 PAGE_FETCH_TIMEOUT = 15
 PAGE_TEXT_CHAR_LIMIT = 6000
 DOWNLOAD_TIMEOUT = 30
+KAGGLE_DOWNLOAD_TIMEOUT = 90  # Kaggle dataset zips are often large (tens of MB)
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 RAW_DATA_DIR = REPO_ROOT / "data" / "raw"
@@ -79,7 +83,14 @@ BROWSER_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
+# Kaggle's own API endpoint, counterintuitively, must NOT use a
+# browser-spoofing UA -- verified live that a Chrome-impersonating UA on
+# non-browser traffic trips Kaggle's reCAPTCHA gate even with valid
+# credentials, while identifying honestly as the API client does not.
+KAGGLE_USER_AGENT = "kaggle-api/1.6.17"
+
 HUGGINGFACE_DATASET_RE = re.compile(r"huggingface\.co/datasets/([^/?#]+(?:/[^/?#]+)?)")
+KAGGLE_DATASET_RE = re.compile(r"kaggle\.com/datasets/([^/?#]+)/([^/?#]+)")
 
 _CANDIDATE_DEFAULTS = {
     "name": "",             # canonical identity: the resolved downloadable link
@@ -427,20 +438,106 @@ def _download_huggingface_csv(candidate: dict) -> "pd.DataFrame | None":
         return None
 
 
+def _download_kaggle_dataset(candidate: dict) -> "pd.DataFrame | None":
+    """Kaggle blocks plain unauthenticated access behind a reCAPTCHA
+    challenge (confirmed repeatedly this session) -- when KAGGLE_USERNAME/
+    KAGGLE_KEY are configured, use the classic, long-stable REST endpoint
+    instead. Tries HTTP Basic Auth (the scheme that endpoint has used for
+    years) first, then falls back to a Bearer token (the newer per-account
+    API-token format) on a 401/403, since either could be what a given
+    token expects. Critically, this must use a User-Agent that identifies
+    as the Kaggle API client rather than the browser-spoofing
+    BROWSER_USER_AGENT used elsewhere -- verified live that a
+    Chrome-impersonating UA on non-browser traffic trips the same
+    reCAPTCHA gate even with valid credentials, while identifying honestly
+    as the API client does not. Never raises; returns None on any failure
+    (including no credentials configured, or a non-Kaggle URL), so the
+    generic download path still applies."""
+    if not KAGGLE_USERNAME or not KAGGLE_KEY:
+        return None
+    match = KAGGLE_DATASET_RE.search(candidate.get("source_url") or candidate.get("name", ""))
+    if not match:
+        return None
+    owner, slug = match.group(1), match.group(2)
+    url = f"https://www.kaggle.com/api/v1/datasets/download/{owner}/{slug}"
+
+    resp = None
+    try:
+        resp = requests.get(
+            url, timeout=KAGGLE_DOWNLOAD_TIMEOUT, headers={"User-Agent": KAGGLE_USER_AGENT},
+            auth=(KAGGLE_USERNAME, KAGGLE_KEY),
+        )
+        if resp.status_code in (401, 403):
+            resp = requests.get(
+                url, timeout=KAGGLE_DOWNLOAD_TIMEOUT,
+                headers={"User-Agent": KAGGLE_USER_AGENT, "Authorization": f"Bearer {KAGGLE_KEY}"},
+            )
+        resp.raise_for_status()
+    except Exception:
+        return None
+
+    return _parse_tabular_content(resp, url)
+
+
+def _search_kaggle_datasets(query: str, count: int = RESULTS_PER_QUERY) -> list:
+    """Query Kaggle's own dataset search API directly (when credentials are
+    configured) instead of depending on Brave having indexed a matching
+    Kaggle page. Verified live: GET /api/v1/datasets/list with the same
+    auth as downloading returns real, structured results (title, url,
+    subtitle, license, etc.) -- more reliable and far less run-to-run
+    variable than a general web search's ranking. Returns results shaped
+    like Brave's (title/url/description) so they flow through the existing
+    _extract_dataset_candidates_from_results pipeline unchanged. Never
+    raises; returns [] on any failure or when credentials aren't
+    configured, so this is a pure addition on top of the existing Brave
+    search, never a replacement."""
+    if not KAGGLE_USERNAME or not KAGGLE_KEY or not query:
+        return []
+    try:
+        resp = requests.get(
+            "https://www.kaggle.com/api/v1/datasets/list",
+            params={"search": query, "sortBy": "hottest", "page": 1},
+            timeout=DOWNLOAD_TIMEOUT,
+            headers={"User-Agent": KAGGLE_USER_AGENT},
+            auth=(KAGGLE_USERNAME, KAGGLE_KEY),
+        )
+        resp.raise_for_status()
+        datasets = resp.json()
+    except Exception:
+        return []
+
+    if not isinstance(datasets, list):
+        return []
+
+    results = []
+    for d in datasets[:count]:
+        ref = d.get("ref", "")
+        if not ref:
+            continue
+        results.append({
+            "title": d.get("title", ""),
+            "url": f"https://www.kaggle.com/datasets/{ref}",
+            "description": d.get("subtitle") or d.get("description", ""),
+        })
+    return results
+
+
 def _download_and_convert_to_csv(candidate: dict) -> bool:
     """Download the candidate's resolved link and convert it to a local
     CSV under data/raw/. Tries the Hugging Face special case first (its
-    dataset pages are HTML and would otherwise fail outright), then a
-    plain GET with content-sniffing. Never raises. On success, sets
-    local_csv_path and derives entry_count directly from the real file
-    (ground truth -- overrides any earlier guess). On failure, sets
-    download_status to a short reason and prints why, so a rejected
-    dataset's cause is visible in the console log the same way an added
-    one's provenance is."""
+    dataset pages are HTML and would otherwise fail outright), then the
+    Kaggle special case (if credentials are configured), then a plain GET
+    with content-sniffing. Never raises. On success, sets local_csv_path
+    and derives entry_count directly from the real file (ground truth --
+    overrides any earlier guess). On failure, sets download_status to a
+    short reason and prints why, so a rejected dataset's cause is visible
+    in the console log the same way an added one's provenance is."""
     url = candidate.get("source_url") or candidate.get("name", "")
     label = candidate.get("display_name") or candidate.get("name", "")
 
     df = _download_huggingface_csv(candidate)
+    if df is None:
+        df = _download_kaggle_dataset(candidate)
     if df is None:
         if not url:
             candidate["download_status"] = "failed: no source URL"
@@ -473,70 +570,42 @@ def _download_and_convert_to_csv(candidate: dict) -> bool:
     return True
 
 
+_OPAQUE_COLUMN_RE = re.compile(r"^(v|col|column|feature|feat|f|x|pc)_?\d+$", re.IGNORECASE)
+
+
 def _check_reproducibility_fit(candidate: dict, parent_paper: dict) -> tuple[bool, str]:
-    """Check whether the actual downloaded dataset's columns are things a
-    researcher could recognize and verify against the Parent Paper's
-    methodology -- catches a dataset that's topically in-scope and
-    successfully downloaded, but whose real structure (e.g. anonymized PCA
-    components like V1..V28) can't be confirmed to match what the paper
-    describes needing.
+    """Check whether the actual downloaded dataset's columns are readable
+    enough to be usable -- deterministic, not an LLM judgment call. An
+    earlier LLM-based version of this check (comparing columns against the
+    Parent Paper's methodology text) proved non-deterministic on borderline
+    cases -- the same dataset against the same paper got opposite verdicts
+    on different runs, which is unacceptable for a hard accept/reject gate.
+    Anonymized/opaque columns (PCA components, generic V1/col_3/feature_7
+    names) make a dataset unusable regardless of topical fit, since the
+    actual features can't be understood or verified -- so this rejects
+    unconditionally when a majority of columns match that pattern, with no
+    exception for what the paper's methodology says.
 
-    Defaults to (True, ...) -- fails open on any technical error or when
-    the Parent Paper has no methodology/abstract text to check against at
-    all, since this check should never block the pipeline over a transient
-    failure or missing paper metadata; it only rejects when the LLM can
-    make an actual, grounded judgment call."""
-    methodology = (parent_paper or {}).get("methodology") or ""
-    abstract = (parent_paper or {}).get("abstract") or ""
-    if not methodology and not abstract:
-        return True, "not checked -- Parent Paper has no methodology/abstract text to verify against"
-
+    `parent_paper` is accepted but unused -- kept so this stays a drop-in
+    replacement for the call sites in _resolve_dataset and
+    _search_exploration_sites. Fails open (True) only on a technical
+    failure (can't re-read the file), never fabricating a rejection it
+    can't support."""
     try:
         sample = pd.read_csv(candidate["local_csv_path"], nrows=5)
     except Exception as e:
         return True, f"not checked -- could not re-read downloaded file ({e})"
 
-    columns_desc = "\n".join(
-        f"  - {col} ({sample[col].dtype}): sample values {sample[col].head(3).tolist()}"
-        for col in sample.columns
-    )
-
-    prompt = f"""You are checking whether a downloaded dataset's actual columns are usable for reproducing a specific research paper's methodology.
-
-Paper title: "{parent_paper.get('title', '')}"
-Paper methodology: "{methodology[:1200]}"
-Paper abstract: "{abstract[:800]}"
-
-The dataset's actual columns (from the real downloaded file):
-{columns_desc}
-
-Determine whether these columns are things a researcher could recognize and verify against the paper's stated methodology (e.g. named features the methodology describes, or a comparable target/label column).
-
-Anonymized or opaque columns (PCA components, generic names like V1/V2/col_1/feature_3) are ONLY an acceptable fit if the paper's own methodology explicitly describes using that same anonymized or PCA-transformed structure -- not merely because the topic matches.
-
-Return ONLY valid JSON: {{"fit": <true or false>, "explanation": "<1-2 sentences>"}}"""
-
-    try:
-        response = requests.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}]},
-            timeout=60,
+    columns = list(sample.columns)
+    opaque = [c for c in columns if _OPAQUE_COLUMN_RE.match(str(c).strip())]
+    if columns and len(opaque) / len(columns) >= 0.5:
+        return False, (
+            f"{len(opaque)}/{len(columns)} columns are anonymized/opaque "
+            f"(e.g. {', '.join(str(c) for c in opaque[:5])}) with no stated meaning -- "
+            "rejected regardless of topical fit, since the actual features "
+            "can't be verified or understood."
         )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        match = re.search(r"\{[\s\S]*\}", content)
-        data = json.loads(match.group(0)) if match else json.loads(content)
-        fit = data.get("fit")
-        explanation = str(data.get("explanation", ""))
-        if isinstance(fit, bool):
-            return fit, explanation
-        return True, "not checked -- LLM response did not include a usable verdict"
-    except Exception as e:
-        return True, f"not checked -- reproducibility check failed ({e})"
+    return True, ""
 
 
 _VERIFICATION_METHOD_DESCRIPTIONS = {
@@ -588,9 +657,16 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
         served["verification_method"] = "cache_hit"
         return served
 
+    query = query_builder(dataset_name, dataset_source)
     try:
-        query = query_builder(dataset_name, dataset_source)
         results = brave_search.search(query, count=RESULTS_PER_QUERY)
+    except Exception:
+        results = []
+    results = results + _search_kaggle_datasets(query)
+    if not results:
+        return _default_candidate(display_name=dataset_name, notes="Dataset search failed: no results from any source.")
+
+    try:
         candidates = _extract_dataset_candidates_from_results(
             results, dataset_name, paper_title, scope_description
         )
@@ -688,6 +764,13 @@ def _search_exploration_sites(scope_description: str, parent_paper: dict = None)
         return []
     try:
         results = brave_search.search_dataset_sites(scope_description, count=RESULTS_PER_QUERY)
+    except Exception:
+        results = []
+    results = results + _search_kaggle_datasets(scope_description)
+    if not results:
+        return []
+
+    try:
         candidates = _extract_dataset_candidates_from_results(results, "", "", scope_description)
     except Exception:
         return []

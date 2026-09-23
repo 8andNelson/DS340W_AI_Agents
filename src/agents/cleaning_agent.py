@@ -24,6 +24,14 @@ set. Every reason a dataset couldn't be merged -- whether it had no CSV,
 an unreadable file, or an incompatible schema -- is written to
 logs/cleaning_conflicts.json and printed as it's found, per CLAUDE.md's
 "never silently drop, always log why" policy.
+
+The project's >=10,000-entry target is enforced here, on the merged
+master CSV's actual row count -- not on any individual dataset. Data
+Agent no longer gates individual candidates on entry count (removed so
+Kaggle's own dataset-search API, which doesn't expose row counts up
+front, can be used for discovery); this is the one place total volume
+actually gets checked, since it's the only point where the true, final,
+deduplicated row count is known.
 """
 import json
 import re
@@ -37,6 +45,7 @@ CONFLICTS_LOG = REPO_ROOT / "logs" / "cleaning_conflicts.json"
 MASTER_CSV_NAME = "master_dataset.csv"
 
 SOURCE_COLUMN = "_source_dataset"
+TARGET_ROWS = 10000
 
 
 def _normalize_column_name(col) -> str:
@@ -146,6 +155,8 @@ def run(selected_datasets: list) -> dict:
             "datasets_merged": 0,
             "rows_total": 0,
             "columns_total": 0,
+            "target_rows": TARGET_ROWS,
+            "target_met": False,
             "conflicts": conflicts,
             "notes": "No dataset could be merged into a master CSV.",
         }
@@ -159,11 +170,19 @@ def run(selected_datasets: list) -> dict:
     master_path = PROCESSED_DATA_DIR / MASTER_CSV_NAME
     master.to_csv(master_path, index=False)
 
-    status = "OK" if not conflicts else "DEGRADED"
-    notes = f"Removed {deduped} duplicate row(s) across the merged set." if deduped else ""
+    target_met = len(master) >= TARGET_ROWS
+    status = "OK" if (not conflicts and target_met) else "DEGRADED"
+
+    notes_parts = []
+    if deduped:
+        notes_parts.append(f"Removed {deduped} duplicate row(s) across the merged set.")
+    if not target_met:
+        notes_parts.append(f"Merged total is {len(master)} rows, below the {TARGET_ROWS}-row target.")
+    notes = " ".join(notes_parts)
 
     print(f"[Cleaning Agent] Done. Status={status}, merged={len(accepted_frames)}/{len(selected_datasets)}, "
-          f"rows={len(master)}, columns={master.shape[1]}, wrote {master_path}.")
+          f"rows={len(master)}/{TARGET_ROWS} (target met: {target_met}), "
+          f"columns={master.shape[1]}, wrote {master_path}.")
 
     return {
         "status": status,
@@ -172,6 +191,8 @@ def run(selected_datasets: list) -> dict:
         "datasets_merged": len(accepted_frames),
         "rows_total": len(master),
         "columns_total": master.shape[1],
+        "target_rows": TARGET_ROWS,
+        "target_met": target_met,
         "conflicts": conflicts,
         "notes": notes,
     }

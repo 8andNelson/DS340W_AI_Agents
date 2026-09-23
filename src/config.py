@@ -8,6 +8,8 @@ BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 SERPENT_API_KEY = os.getenv("SERPENT_API_KEY", "")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "")
+KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME", "")
+KAGGLE_KEY = os.getenv("KAGGLE_KEY", "")
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 

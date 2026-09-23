@@ -98,7 +98,8 @@ def _print_dataset_summary(result: dict) -> None:
 def _print_cleaning_summary(result: dict) -> None:
     print(f"\n--- Master Dataset ({result['status']}) ---")
     print(f"  Datasets merged: {result['datasets_merged']} / {result['datasets_attempted']}")
-    print(f"  Rows / columns:  {result['rows_total']} / {result['columns_total']}")
+    print(f"  Rows / columns:  {result['rows_total']} / {result['columns_total']} "
+          f"(target: {result.get('target_rows', 10000)}, target met: {result.get('target_met', False)})")
     if result.get("master_csv_path"):
         print(f"  Master CSV:      {result['master_csv_path']}")
 

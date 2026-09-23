@@ -143,7 +143,8 @@ def _format_cleaning_report(result: dict) -> str:
         "[Cleaning Agent] Master CSV for Parent Paper replication",
         f"Status:            {result.get('status', '')}",
         f"Datasets merged:   {result.get('datasets_merged', 0)} / {result.get('datasets_attempted', 0)}",
-        f"Rows / columns:    {result.get('rows_total', 0)} / {result.get('columns_total', 0)}",
+        f"Rows / columns:    {result.get('rows_total', 0)} / {result.get('columns_total', 0)} "
+        f"(target: {result.get('target_rows', 10000)}, target met: {result.get('target_met', False)})",
         f"Master CSV:        {result.get('master_csv_path', '')}",
     ]
     if result.get("conflicts"):
@@ -524,6 +525,7 @@ def run_pipeline(topic: str) -> dict:
             "master_csv_path": cleaning_result["master_csv_path"],
             "datasets_merged": cleaning_result["datasets_merged"],
             "rows_total": cleaning_result["rows_total"],
+            "target_met": cleaning_result["target_met"],
             "conflicts": cleaning_result["conflicts"],
         },
         "phase": "DATA_CLEANING",

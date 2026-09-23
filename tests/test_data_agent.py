@@ -10,6 +10,25 @@ import pandas as pd
 from src.agents import data_agent
 from src.orchestration import dataset_cache
 
+# KAGGLE_USERNAME/KAGGLE_KEY are genuinely configured in this project's real
+# .env -- without this, every test that reaches _resolve_dataset or
+# _search_exploration_sites would make live Kaggle API calls. Individual
+# Kaggle-specific test classes override this locally in their own setUp.
+_kaggle_creds_patches = [
+    patch.object(data_agent, "KAGGLE_USERNAME", ""),
+    patch.object(data_agent, "KAGGLE_KEY", ""),
+]
+
+
+def setUpModule():
+    for p in _kaggle_creds_patches:
+        p.start()
+
+
+def tearDownModule():
+    for p in _kaggle_creds_patches:
+        p.stop()
+
 
 def make_paper(**overrides) -> dict:
     paper = {
@@ -110,8 +129,8 @@ class TestRunAlgorithm(unittest.TestCase):
         self.assertIn("does not state a dataset", result["warnings"][0])
 
     def test_traversal_starts_at_second_highest_ranked_paper(self):
-        parent = make_paper(title="Parent", dataset="Small Dataset")
-        small = make_link_candidate("https://kaggle.com/small", entry_count=50)  # < 100, discarded
+        parent = make_paper(title="Parent", dataset="Empty Dataset")
+        empty = make_link_candidate("https://kaggle.com/empty", entry_count=0)  # genuinely 0 rows, discarded
         second = make_paper(title="Second", dataset="Second Dataset")
         second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=11000)
 
@@ -120,7 +139,7 @@ class TestRunAlgorithm(unittest.TestCase):
         def fake_find(paper, _scope, _parent=None):
             calls.append(paper["title"])
             if paper["title"] == "Parent":
-                return small
+                return empty
             if paper["title"] == "Second":
                 return second_candidate
             raise AssertionError(f"unexpected paper checked: {paper['title']}")
@@ -218,6 +237,38 @@ class TestRunAlgorithm(unittest.TestCase):
         self.assertEqual(result["total_entries"], 5000)
         self.assertEqual(result["status"], "DEGRADED")
         self.assertFalse(result["target_met"])
+
+
+class TestKaggleSearchIntegration(unittest.TestCase):
+    """Kaggle's own dataset search (when credentials are configured) is
+    merged alongside Brave's results, not a replacement for them -- both
+    _resolve_dataset (stage 1/2) and _search_exploration_sites (stage 3)
+    feed the combined list through the same extraction pipeline."""
+
+    def test_kaggle_results_merged_into_exploration_extraction(self):
+        kaggle_hit = {"title": "Kaggle Hit", "url": "https://www.kaggle.com/datasets/a/b", "description": ""}
+        with patch("src.search.brave_search.search_dataset_sites", return_value=[]), \
+             patch.object(data_agent, "_search_kaggle_datasets", return_value=[kaggle_hit]) as kaggle_mock, \
+             patch.object(data_agent, "_extract_dataset_candidates_from_results", return_value=[]) as extract_mock:
+            data_agent._search_exploration_sites("fraud detection scope")
+
+        kaggle_mock.assert_called_once_with("fraud detection scope")
+        results_arg = extract_mock.call_args.args[0]
+        self.assertIn(kaggle_hit, results_arg)
+
+    def test_kaggle_results_merged_into_resolve_dataset_extraction(self):
+        kaggle_hit = {"title": "Kaggle Hit", "url": "https://www.kaggle.com/datasets/a/b", "description": ""}
+        with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
+             patch("src.search.brave_search.search", return_value=[]), \
+             patch.object(data_agent, "_search_kaggle_datasets", return_value=[kaggle_hit]) as kaggle_mock, \
+             patch.object(data_agent, "_extract_dataset_candidates_from_results", return_value=[]) as extract_mock:
+            data_agent._resolve_dataset(
+                "Some Dataset", "", "", "", query_builder=data_agent._build_query,
+            )
+
+        kaggle_mock.assert_called_once()
+        results_arg = extract_mock.call_args.args[0]
+        self.assertIn(kaggle_hit, results_arg)
 
 
 class TestEscalationStages(unittest.TestCase):
@@ -537,14 +588,24 @@ class TestResolveDataset(unittest.TestCase):
 
 
 class TestEntryCountFloor(unittest.TestCase):
-    def test_min_entries_to_consider_is_100(self):
-        self.assertEqual(data_agent.MIN_ENTRIES_TO_CONSIDER, 100)
+    """The 10,000+ target is enforced on the merged master CSV by the
+    Cleaning Agent, not per individual dataset here -- so the floor is
+    trivial (any real, non-empty download counts), not a meaningful gate."""
+
+    def test_min_entries_to_consider_is_1(self):
+        self.assertEqual(data_agent.MIN_ENTRIES_TO_CONSIDER, 1)
 
     def test_boundary_usability(self):
-        at_floor = make_candidate(entry_count=100)
-        below_floor = make_candidate(entry_count=99)
+        at_floor = make_candidate(entry_count=1)
+        below_floor = make_candidate(entry_count=0)
         self.assertTrue(data_agent._usable(at_floor, data_agent.MIN_ENTRIES_TO_CONSIDER))
         self.assertFalse(data_agent._usable(below_floor, data_agent.MIN_ENTRIES_TO_CONSIDER))
+
+    def test_small_dataset_is_still_usable(self):
+        """A dataset far below the old 100-entry threshold is fine now --
+        individual size no longer gates inclusion."""
+        candidate = make_candidate(entry_count=12)
+        self.assertTrue(data_agent._usable(candidate, data_agent.MIN_ENTRIES_TO_CONSIDER))
 
     def test_undownloaded_candidate_is_never_usable(self):
         """A verified, in-scope, well-counted candidate that was never
@@ -830,14 +891,35 @@ class TestDownloadAndConvertToCsv(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(candidate["entry_count"], 2)
 
+    def test_kaggle_special_case_is_tried_between_huggingface_and_generic(self):
+        candidate = make_candidate(
+            name="https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud",
+            source_url="https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud",
+            local_csv_path="", entry_count=None, entry_count_source="",
+        )
+        fake_df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+
+        with patch.object(data_agent, "_download_huggingface_csv", return_value=None) as hf_mock, \
+             patch.object(data_agent, "_download_kaggle_dataset", return_value=fake_df) as kaggle_mock, \
+             patch("requests.get") as get_mock:
+            ok = data_agent._download_and_convert_to_csv(candidate)
+
+        hf_mock.assert_called_once_with(candidate)
+        kaggle_mock.assert_called_once_with(candidate)
+        get_mock.assert_not_called()  # generic path never reached
+        self.assertTrue(ok)
+        self.assertEqual(candidate["entry_count"], 2)
+
 
 class TestReproducibilityFitCheck(unittest.TestCase):
-    """_check_reproducibility_fit: verifies the actual downloaded columns
-    against the Parent Paper's methodology, catching e.g. anonymized/PCA
-    columns (V1..V28) that can't be confirmed to match what the paper
-    describes needing. Fails open (returns True) on anything it can't
-    actually judge -- missing paper text, or a technical error -- and only
-    rejects when the LLM makes a real, grounded call."""
+    """_check_reproducibility_fit: deterministic, not an LLM judgment call
+    -- an earlier LLM-based version proved non-deterministic on borderline
+    cases (same dataset + same paper, opposite verdicts on different runs),
+    which is unacceptable for a hard accept/reject gate. Anonymized/opaque
+    columns (PCA components, generic V1/col_3/feature_7 names) are rejected
+    unconditionally when they're the majority of a dataset's columns --
+    no exception for what the paper's methodology says. Fails open (True)
+    only on a technical failure (can't re-read the file)."""
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
@@ -850,80 +932,200 @@ class TestReproducibilityFitCheck(unittest.TestCase):
         pd.DataFrame(columns_and_rows).to_csv(path, index=False)
         return str(path)
 
-    def _llm_response(self, content_json: str) -> MagicMock:
-        response = MagicMock()
-        response.json.return_value = {"choices": [{"message": {"content": content_json}}]}
-        response.raise_for_status = lambda: None
-        return response
-
-    def test_no_methodology_or_abstract_skips_the_check(self):
-        candidate = make_candidate(local_csv_path=self._write_csv({"amount": [1, 2]}))
+    def test_majority_opaque_columns_rejected(self):
+        candidate = make_candidate(local_csv_path=self._write_csv({
+            "Time": [0, 1], "V1": [-1.35, 0.2], "V2": [-0.07, 1.1], "V3": [1.0, 2.0],
+            "Amount": [149.6, 2.6], "Class": [0, 1],
+        }))
         with patch("requests.post") as post_mock:
-            fit, explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P", "methodology": "", "abstract": ""})
-        post_mock.assert_not_called()
-        self.assertTrue(fit)
-        self.assertIn("not checked", explanation)
+            fit, explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
 
-    def test_anonymized_columns_rejected_when_paper_does_not_mention_them(self):
-        candidate = make_candidate(local_csv_path=self._write_csv({
-            "Time": [0, 1], "V1": [-1.35, 0.2], "V2": [-0.07, 1.1], "Amount": [149.6, 2.6], "Class": [0, 1],
-        }))
-        parent_paper = {
-            "title": "Fraud detection using merchant category and transaction location",
-            "methodology": "We use named features including merchant category code, transaction "
-                            "location, and cardholder age to train a gradient boosted tree.",
-            "abstract": "",
-        }
-        llm_response = self._llm_response(
-            '{"fit": false, "explanation": "Columns are anonymized PCA components (V1, V2) with no '
-            'stated meaning; the paper describes named features not present here."}'
-        )
-        with patch("requests.post", return_value=llm_response):
-            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
-
+        post_mock.assert_not_called()  # no LLM call at all -- fully deterministic
         self.assertFalse(fit)
-        self.assertIn("PCA", explanation)
+        self.assertIn("V1", explanation)
+        self.assertIn("anonymized", explanation)
 
-    def test_anonymized_columns_accepted_when_paper_describes_pca_features(self):
+    def test_result_is_identical_across_repeated_calls(self):
+        """The whole point of the fix -- same input, same verdict, every time."""
         candidate = make_candidate(local_csv_path=self._write_csv({
-            "Time": [0, 1], "V1": [-1.35, 0.2], "Amount": [149.6, 2.6], "Class": [0, 1],
+            "Time": [0, 1], "V1": [-1.35, 0.2], "V2": [-0.07, 1.1], "V3": [1.0, 2.0],
+            "Amount": [149.6, 2.6], "Class": [0, 1],
         }))
-        parent_paper = {
-            "title": "Credit card fraud detection with PCA-transformed features",
-            "methodology": "We use the standard ULB dataset's 28 PCA-transformed components (V1-V28) "
-                            "along with Time and Amount.",
-            "abstract": "",
-        }
-        llm_response = self._llm_response('{"fit": true, "explanation": "Paper explicitly uses these PCA components."}')
-        with patch("requests.post", return_value=llm_response):
-            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
+        results = [data_agent._check_reproducibility_fit(candidate, {"title": "P"}) for _ in range(5)]
+        self.assertEqual(len({r[0] for r in results}), 1)
+        self.assertFalse(results[0][0])
 
+    def test_normal_named_columns_accepted(self):
+        candidate = make_candidate(local_csv_path=self._write_csv({
+            "merchant_category": ["grocery", "retail"], "transaction_amount": [10.5, 200.0],
+            "cardholder_age": [34, 51], "is_fraud": [0, 1],
+        }))
+        fit, explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
         self.assertTrue(fit)
+        self.assertEqual(explanation, "")
+
+    def test_single_opaque_column_among_many_named_ones_is_still_accepted(self):
+        """Below the 50% threshold -- one anonymized column doesn't make an
+        otherwise-interpretable dataset unusable."""
+        candidate = make_candidate(local_csv_path=self._write_csv({
+            "merchant_category": ["grocery", "retail"], "transaction_amount": [10.5, 200.0],
+            "cardholder_age": [34, 51], "is_fraud": [0, 1], "pc1": [0.1, 0.2],
+        }))
+        fit, _explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
+        self.assertTrue(fit)
+
+    def test_exactly_half_opaque_is_rejected(self):
+        candidate = make_candidate(local_csv_path=self._write_csv({
+            "amount": [1, 2], "V1": [0.1, 0.2],
+        }))
+        fit, _explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
+        self.assertFalse(fit)
 
     def test_unreadable_local_file_fails_open(self):
         candidate = make_candidate(local_csv_path=str(Path(self._tmpdir) / "does_not_exist.csv"))
-        parent_paper = {"title": "P", "methodology": "Uses named clinical features.", "abstract": ""}
-        with patch("requests.post") as post_mock:
-            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
-        post_mock.assert_not_called()
+        fit, explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
         self.assertTrue(fit)
         self.assertIn("not checked", explanation)
 
-    def test_llm_failure_fails_open(self):
-        candidate = make_candidate(local_csv_path=self._write_csv({"amount": [1, 2]}))
-        parent_paper = {"title": "P", "methodology": "Uses named transaction features.", "abstract": ""}
-        with patch("requests.post", side_effect=RuntimeError("network down")):
-            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
-        self.assertTrue(fit)
-        self.assertIn("not checked", explanation)
 
-    def test_malformed_llm_json_fails_open(self):
-        candidate = make_candidate(local_csv_path=self._write_csv({"amount": [1, 2]}))
-        parent_paper = {"title": "P", "methodology": "Uses named transaction features.", "abstract": ""}
-        llm_response = self._llm_response("not valid json at all")
-        with patch("requests.post", return_value=llm_response):
-            fit, explanation = data_agent._check_reproducibility_fit(candidate, parent_paper)
-        self.assertTrue(fit)
+class TestDownloadKaggleDataset(unittest.TestCase):
+    """_download_kaggle_dataset: only engages when KAGGLE_USERNAME/KAGGLE_KEY
+    are configured (so it's a no-op for anyone else running the project),
+    tries HTTP Basic Auth first, falls back to a Bearer token on 401/403."""
+
+    def setUp(self):
+        self._user_patch = patch.object(data_agent, "KAGGLE_USERNAME", "testuser")
+        self._key_patch = patch.object(data_agent, "KAGGLE_KEY", "testkey")
+        self._user_patch.start()
+        self._key_patch.start()
+
+    def tearDown(self):
+        self._user_patch.stop()
+        self._key_patch.stop()
+
+    def test_no_credentials_returns_none_without_request(self):
+        with patch.object(data_agent, "KAGGLE_USERNAME", ""), \
+             patch.object(data_agent, "KAGGLE_KEY", ""), \
+             patch("requests.get") as get_mock:
+            result = data_agent._download_kaggle_dataset(
+                make_candidate(source_url="https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud")
+            )
+        get_mock.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_non_kaggle_url_returns_none_without_request(self):
+        with patch("requests.get") as get_mock:
+            result = data_agent._download_kaggle_dataset(
+                make_candidate(source_url="https://example.com/data.csv")
+            )
+        get_mock.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_basic_auth_success(self):
+        resp = make_response(b"a,b\n1,2\n3,4\n", content_type="text/csv")
+        resp.status_code = 200
+        with patch("requests.get", return_value=resp) as get_mock:
+            df = data_agent._download_kaggle_dataset(
+                make_candidate(source_url="https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud")
+            )
+        self.assertEqual(len(df), 2)
+        _args, kwargs = get_mock.call_args
+        self.assertEqual(kwargs.get("auth"), ("testuser", "testkey"))
+
+    def test_falls_back_to_bearer_token_on_401(self):
+        unauthorized = MagicMock(status_code=401)
+        authorized = make_response(b"a,b\n1,2\n", content_type="text/csv")
+        authorized.status_code = 200
+
+        with patch("requests.get", side_effect=[unauthorized, authorized]) as get_mock:
+            df = data_agent._download_kaggle_dataset(
+                make_candidate(source_url="https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud")
+            )
+
+        self.assertEqual(len(df), 1)
+        self.assertEqual(get_mock.call_count, 2)
+        second_call_kwargs = get_mock.call_args_list[1].kwargs
+        self.assertEqual(second_call_kwargs["headers"]["Authorization"], "Bearer testkey")
+
+    def test_request_failure_returns_none(self):
+        with patch("requests.get", side_effect=RuntimeError("network down")):
+            result = data_agent._download_kaggle_dataset(
+                make_candidate(source_url="https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud")
+            )
+        self.assertIsNone(result)
+
+
+class TestSearchKaggleDatasets(unittest.TestCase):
+    """_search_kaggle_datasets: queries Kaggle's own dataset search API
+    directly (more reliable than depending on Brave having indexed a
+    matching Kaggle page), returning results shaped like Brave's
+    (title/url/description) so they flow through the existing extraction
+    pipeline unchanged."""
+
+    def setUp(self):
+        self._user_patch = patch.object(data_agent, "KAGGLE_USERNAME", "testuser")
+        self._key_patch = patch.object(data_agent, "KAGGLE_KEY", "testkey")
+        self._user_patch.start()
+        self._key_patch.start()
+
+    def tearDown(self):
+        self._user_patch.stop()
+        self._key_patch.stop()
+
+    def _list_response(self, datasets: list) -> MagicMock:
+        resp = MagicMock()
+        resp.raise_for_status = lambda: None
+        resp.json.return_value = datasets
+        return resp
+
+    def test_no_credentials_returns_empty_without_request(self):
+        with patch.object(data_agent, "KAGGLE_USERNAME", ""), \
+             patch.object(data_agent, "KAGGLE_KEY", ""), \
+             patch("requests.get") as get_mock:
+            result = data_agent._search_kaggle_datasets("credit card fraud")
+        get_mock.assert_not_called()
+        self.assertEqual(result, [])
+
+    def test_empty_query_returns_empty_without_request(self):
+        with patch("requests.get") as get_mock:
+            result = data_agent._search_kaggle_datasets("")
+        get_mock.assert_not_called()
+        self.assertEqual(result, [])
+
+    def test_maps_kaggle_fields_into_brave_shaped_results(self):
+        resp = self._list_response([
+            {"ref": "mlg-ulb/creditcardfraud", "title": "Credit Card Fraud Detection",
+             "subtitle": "Anonymized credit card transactions"},
+            {"ref": "someone/other-dataset", "title": "Other Dataset", "subtitle": ""},
+        ])
+        with patch("requests.get", return_value=resp) as get_mock:
+            results = data_agent._search_kaggle_datasets("credit card fraud")
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["title"], "Credit Card Fraud Detection")
+        self.assertEqual(results[0]["url"], "https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud")
+        self.assertEqual(results[0]["description"], "Anonymized credit card transactions")
+        _args, kwargs = get_mock.call_args
+        self.assertEqual(kwargs["auth"], ("testuser", "testkey"))
+        self.assertEqual(kwargs["params"]["search"], "credit card fraud")
+
+    def test_entries_missing_ref_are_skipped(self):
+        resp = self._list_response([{"title": "No ref here", "subtitle": ""}])
+        with patch("requests.get", return_value=resp):
+            results = data_agent._search_kaggle_datasets("query")
+        self.assertEqual(results, [])
+
+    def test_non_list_response_returns_empty(self):
+        resp = self._list_response(None)
+        resp.json.return_value = {"unexpected": "shape"}
+        with patch("requests.get", return_value=resp):
+            results = data_agent._search_kaggle_datasets("query")
+        self.assertEqual(results, [])
+
+    def test_request_failure_returns_empty(self):
+        with patch("requests.get", side_effect=RuntimeError("network down")):
+            results = data_agent._search_kaggle_datasets("query")
+        self.assertEqual(results, [])
 
 
 class TestDownloadHuggingfaceCsv(unittest.TestCase):

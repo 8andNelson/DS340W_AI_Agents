@@ -51,7 +51,11 @@ class TestSuccessfulMerge(CleaningAgentTestCase):
 
         result = cleaning_agent.run(candidates)
 
-        self.assertEqual(result["status"], "OK")
+        # DEGRADED, not OK -- no conflicts, but only 3 rows total, well
+        # under the 10,000-row target (see TestTargetRows for OK vs
+        # DEGRADED specifically).
+        self.assertEqual(result["status"], "DEGRADED")
+        self.assertFalse(result["target_met"])
         self.assertEqual(result["datasets_merged"], 2)
         self.assertEqual(result["conflicts"], [])
         self.assertTrue(Path(result["master_csv_path"]).exists())
@@ -85,6 +89,55 @@ class TestSuccessfulMerge(CleaningAgentTestCase):
         # Row (x=1) from A and (x=1) from B differ by _source_dataset, so
         # they are NOT exact duplicates and both survive -- 4 total rows.
         self.assertEqual(result["rows_total"], 4)
+
+
+class TestTargetRows(CleaningAgentTestCase):
+    """The project's >=10,000-entry target is enforced here, on the merged
+    master CSV's actual row count -- not per individual dataset (Data
+    Agent no longer gates on that, so Kaggle's row-count-free search API
+    can be used for discovery)."""
+
+    def test_target_rows_constant_is_10000(self):
+        self.assertEqual(cleaning_agent.TARGET_ROWS, 10000)
+
+    def test_status_ok_when_merged_total_meets_target(self):
+        big = pd.DataFrame({"amount": range(10000), "label": [0] * 10000})
+        path = self._write_csv("big.csv", big)
+        result = cleaning_agent.run([make_candidate(name="https://example.com/big", local_csv_path=path)])
+
+        self.assertEqual(result["rows_total"], 10000)
+        self.assertTrue(result["target_met"])
+        self.assertEqual(result["status"], "OK")
+
+    def test_status_degraded_when_merged_total_is_under_target(self):
+        small = pd.DataFrame({"amount": [1, 2, 3]})
+        path = self._write_csv("small.csv", small)
+        result = cleaning_agent.run([make_candidate(name="https://example.com/small", local_csv_path=path)])
+
+        self.assertFalse(result["target_met"])
+        self.assertEqual(result["status"], "DEGRADED")
+        self.assertIn("below the 10000-row target", result["notes"])
+
+    def test_status_degraded_when_target_met_but_conflicts_exist(self):
+        """Hitting the row target doesn't excuse an unmerged dataset from
+        being visible -- conflicts still make the outcome DEGRADED even
+        when volume is fine."""
+        big = pd.DataFrame({"amount": range(10000)})
+        good_path = self._write_csv("big.csv", big)
+        candidates = [
+            make_candidate(name="https://example.com/big", local_csv_path=good_path),
+            make_candidate(name="https://example.com/missing", local_csv_path=""),
+        ]
+        result = cleaning_agent.run(candidates)
+
+        self.assertTrue(result["target_met"])
+        self.assertEqual(len(result["conflicts"]), 1)
+        self.assertEqual(result["status"], "DEGRADED")
+
+    def test_not_found_reports_target_not_met(self):
+        result = cleaning_agent.run([])
+        self.assertFalse(result["target_met"])
+        self.assertEqual(result["target_rows"], 10000)
 
 
 class TestConflicts(CleaningAgentTestCase):

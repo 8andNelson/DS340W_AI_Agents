@@ -173,13 +173,16 @@ def make_data_result(**overrides) -> dict:
 
 def make_cleaning_result(**overrides) -> dict:
     merged = overrides.pop("datasets_merged", 1)
+    rows_total = overrides.pop("rows_total", 12000 if merged else 0)
     result = {
         "status": "OK" if merged else "NOT_FOUND",
         "master_csv_path": "data/processed/master_dataset.csv" if merged else "",
         "datasets_attempted": merged,
         "datasets_merged": merged,
-        "rows_total": 1000 if merged else 0,
+        "rows_total": rows_total,
         "columns_total": 5 if merged else 0,
+        "target_rows": 10000,
+        "target_met": rows_total >= 10000,
         "conflicts": [],
         "notes": "",
     }
