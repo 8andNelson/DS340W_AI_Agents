@@ -89,24 +89,39 @@ def _check_prohibited_source(url: str) -> str:
     return ""
 
 
+# A realistic browser UA -- some hosts (e.g. Kaggle) return 403s to an
+# identifying bot User-Agent even for pages that are genuinely public,
+# producing false "unreachable" verdicts.
+_REACHABILITY_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+
 def _check_url_reachable(url: str) -> tuple[bool, int]:
-    """Return (reachable, status_code) for a URL."""
+    """Return (reachable, status_code) for a URL. Falls back to GET whenever
+    HEAD fails to confirm reachability -- either by raising, or by coming
+    back >= 400 -- since some hosts (e.g. Kaggle) don't implement HEAD
+    correctly on dataset pages and return a 404 for it even though the page
+    is genuinely live."""
     if not url:
         return False, 0
     try:
         resp = requests.head(url, timeout=URL_TIMEOUT, allow_redirects=True,
-                             headers={"User-Agent": "Mozilla/5.0 (research-bot)"})
+                             headers={"User-Agent": _REACHABILITY_USER_AGENT})
+        if resp.status_code < 400:
+            return True, resp.status_code
+    except Exception:
+        pass
+
+    try:
+        resp = requests.get(url, timeout=URL_TIMEOUT, allow_redirects=True,
+                            headers={"User-Agent": _REACHABILITY_USER_AGENT},
+                            stream=True)
+        resp.close()
         return resp.status_code < 400, resp.status_code
     except Exception:
-        try:
-            # Fallback: some servers reject HEAD, try GET with short timeout
-            resp = requests.get(url, timeout=URL_TIMEOUT, allow_redirects=True,
-                                headers={"User-Agent": "Mozilla/5.0 (research-bot)"},
-                                stream=True)
-            resp.close()
-            return resp.status_code < 400, resp.status_code
-        except Exception:
-            return False, 0
+        return False, 0
 
 
 def _is_credible_domain(url: str) -> bool:
@@ -515,6 +530,7 @@ def rank_and_recommend(validation_results: dict) -> dict:
             "degraded": True,
             "degraded_reason": pool_info["reason"],
             "comparison_table": [],
+            "ranked_pool": [],
             "code_availability_audit": {"count_with_code": 0, "titles_with_code": [], "policy_violation": False, "note": ""},
             "recommended_parent_paper": None,
             "runner_ups": [],
@@ -547,6 +563,7 @@ def rank_and_recommend(validation_results: dict) -> dict:
         "degraded": pool_info["degraded"],
         "degraded_reason": pool_info["reason"],
         "comparison_table": [rows[i] for i in ranked_indices],
+        "ranked_pool": [pool[i] for i in ranked_indices],
         "code_availability_audit": audit,
         "recommended_parent_paper": pool[chosen_idx],
         "runner_ups": [pool[i] for i in runner_up_indices],

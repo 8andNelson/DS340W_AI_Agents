@@ -77,6 +77,37 @@ def _print_parent_paper_recommendation(rec: dict) -> None:
     print(f"\n  Justification:\n  {rec['justification']}")
 
 
+def _print_dataset_summary(result: dict) -> None:
+    print(f"\n--- Dataset Pool ({result['status']}) ---")
+    print(f"  Total entries: {result['total_entries']} / {result['target_entries']} "
+          f"(target met: {result['target_met']})")
+    print(f"  Datasets used: {len(result['selected_datasets'])} "
+          f"(considered {result['datasets_considered']} candidate papers)")
+    print(f"  Search stage:  {result['search_stage']}")
+
+    for d in result["selected_datasets"]:
+        label = d.get("display_name") or d.get("name", "")
+        print(f"    - {label} ({d.get('source', '')}): {d.get('entry_count', '?')} entries -> {d.get('name', '')}")
+
+    if result.get("warnings"):
+        print("  Warnings:")
+        for w in result["warnings"]:
+            print(f"    - {w}")
+
+
+def _print_cleaning_summary(result: dict) -> None:
+    print(f"\n--- Master Dataset ({result['status']}) ---")
+    print(f"  Datasets merged: {result['datasets_merged']} / {result['datasets_attempted']}")
+    print(f"  Rows / columns:  {result['rows_total']} / {result['columns_total']}")
+    if result.get("master_csv_path"):
+        print(f"  Master CSV:      {result['master_csv_path']}")
+
+    if result.get("conflicts"):
+        print("  Conflicts:")
+        for c in result["conflicts"]:
+            print(f"    - {c.get('dataset', '')} ({c.get('link', '')}): {c.get('reason', '')}")
+
+
 def main():
     print(BANNER)
 
@@ -97,7 +128,8 @@ def main():
         sys.exit(1)
 
     print(f"\nTopic: {topic}")
-    print("\n[Master Agent] Starting supervised pipeline (Intake -> Research -> Validation & Selection)...")
+    print("\n[Master Agent] Starting supervised pipeline "
+          "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent)...")
 
     result = master_agent.run_pipeline(topic)
 
@@ -119,10 +151,17 @@ def main():
     _print_validation_summary(validation_result)
     _print_parent_paper_recommendation(validation_result)
 
-    print("\n[State] Phase -> MASTER_APPROVAL")
+    if result["dataset_result"]:
+        _print_dataset_summary(result["dataset_result"])
+
+    if result["cleaning_result"]:
+        _print_cleaning_summary(result["cleaning_result"])
+
+    print(f"\n[State] Phase -> {result['phase']}")
     print("[State] parent_paper_approved -> True")
     print("[State] Saved to logs/project_state.json")
-    print("\nParent Paper approved by Master Agent. Ready for Code Discovery (Milestone 7).")
+    print("\nParent Paper approved, dataset pool built, and master CSV cleaned. "
+          "Next pipeline stage: Code Discovery (Milestone 9).")
 
 
 if __name__ == "__main__":
