@@ -3,4 +3,6 @@ slack_sdk
 python-dotenv
 requests
 beautifulsoup4
+pandas
+pyarrow
 pytest

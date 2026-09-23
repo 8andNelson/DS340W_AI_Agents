@@ -4,8 +4,7 @@ Data Agent (Milestone 6).
 Builds a dataset pool of at least TARGET_ENTRIES total entries to support
 the Parent Paper's replication, escalating through three stages:
 
-  1. Parent Paper's own stated dataset. If it alone reaches the target,
-     stop there.
+  1. Parent Paper's own stated dataset.
   2. The full ranked candidate pool (composite-score order, starting at the
      second-highest paper), each paper's own stated dataset -- no cap on
      how many papers are checked.
@@ -16,6 +15,13 @@ the Parent Paper's replication, escalating through three stages:
      project's scope, scoring each candidate on usability (entry count,
      license, format, access method) since there's no single paper claim to
      match against here.
+
+Collection does NOT stop the moment the entry-count target is reached --
+it keeps adding further qualifying, non-duplicate datasets (across all
+three stages) up to MAX_DATASETS, so a pool of several smaller datasets is
+preferred over stopping at the first single dataset big enough to meet the
+target alone. It still stops early once MAX_DATASETS is reached, or once
+a stage's candidates are exhausted, whichever comes first.
 
 A dataset's identity is its resolved downloadable link (`name`), not any
 text name mentioned in a paper -- two papers naming the same dataset
@@ -30,9 +36,23 @@ Never invents a dataset a paper doesn't claim to use, never invents an
 entry count that isn't explicitly stated by the source, and never accepts
 a dataset without confirming it is both reachable and in scope, per
 CLAUDE.md's Source Verification / No Hallucination Policy.
+
+A candidate is also only ever counted once it has actually been
+downloaded and converted to a local CSV file (data/raw/) -- a dataset that
+merely resolves to a real, in-scope, reachable page (e.g. most Kaggle
+pages, which gate real access behind a reCAPTCHA challenge) but can't
+actually be fetched is rejected the same way an unreachable one is. This
+is what lets the downstream Cleaning Agent assume every dataset it's
+handed is a real local file, with no downloading of its own to do.
 """
+import hashlib
+import io
 import json
 import re
+import zipfile
+from pathlib import Path
+
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
@@ -42,11 +62,15 @@ from src.orchestration import dataset_cache
 from src.agents.validation_agent import _check_url_reachable
 
 TARGET_ENTRIES = 10000
-SINGLE_DATASET_THRESHOLD = 10000
 MIN_ENTRIES_TO_CONSIDER = 100
+MAX_DATASETS = 5
 RESULTS_PER_QUERY = 10
 PAGE_FETCH_TIMEOUT = 15
 PAGE_TEXT_CHAR_LIMIT = 6000
+DOWNLOAD_TIMEOUT = 30
+
+REPO_ROOT = Path(__file__).parent.parent.parent
+RAW_DATA_DIR = REPO_ROOT / "data" / "raw"
 
 # A realistic browser UA -- some dataset hosts (e.g. Kaggle) return 403s to
 # an identifying bot User-Agent even for pages that are genuinely public.
@@ -74,6 +98,8 @@ _CANDIDATE_DEFAULTS = {
     "usability_score": None,
     "verified": False,
     "verification_method": "",
+    "local_csv_path": "",   # set once downloaded and converted -- see _download_and_convert_to_csv
+    "download_status": "",  # "" until attempted; "ok" or "failed: <reason>" after
     "notes": "",
 }
 
@@ -303,6 +329,148 @@ def _resolve_entry_count(candidate: dict, dataset_name: str) -> None:
         candidate["entry_count_source"] = "the dataset's own page"
 
 
+def _slugify(candidate: dict) -> str:
+    """Filesystem-safe, stable filename for a candidate's downloaded CSV --
+    a short slug of its display name plus a hash of its resolved link, so
+    two differently-named candidates never collide and re-downloading the
+    same link produces the same filename."""
+    base = candidate.get("display_name") or candidate.get("name") or "dataset"
+    slug = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")[:60]
+    link_hash = hashlib.sha1((candidate.get("name") or "").encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{link_hash}" if slug else link_hash
+
+
+def _parse_tabular_content(resp: "requests.Response", url: str) -> "pd.DataFrame | None":
+    """Sniff a downloaded response and try to read it as tabular data.
+    Never raises -- returns None if nothing works. Rejects immediately on
+    an HTML content type: a landing page (the single most common failure
+    mode observed against real dataset hosts) can otherwise "succeed" as a
+    one-column garbage CSV if read blindly."""
+    content_type = resp.headers.get("Content-Type", "").lower()
+    if "html" in content_type:
+        return None
+
+    lower_url = url.lower()
+    content = resp.content
+
+    if "zip" in content_type or lower_url.endswith(".zip"):
+        return _parse_zip_for_csv(content)
+
+    if "json" in content_type or lower_url.endswith((".json", ".jsonl")):
+        try:
+            return pd.read_json(io.BytesIO(content), lines=lower_url.endswith(".jsonl"))
+        except Exception:
+            pass
+
+    if lower_url.endswith(".parquet") or "parquet" in content_type:
+        try:
+            return pd.read_parquet(io.BytesIO(content))
+        except Exception:
+            pass
+
+    # Default / fallback: most direct-download dataset links are CSV/TSV
+    # even when the server doesn't set an accurate Content-Type.
+    try:
+        df = pd.read_csv(io.BytesIO(content), sep=None, engine="python")
+        if df.shape[1] > 0 and df.shape[0] > 0:
+            return df
+    except Exception:
+        pass
+
+    return None
+
+
+def _parse_zip_for_csv(content: bytes) -> "pd.DataFrame | None":
+    """Extract the largest CSV member from a downloaded zip (Kaggle-style
+    packaging) and read it. Never raises."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+            if not csv_names:
+                return None
+            largest = max(csv_names, key=lambda n: zf.getinfo(n).file_size)
+            with zf.open(largest) as f:
+                return pd.read_csv(f)
+    except Exception:
+        return None
+
+
+def _download_huggingface_csv(candidate: dict) -> "pd.DataFrame | None":
+    """A Hugging Face dataset's own page is HTML (the generic path would
+    reject it) -- instead resolve a real Parquet file via HF's public
+    datasets-server API and read that directly. Never raises."""
+    match = HUGGINGFACE_DATASET_RE.search(candidate.get("source_url") or candidate.get("name", ""))
+    if not match:
+        return None
+    dataset_id = match.group(1).strip("/")
+
+    try:
+        resp = requests.get(
+            "https://datasets-server.huggingface.co/parquet",
+            params={"dataset": dataset_id},
+            timeout=DOWNLOAD_TIMEOUT,
+            headers={"User-Agent": BROWSER_USER_AGENT},
+        )
+        resp.raise_for_status()
+        parquet_files = resp.json().get("parquet_files", [])
+        if not parquet_files:
+            return None
+        file_url = parquet_files[0].get("url", "")
+        if not file_url:
+            return None
+        file_resp = requests.get(file_url, timeout=DOWNLOAD_TIMEOUT, headers={"User-Agent": BROWSER_USER_AGENT})
+        file_resp.raise_for_status()
+        return pd.read_parquet(io.BytesIO(file_resp.content))
+    except Exception:
+        return None
+
+
+def _download_and_convert_to_csv(candidate: dict) -> bool:
+    """Download the candidate's resolved link and convert it to a local
+    CSV under data/raw/. Tries the Hugging Face special case first (its
+    dataset pages are HTML and would otherwise fail outright), then a
+    plain GET with content-sniffing. Never raises. On success, sets
+    local_csv_path and derives entry_count directly from the real file
+    (ground truth -- overrides any earlier guess). On failure, sets
+    download_status to a short reason and prints why, so a rejected
+    dataset's cause is visible in the console log the same way an added
+    one's provenance is."""
+    url = candidate.get("source_url") or candidate.get("name", "")
+    label = candidate.get("display_name") or candidate.get("name", "")
+
+    df = _download_huggingface_csv(candidate)
+    if df is None:
+        if not url:
+            candidate["download_status"] = "failed: no source URL"
+            return False
+        try:
+            resp = requests.get(url, timeout=DOWNLOAD_TIMEOUT, headers={"User-Agent": BROWSER_USER_AGENT})
+            resp.raise_for_status()
+        except Exception as e:
+            candidate["download_status"] = f"failed: could not fetch URL ({e})"
+            print(f"[Data Agent] Could not download '{label}' from {url}: {e}")
+            return False
+        df = _parse_tabular_content(resp, url)
+
+    if df is None or df.empty or df.shape[1] == 0:
+        candidate["download_status"] = (
+            "failed: content is not parseable tabular data "
+            "(likely an HTML landing page, a zip with no CSV inside, or an unsupported format)"
+        )
+        print(f"[Data Agent] '{label}' from {url} did not resolve to usable tabular data; skipped.")
+        return False
+
+    RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = RAW_DATA_DIR / f"{_slugify(candidate)}.csv"
+    df.to_csv(path, index=False)
+
+    candidate["local_csv_path"] = str(path)
+    candidate["download_status"] = "ok"
+    candidate["entry_count"] = len(df)
+    candidate["entry_count_source"] = "downloaded file"
+    return True
+
+
 _VERIFICATION_METHOD_DESCRIPTIONS = {
     "cache_hit": "reused from an earlier search",
     "brave_search": "found via Brave search for the paper's stated dataset name",
@@ -365,14 +533,15 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
         c["name"] = c.get("source_url", "")
         if not c.get("in_scope"):
             continue
-        _resolve_entry_count(c, dataset_name)
-        if isinstance(c.get("entry_count"), int):
+        if _download_and_convert_to_csv(c):
             dataset_cache.cache_dataset(dataset_name, c)
             return c
-        # Reachable and in scope, but no entry count found anywhere -- keep
-        # it as a fallback answer, but deliberately don't cache it, so a
-        # later run (or a different paper naming the same dataset) gets a
-        # genuine retry instead of replaying a permanent unknown count.
+        # Reachable and in scope, but couldn't actually be downloaded --
+        # still try to report an approximate entry count for transparency,
+        # but keep it uncached (so a later run, or a different paper naming
+        # the same dataset, gets a genuine retry) and unusable (_usable()
+        # requires local_csv_path, which download failure left empty).
+        _resolve_entry_count(c, dataset_name)
         best_in_scope = c
 
     if best_in_scope is not None:
@@ -450,7 +619,8 @@ def _search_exploration_sites(scope_description: str) -> list:
             continue
         c["name"] = c.get("source_url", "")
         if c.get("in_scope"):
-            _resolve_entry_count(c, c.get("display_name", ""))
+            if not _download_and_convert_to_csv(c):
+                _resolve_entry_count(c, c.get("display_name", ""))
         c["usability_score"] = _usability_score(c)
         resolved.append(c)
 
@@ -463,6 +633,7 @@ def _usable(candidate: dict | None, min_entries: int) -> bool:
         candidate
         and candidate.get("verified")
         and candidate.get("in_scope")
+        and candidate.get("local_csv_path")
         and isinstance(candidate.get("entry_count"), int)
         and candidate["entry_count"] >= min_entries
     )
@@ -508,26 +679,6 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
         parent_candidate = _find_and_verify_dataset_for_paper(parent_paper, scope_description)
         datasets_considered += 1
 
-    if _usable(parent_candidate, SINGLE_DATASET_THRESHOLD):
-        provenance = _describe_provenance(parent_candidate)
-        detail = f" ({provenance})" if provenance else ""
-        print(f"[Data Agent] Parent Paper's own dataset alone meets the target "
-              f"({parent_candidate['entry_count']} entries) from {parent_candidate['name']}{detail}. "
-              f"Using it as the sole dataset.")
-        return {
-            "status": "OK",
-            "target_entries": TARGET_ENTRIES,
-            "total_entries": parent_candidate["entry_count"],
-            "target_met": True,
-            "datasets_considered": datasets_considered,
-            "selected_datasets": [parent_candidate],
-            "master_dataset": parent_candidate,
-            "is_combined": False,
-            "search_stage": search_stage,
-            "warnings": warnings,
-            "notes": "Parent Paper's own dataset alone met the target; no combination needed.",
-        }
-
     if parent_candidate is None:
         warnings.append("Parent Paper does not state a dataset.")
     elif not try_add(parent_candidate):
@@ -536,9 +687,13 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
             f"was not in scope, or has fewer than {MIN_ENTRIES_TO_CONSIDER} entries."
         )
 
-    # --- Stage 2: full ranked candidate pool, no cap on how many papers are checked ---
+    # --- Stage 2: full ranked candidate pool, no cap on how many papers are
+    # checked for candidacy -- keeps going even after the entry-count target
+    # is already met, stopping only once MAX_DATASETS unique datasets have
+    # been collected (or the pool is exhausted), so more than one dataset
+    # gets combined whenever more than one genuinely qualifies. ---
     for paper in ranked_pool[1:]:
-        if total_entries >= TARGET_ENTRIES:
+        if len(selected_datasets) >= MAX_DATASETS:
             break
         datasets_considered += 1
         try_add(_find_and_verify_dataset_for_paper(paper, scope_description))
@@ -554,7 +709,7 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
         print("[Data Agent] No usable dataset found among candidate papers; "
               "searching generally for datasets relevant to the project scope...")
         for candidate in _search_exploration_sites(scope_description):
-            if total_entries >= TARGET_ENTRIES:
+            if len(selected_datasets) >= MAX_DATASETS:
                 break
             try_add(candidate)
 

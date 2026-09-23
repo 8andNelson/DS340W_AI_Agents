@@ -95,6 +95,19 @@ def _print_dataset_summary(result: dict) -> None:
             print(f"    - {w}")
 
 
+def _print_cleaning_summary(result: dict) -> None:
+    print(f"\n--- Master Dataset ({result['status']}) ---")
+    print(f"  Datasets merged: {result['datasets_merged']} / {result['datasets_attempted']}")
+    print(f"  Rows / columns:  {result['rows_total']} / {result['columns_total']}")
+    if result.get("master_csv_path"):
+        print(f"  Master CSV:      {result['master_csv_path']}")
+
+    if result.get("conflicts"):
+        print("  Conflicts:")
+        for c in result["conflicts"]:
+            print(f"    - {c.get('dataset', '')} ({c.get('link', '')}): {c.get('reason', '')}")
+
+
 def main():
     print(BANNER)
 
@@ -116,7 +129,7 @@ def main():
 
     print(f"\nTopic: {topic}")
     print("\n[Master Agent] Starting supervised pipeline "
-          "(Intake -> Research -> Validation & Selection -> Data Agent)...")
+          "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent)...")
 
     result = master_agent.run_pipeline(topic)
 
@@ -141,11 +154,14 @@ def main():
     if result["dataset_result"]:
         _print_dataset_summary(result["dataset_result"])
 
+    if result["cleaning_result"]:
+        _print_cleaning_summary(result["cleaning_result"])
+
     print(f"\n[State] Phase -> {result['phase']}")
     print("[State] parent_paper_approved -> True")
     print("[State] Saved to logs/project_state.json")
-    print("\nParent Paper approved and dataset pool built. "
-          "Next pipeline stage: Code Discovery (Milestone 8).")
+    print("\nParent Paper approved, dataset pool built, and master CSV cleaned. "
+          "Next pipeline stage: Code Discovery (Milestone 9).")
 
 
 if __name__ == "__main__":

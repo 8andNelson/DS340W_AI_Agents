@@ -171,6 +171,22 @@ def make_data_result(**overrides) -> dict:
     return result
 
 
+def make_cleaning_result(**overrides) -> dict:
+    merged = overrides.pop("datasets_merged", 1)
+    result = {
+        "status": "OK" if merged else "NOT_FOUND",
+        "master_csv_path": "data/processed/master_dataset.csv" if merged else "",
+        "datasets_attempted": merged,
+        "datasets_merged": merged,
+        "rows_total": 1000 if merged else 0,
+        "columns_total": 5 if merged else 0,
+        "conflicts": [],
+        "notes": "",
+    }
+    result.update(overrides)
+    return result
+
+
 class TestDataChecks(MasterAgentTestCase):
     """_check_data is Master Agent's independent review of data_agent.run()'s
     dataset pool -- it only blocks when zero usable datasets were found."""
@@ -323,12 +339,13 @@ class TestDataAgentPipelineWiring(MasterAgentTestCase):
     """run_pipeline's Stage 4: Data Agent runs right after Parent Paper
     approval, caches the ranked pool, and only blocks on zero datasets."""
 
-    def _run(self, data_agent_result: dict):
+    def _run(self, data_agent_result: dict, cleaning_agent_result: dict = None):
         ranked_pool = [
             {"title": "Parent Paper", "dataset": "DS1"},
             {"title": "Runner Up", "dataset": "DS2"},
         ]
         validation_result = make_validation_result(ranked_pool)
+        cleaning_agent_result = cleaning_agent_result or make_cleaning_result()
 
         with patch.object(master_agent, "_check_intake", return_value=[]), \
              patch.object(master_agent, "_check_research", return_value=[]), \
@@ -341,6 +358,7 @@ class TestDataAgentPipelineWiring(MasterAgentTestCase):
              ]), \
              patch("src.agents.validation_agent.run", return_value=validation_result), \
              patch("src.agents.data_agent.run", return_value=data_agent_result) as data_run, \
+             patch("src.agents.cleaning_agent.run", return_value=cleaning_agent_result), \
              patch("src.orchestration.state_manager.update_state") as update_state, \
              patch("src.orchestration.dataset_cache.cache_validated_papers") as cache_papers:
             result = master_agent.run_pipeline("credit card fraud detection")
@@ -352,7 +370,6 @@ class TestDataAgentPipelineWiring(MasterAgentTestCase):
         result, ranked_pool, data_run, update_state, cache_papers = self._run(data_result)
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["phase"], "DATA_DISCOVERY")
         self.assertEqual(result["dataset_result"], data_result)
         cache_papers.assert_called_once_with(ranked_pool)
         data_run.assert_called_once_with(ranked_pool[0], ranked_pool)
@@ -365,6 +382,54 @@ class TestDataAgentPipelineWiring(MasterAgentTestCase):
         self.assertEqual(result["phase"], "DATA_DISCOVERY")
         self.assertTrue(result["blockers"])
         self.assertEqual(result["blockers"][0]["target"], "Data Agent")
+
+
+class TestCleaningAgentPipelineWiring(MasterAgentTestCase):
+    """run_pipeline's Stage 5: Cleaning Agent runs right after Data Agent
+    succeeds, is handed exactly dataset_result['selected_datasets'], and
+    only blocks on zero merged datasets."""
+
+    _run = TestDataAgentPipelineWiring._run
+
+    def test_advances_to_data_cleaning_on_success(self):
+        data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
+        cleaning_result = make_cleaning_result(datasets_merged=1)
+
+        with patch.object(master_agent, "_check_intake", return_value=[]), \
+             patch.object(master_agent, "_check_research", return_value=[]), \
+             patch.object(master_agent, "_check_validation_and_selection", return_value=[]), \
+             patch("src.agents.intake_agent.run", return_value={
+                 "domain": "fraud", "keywords": ["fraud"], "search_queries": ["fraud ML"],
+             }), \
+             patch("src.agents.research_agent.run", return_value=[
+                 {"title": "Parent Paper", "peer_reviewed": True, "year": 2023}
+             ]), \
+             patch("src.agents.validation_agent.run", return_value=make_validation_result([
+                 {"title": "Parent Paper", "dataset": "DS1"},
+             ])), \
+             patch("src.agents.data_agent.run", return_value=data_result), \
+             patch("src.agents.cleaning_agent.run", return_value=cleaning_result) as cleaning_run, \
+             patch("src.orchestration.state_manager.update_state"), \
+             patch("src.orchestration.dataset_cache.cache_validated_papers"):
+            result = master_agent.run_pipeline("credit card fraud detection")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["phase"], "DATA_CLEANING")
+        self.assertEqual(result["cleaning_result"], cleaning_result)
+        cleaning_run.assert_called_once_with(data_result["selected_datasets"])
+
+    def test_halts_when_nothing_could_be_merged(self):
+        data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
+        cleaning_result = make_cleaning_result(
+            datasets_merged=0,
+            conflicts=[{"dataset": "Some Dataset", "link": "https://kaggle.com/x", "reason": "no local CSV path"}],
+        )
+        result, *_ = self._run(data_result, cleaning_result)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["phase"], "DATA_CLEANING")
+        self.assertTrue(result["blockers"])
+        self.assertEqual(result["blockers"][0]["target"], "Cleaning Agent")
 
 
 class TestWriteReport(MasterAgentTestCase):

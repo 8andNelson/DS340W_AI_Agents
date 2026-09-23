@@ -138,6 +138,21 @@ def _format_data_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_cleaning_report(result: dict) -> str:
+    lines = [
+        "[Cleaning Agent] Master CSV for Parent Paper replication",
+        f"Status:            {result.get('status', '')}",
+        f"Datasets merged:   {result.get('datasets_merged', 0)} / {result.get('datasets_attempted', 0)}",
+        f"Rows / columns:    {result.get('rows_total', 0)} / {result.get('columns_total', 0)}",
+        f"Master CSV:        {result.get('master_csv_path', '')}",
+    ]
+    if result.get("conflicts"):
+        lines.append("Conflicts:")
+        for c in result["conflicts"]:
+            lines.append(f"  - {c.get('dataset', '')} ({c.get('link', '')}): {c.get('reason', '')}")
+    return "\n".join(lines)
+
+
 # --- Per-stage checkers: each returns a list of blocker log entries ---
 
 def _check_intake(structured: dict) -> list:
@@ -271,6 +286,25 @@ def _check_data(result: dict) -> list:
     return []
 
 
+def _check_cleaning(result: dict) -> list:
+    """
+    Cleaning Agent is only blocked when it could not merge a single
+    dataset into a master CSV. A DEGRADED result (1+ datasets merged, but
+    some logged as conflicts) is approved and passed through -- the
+    conflicts stay visible in the saved report and the returned
+    cleaning_result, per CLAUDE.md's Results Integrity policy.
+    """
+    if not result.get("datasets_merged"):
+        conflict_reasons = "; ".join(c.get("reason", "") for c in result.get("conflicts", [])) or "none reported"
+        return [_log_entry(
+            "Correction", "Cleaning Agent",
+            f"Cleaning Agent could not merge any dataset into a master CSV. Conflicts: {conflict_reasons}.",
+            "Rejected",
+            "Re-run Cleaning Agent; if it fails again, halt for manual dataset review.",
+        )]
+    return []
+
+
 def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int = MAX_ATTEMPTS):
     """
     Invoke run_fn() up to max_attempts times, independently checking its
@@ -354,9 +388,9 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
 def run_pipeline(topic: str) -> dict:
     """
     Drive the full pipeline (Intake -> Research -> Validation & Selection ->
-    Data Agent), supervising every stage. Master Agent invokes each agent
-    itself, checks its output, retries once on failure, and halts (with a
-    logged rejection) if the retry also fails.
+    Data Agent -> Cleaning Agent), supervising every stage. Master Agent
+    invokes each agent itself, checks its output, retries once on failure,
+    and halts (with a logged rejection) if the retry also fails.
 
     Returns:
         {
@@ -367,12 +401,13 @@ def run_pipeline(topic: str) -> dict:
           "validation_result": dict | None,
           "parent_paper": dict | None,
           "dataset_result": dict | None,
+          "cleaning_result": dict | None,
           "blockers": [...],   # non-empty only when success is False
         }
     """
     # Imported here (not at module load) so master_agent stays the sole
     # orchestrator without creating an import cycle with src.main.
-    from src.agents import intake_agent, research_agent, validation_agent, data_agent
+    from src.agents import intake_agent, research_agent, validation_agent, data_agent, cleaning_agent
     from src.orchestration.state_manager import update_state
     from src.orchestration import dataset_cache
 
@@ -384,6 +419,7 @@ def run_pipeline(topic: str) -> dict:
         "validation_result": None,
         "parent_paper": None,
         "dataset_result": None,
+        "cleaning_result": None,
         "blockers": [],
     }
 
@@ -469,10 +505,33 @@ def run_pipeline(topic: str) -> dict:
         },
         "phase": "DATA_DISCOVERY",
     })
+    result["dataset_result"] = dataset_result
+
+    # --- Stage 5: Cleaning Agent (merge downloaded datasets into a master CSV) ---
+    cleaning_result, blockers = _supervise(
+        "Cleaning Agent",
+        lambda: cleaning_agent.run(dataset_result["selected_datasets"]),
+        _check_cleaning,
+        _format_cleaning_report,
+    )
+    if blockers:
+        update_state({"phase": "DATA_CLEANING"})
+        result.update(phase="DATA_CLEANING", blockers=blockers)
+        return result
+
+    update_state({
+        "cleaning": {
+            "master_csv_path": cleaning_result["master_csv_path"],
+            "datasets_merged": cleaning_result["datasets_merged"],
+            "rows_total": cleaning_result["rows_total"],
+            "conflicts": cleaning_result["conflicts"],
+        },
+        "phase": "DATA_CLEANING",
+    })
 
     result.update(
         success=True,
-        phase="DATA_DISCOVERY",
-        dataset_result=dataset_result,
+        phase="DATA_CLEANING",
+        cleaning_result=cleaning_result,
     )
     return result

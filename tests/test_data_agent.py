@@ -1,5 +1,11 @@
+import io
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+import pandas as pd
 
 from src.agents import data_agent
 from src.orchestration import dataset_cache
@@ -33,6 +39,8 @@ def make_candidate(**overrides) -> dict:
         "usability_score": None,
         "verified": True,
         "verification_method": "brave_search",
+        "local_csv_path": "data/raw/fake-dataset.csv",
+        "download_status": "ok",
         "notes": "",
     }
     candidate.update(overrides)
@@ -48,7 +56,7 @@ class TestRunAlgorithm(unittest.TestCase):
     the full ranked pool). _find_and_verify_dataset_for_paper is mocked so
     these tests exercise only the accumulation/stopping logic."""
 
-    def test_parent_paper_dataset_alone_meets_target(self):
+    def test_parent_paper_dataset_alone_meets_target_and_no_other_candidates_exist(self):
         parent = make_paper(dataset="Big Dataset")
         big = make_link_candidate("https://kaggle.com/big-dataset", entry_count=15000)
 
@@ -61,7 +69,28 @@ class TestRunAlgorithm(unittest.TestCase):
         self.assertEqual(result["selected_datasets"], [big])
         self.assertEqual(result["master_dataset"], big)
         self.assertFalse(result["is_combined"])
-        self.assertEqual(result["search_stage"], "parent_paper")
+        self.assertEqual(result["search_stage"], "paper_traversal")
+
+    def test_keeps_collecting_past_the_target_when_more_candidates_qualify(self):
+        """The agent no longer stops the instant the entry-count target is
+        met -- it keeps adding further qualifying, non-duplicate datasets
+        (up to MAX_DATASETS) so a pool of several datasets is preferred
+        over stopping at the first one big enough alone."""
+        parent = make_paper(title="Parent", dataset="Big Dataset")
+        big = make_link_candidate("https://kaggle.com/big-dataset", entry_count=15000)
+        second = make_paper(title="Second", dataset="Second Dataset")
+        second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=2000)
+
+        def fake_find(paper, _scope):
+            return big if paper["title"] == "Parent" else second_candidate
+
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
+            result = data_agent.run(parent, [parent, second])
+
+        self.assertEqual(result["selected_datasets"], [big, second_candidate])
+        self.assertEqual(result["total_entries"], 17000)
+        self.assertTrue(result["is_combined"])
+        self.assertTrue(result["target_met"])
 
     def test_falls_through_to_traversal_when_parent_dataset_missing(self):
         parent = make_paper(title="Parent", dataset="")
@@ -143,12 +172,12 @@ class TestRunAlgorithm(unittest.TestCase):
         self.assertEqual(len(links), 2)
         self.assertEqual(result["total_entries"], 11000)
 
-    def test_no_cap_on_papers_checked_traverses_entire_pool(self):
+    def test_traversal_checks_the_whole_pool_when_under_the_dataset_cap(self):
         parent = make_paper(title="P0", dataset="D0")
-        alts = [make_paper(title=f"P{i}", dataset=f"D{i}") for i in range(1, 8)]
+        alts = [make_paper(title=f"P{i}", dataset=f"D{i}") for i in range(1, 4)]
         candidates = {
             f"D{i}": make_link_candidate(f"https://kaggle.com/d{i}", entry_count=1000)
-            for i in range(8)
+            for i in range(4)
         }
 
         def fake_find(paper, _scope):
@@ -157,11 +186,36 @@ class TestRunAlgorithm(unittest.TestCase):
         with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
             result = data_agent.run(parent, [parent] + alts)
 
-        # 10 unique 1000-entry datasets would be needed to hit 10000; with
-        # only 8 available the pool is exhausted below target, but ALL 8
-        # must have been checked (no 5-dataset cap).
-        self.assertEqual(len(result["selected_datasets"]), 8)
-        self.assertEqual(result["total_entries"], 8000)
+        # Only 4 candidates exist and none individually meets the target,
+        # so all 4 are checked and added (well under the MAX_DATASETS cap),
+        # leaving the pool DEGRADED rather than stopping short.
+        self.assertEqual(len(result["selected_datasets"]), 4)
+        self.assertEqual(result["total_entries"], 4000)
+        self.assertEqual(result["status"], "DEGRADED")
+        self.assertFalse(result["target_met"])
+
+    def test_stops_at_max_datasets_cap_even_with_more_candidates_remaining(self):
+        parent = make_paper(title="P0", dataset="D0")
+        alts = [make_paper(title=f"P{i}", dataset=f"D{i}") for i in range(1, 8)]
+        candidates = {
+            f"D{i}": make_link_candidate(f"https://kaggle.com/d{i}", entry_count=1000)
+            for i in range(8)
+        }
+        checked = []
+
+        def fake_find(paper, _scope):
+            checked.append(paper["dataset"])
+            return candidates[paper["dataset"]]
+
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
+            result = data_agent.run(parent, [parent] + alts)
+
+        # 8 candidates are each individually usable, but the agent stops at
+        # MAX_DATASETS (5) rather than checking all 8 or trying to reach
+        # the 10000-entry target, which is never hit.
+        self.assertEqual(len(result["selected_datasets"]), data_agent.MAX_DATASETS)
+        self.assertEqual(len(checked), data_agent.MAX_DATASETS)
+        self.assertEqual(result["total_entries"], 5000)
         self.assertEqual(result["status"], "DEGRADED")
         self.assertFalse(result["target_met"])
 
@@ -199,8 +253,6 @@ class TestEscalationStages(unittest.TestCase):
         self.assertIn("Parent", scope_arg)
 
     def test_exploration_does_not_fire_when_paper_traversal_succeeds(self):
-        # entry_count kept below SINGLE_DATASET_THRESHOLD so this exercises
-        # the accumulation path, not the parent-alone early return.
         parent = make_paper(title="Parent", dataset="Findable Dataset")
         found = make_link_candidate("https://kaggle.com/found", entry_count=3000)
 
@@ -210,6 +262,23 @@ class TestEscalationStages(unittest.TestCase):
 
         explore_mock.assert_not_called()
         self.assertEqual(result["search_stage"], "paper_traversal")
+
+    def test_exploration_stops_at_max_datasets_cap(self):
+        """Stage 3 collects more than one dataset when more than one
+        exploration hit qualifies, but still stops at MAX_DATASETS rather
+        than adding every hit returned."""
+        parent = make_paper(title="Parent", dataset="Elusive Dataset")
+        hits = [
+            make_link_candidate(f"https://kaggle.com/explored{i}", entry_count=1000)
+            for i in range(data_agent.MAX_DATASETS + 3)
+        ]
+
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
+             patch.object(data_agent, "_search_exploration_sites", return_value=hits):
+            result = data_agent.run(parent, [parent])
+
+        self.assertEqual(len(result["selected_datasets"]), data_agent.MAX_DATASETS)
+        self.assertEqual(result["selected_datasets"], hits[:data_agent.MAX_DATASETS])
 
     def test_not_found_when_every_stage_fails(self):
         parent = make_paper(title="Parent", dataset="Ghost Dataset")
@@ -275,6 +344,7 @@ class TestResolveDataset(unittest.TestCase):
              ]), \
              patch("requests.post", return_value=llm_response), \
              patch.object(data_agent, "_check_url_reachable", return_value=(True, 200)), \
+             patch.object(data_agent, "_download_and_convert_to_csv", return_value=False), \
              patch.object(data_agent, "_resolve_entry_count"):
             candidate = data_agent._resolve_dataset(
                 "Unsized Dataset", "", "", "", query_builder=data_agent._build_query,
@@ -286,16 +356,20 @@ class TestResolveDataset(unittest.TestCase):
         self.assertEqual(candidate["display_name"], "Unsized Dataset")
         cache_dataset.assert_not_called()
 
-    def test_page_fetch_fallback_populates_entry_count_and_caches(self):
-        """When the fallback chain (mocked here) does find a stated count,
-        the candidate is cached like any other resolved success."""
+    def test_successful_download_populates_entry_count_and_caches(self):
+        """A candidate is only cached once it's actually been downloaded --
+        _download_and_convert_to_csv (mocked here) is what sets
+        local_csv_path and entry_count from the real file."""
         llm_response = self._llm_response(
             '[{"name": "Big Dataset", "source": "GitHub", "in_scope": true, '
             '"source_url": "https://github.com/example/big", "entry_count": null}]'
         )
 
-        def fake_resolve_entry_count(candidate, _name):
+        def fake_download(candidate):
+            candidate["local_csv_path"] = "data/raw/big-dataset.csv"
             candidate["entry_count"] = 25000
+            candidate["entry_count_source"] = "downloaded file"
+            return True
 
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
@@ -304,13 +378,39 @@ class TestResolveDataset(unittest.TestCase):
              ]), \
              patch("requests.post", return_value=llm_response), \
              patch.object(data_agent, "_check_url_reachable", return_value=(True, 200)), \
-             patch.object(data_agent, "_resolve_entry_count", side_effect=fake_resolve_entry_count):
+             patch.object(data_agent, "_download_and_convert_to_csv", side_effect=fake_download):
             candidate = data_agent._resolve_dataset(
                 "Big Dataset", "", "", "", query_builder=data_agent._build_query,
             )
 
         self.assertEqual(candidate["entry_count"], 25000)
+        self.assertEqual(candidate["local_csv_path"], "data/raw/big-dataset.csv")
         cache_dataset.assert_called_once()
+
+    def test_download_failure_leaves_candidate_unusable_and_uncached(self):
+        """A verified, in-scope candidate that fails to download is
+        rejected the same way an unreachable one is -- _usable() requires
+        local_csv_path, which a failed download never sets."""
+        llm_response = self._llm_response(
+            '[{"name": "Undownloadable Dataset", "source": "Kaggle", "in_scope": true, '
+            '"source_url": "https://kaggle.com/gated", "entry_count": 50000}]'
+        )
+
+        with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
+             patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
+             patch("src.search.brave_search.search", return_value=[
+                 {"title": "Undownloadable Dataset", "url": "https://kaggle.com/gated", "description": ""}
+             ]), \
+             patch("requests.post", return_value=llm_response), \
+             patch.object(data_agent, "_check_url_reachable", return_value=(True, 200)), \
+             patch.object(data_agent, "_download_and_convert_to_csv", return_value=False):
+            candidate = data_agent._resolve_dataset(
+                "Undownloadable Dataset", "", "", "", query_builder=data_agent._build_query,
+            )
+
+        self.assertFalse(candidate.get("local_csv_path"))
+        self.assertFalse(data_agent._usable(candidate, 1))
+        cache_dataset.assert_not_called()
 
     def test_second_candidate_tried_when_first_is_unreachable(self):
         """top_k > 1 lets a later LLM-ranked candidate rescue a dataset name
@@ -325,6 +425,12 @@ class TestResolveDataset(unittest.TestCase):
         def fake_reachable(url):
             return (True, 200) if url == "https://example.com/second" else (False, 0)
 
+        def fake_download(candidate):
+            candidate["local_csv_path"] = "data/raw/second.csv"
+            candidate["entry_count"] = candidate.get("entry_count") or 6000
+            candidate["entry_count_source"] = "downloaded file"
+            return True
+
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset"), \
              patch("src.search.brave_search.search", return_value=[
@@ -332,7 +438,8 @@ class TestResolveDataset(unittest.TestCase):
                  {"title": "Second", "url": "https://example.com/second", "description": ""},
              ]), \
              patch("requests.post", return_value=llm_response), \
-             patch.object(data_agent, "_check_url_reachable", side_effect=fake_reachable):
+             patch.object(data_agent, "_check_url_reachable", side_effect=fake_reachable), \
+             patch.object(data_agent, "_download_and_convert_to_csv", side_effect=fake_download):
             candidate = data_agent._resolve_dataset(
                 "Some Dataset", "", "", "", query_builder=data_agent._build_query, top_k=3,
             )
@@ -404,6 +511,13 @@ class TestEntryCountFloor(unittest.TestCase):
         below_floor = make_candidate(entry_count=99)
         self.assertTrue(data_agent._usable(at_floor, data_agent.MIN_ENTRIES_TO_CONSIDER))
         self.assertFalse(data_agent._usable(below_floor, data_agent.MIN_ENTRIES_TO_CONSIDER))
+
+    def test_undownloaded_candidate_is_never_usable(self):
+        """A verified, in-scope, well-counted candidate that was never
+        actually downloaded (local_csv_path empty) is still rejected --
+        download success is a required gate alongside the others."""
+        candidate = make_candidate(entry_count=50000, local_csv_path="")
+        self.assertFalse(data_agent._usable(candidate, data_agent.MIN_ENTRIES_TO_CONSIDER))
 
 
 class TestResolveEntryCount(unittest.TestCase):
@@ -532,6 +646,190 @@ class TestHuggingFaceLookup(unittest.TestCase):
     def test_request_failure_returns_none(self):
         with patch("requests.get", side_effect=RuntimeError("network down")):
             result = data_agent._lookup_huggingface_entry_count("https://huggingface.co/datasets/foo")
+        self.assertIsNone(result)
+
+
+def make_response(content: bytes, content_type: str = "") -> MagicMock:
+    resp = MagicMock()
+    resp.headers = {"Content-Type": content_type}
+    resp.content = content
+    resp.raise_for_status = lambda: None
+    return resp
+
+
+def make_zip_bytes(files: dict) -> bytes:
+    import zipfile
+    import io as _io
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+class TestParseTabularContent(unittest.TestCase):
+    def test_html_content_type_is_rejected_without_parsing(self):
+        resp = make_response(b"<html><body>Not a dataset</body></html>", content_type="text/html; charset=utf-8")
+        result = data_agent._parse_tabular_content(resp, "https://example.com/landing")
+        self.assertIsNone(result)
+
+    def test_parses_direct_csv(self):
+        resp = make_response(b"a,b\n1,2\n3,4\n", content_type="text/csv")
+        df = data_agent._parse_tabular_content(resp, "https://example.com/data.csv")
+        self.assertEqual(list(df.columns), ["a", "b"])
+        self.assertEqual(len(df), 2)
+
+    def test_parses_csv_with_no_content_type_via_extension(self):
+        resp = make_response(b"a,b\n1,2\n", content_type="")
+        df = data_agent._parse_tabular_content(resp, "https://example.com/data.csv")
+        self.assertEqual(len(df), 1)
+
+    def test_parses_json_array(self):
+        resp = make_response(b'[{"a": 1, "b": 2}, {"a": 3, "b": 4}]', content_type="application/json")
+        df = data_agent._parse_tabular_content(resp, "https://example.com/data.json")
+        self.assertEqual(len(df), 2)
+
+    def test_parses_zip_with_csv_inside(self):
+        zip_bytes = make_zip_bytes({"readme.txt": "hello", "data.csv": "a,b\n1,2\n3,4\n5,6\n"})
+        resp = make_response(zip_bytes, content_type="application/zip")
+        df = data_agent._parse_tabular_content(resp, "https://example.com/archive.zip")
+        self.assertEqual(len(df), 3)
+
+    def test_zip_with_no_csv_inside_returns_none(self):
+        zip_bytes = make_zip_bytes({"readme.txt": "hello", "data.json": "{}"})
+        resp = make_response(zip_bytes, content_type="application/zip")
+        result = data_agent._parse_tabular_content(resp, "https://example.com/archive.zip")
+        self.assertIsNone(result)
+
+    def test_garbage_content_returns_none(self):
+        resp = make_response(b"\x00\x01\x02not tabular at all", content_type="application/octet-stream")
+        result = data_agent._parse_tabular_content(resp, "https://example.com/mystery")
+        self.assertIsNone(result)
+
+
+class TestDownloadAndConvertToCsv(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._raw_dir_patch = patch.object(data_agent, "RAW_DATA_DIR", Path(self._tmpdir))
+        self._raw_dir_patch.start()
+
+    def tearDown(self):
+        self._raw_dir_patch.stop()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_successful_download_writes_csv_and_sets_fields(self):
+        candidate = make_candidate(
+            name="https://example.com/data.csv", source_url="https://example.com/data.csv",
+            local_csv_path="", entry_count=None, entry_count_source="",
+        )
+        resp = make_response(b"a,b\n1,2\n3,4\n5,6\n", content_type="text/csv")
+
+        with patch.object(data_agent, "_download_huggingface_csv", return_value=None), \
+             patch("requests.get", return_value=resp):
+            ok = data_agent._download_and_convert_to_csv(candidate)
+
+        self.assertTrue(ok)
+        self.assertTrue(candidate["local_csv_path"])
+        self.assertTrue(Path(candidate["local_csv_path"]).exists())
+        self.assertEqual(candidate["entry_count"], 3)
+        self.assertEqual(candidate["entry_count_source"], "downloaded file")
+        self.assertEqual(candidate["download_status"], "ok")
+
+    def test_html_landing_page_fails_and_is_logged(self):
+        candidate = make_candidate(
+            name="https://kaggle.com/datasets/x", source_url="https://kaggle.com/datasets/x",
+            local_csv_path="", entry_count=None, entry_count_source="",
+        )
+        resp = make_response(b"<html>recaptcha challenge</html>", content_type="text/html")
+
+        with patch.object(data_agent, "_download_huggingface_csv", return_value=None), \
+             patch("requests.get", return_value=resp):
+            ok = data_agent._download_and_convert_to_csv(candidate)
+
+        self.assertFalse(ok)
+        self.assertFalse(candidate["local_csv_path"])
+        self.assertIn("failed", candidate["download_status"])
+
+    def test_network_failure_is_caught_and_logged(self):
+        candidate = make_candidate(
+            name="https://example.com/data.csv", source_url="https://example.com/data.csv",
+            local_csv_path="", entry_count=None, entry_count_source="",
+        )
+        with patch.object(data_agent, "_download_huggingface_csv", return_value=None), \
+             patch("requests.get", side_effect=RuntimeError("connection reset")):
+            ok = data_agent._download_and_convert_to_csv(candidate)
+
+        self.assertFalse(ok)
+        self.assertFalse(candidate["local_csv_path"])
+        self.assertIn("failed", candidate["download_status"])
+
+    def test_huggingface_special_case_is_tried_first(self):
+        candidate = make_candidate(
+            name="https://huggingface.co/datasets/foo/bar",
+            source_url="https://huggingface.co/datasets/foo/bar",
+            local_csv_path="", entry_count=None, entry_count_source="",
+        )
+        fake_df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+
+        with patch.object(data_agent, "_download_huggingface_csv", return_value=fake_df) as hf_mock, \
+             patch("requests.get") as get_mock:
+            ok = data_agent._download_and_convert_to_csv(candidate)
+
+        hf_mock.assert_called_once_with(candidate)
+        get_mock.assert_not_called()
+        self.assertTrue(ok)
+        self.assertEqual(candidate["entry_count"], 2)
+
+
+class TestDownloadHuggingfaceCsv(unittest.TestCase):
+    def test_non_huggingface_url_returns_none_without_request(self):
+        candidate = make_candidate(name="https://kaggle.com/x", source_url="https://kaggle.com/x")
+        with patch("requests.get") as get_mock:
+            result = data_agent._download_huggingface_csv(candidate)
+        get_mock.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_resolves_and_reads_parquet_file(self):
+        candidate = make_candidate(
+            name="https://huggingface.co/datasets/foo/bar",
+            source_url="https://huggingface.co/datasets/foo/bar",
+        )
+        parquet_bytes = io.BytesIO()
+        pd.DataFrame({"a": [1, 2, 3]}).to_parquet(parquet_bytes)
+
+        api_resp = MagicMock()
+        api_resp.raise_for_status = lambda: None
+        api_resp.json.return_value = {"parquet_files": [{"url": "https://huggingface.co/datasets/foo/bar/resolve/main/data.parquet"}]}
+
+        file_resp = MagicMock()
+        file_resp.raise_for_status = lambda: None
+        file_resp.content = parquet_bytes.getvalue()
+
+        with patch("requests.get", side_effect=[api_resp, file_resp]):
+            df = data_agent._download_huggingface_csv(candidate)
+
+        self.assertEqual(len(df), 3)
+
+    def test_no_parquet_files_returns_none(self):
+        candidate = make_candidate(
+            name="https://huggingface.co/datasets/foo/bar",
+            source_url="https://huggingface.co/datasets/foo/bar",
+        )
+        api_resp = MagicMock()
+        api_resp.raise_for_status = lambda: None
+        api_resp.json.return_value = {"parquet_files": []}
+
+        with patch("requests.get", return_value=api_resp):
+            result = data_agent._download_huggingface_csv(candidate)
+        self.assertIsNone(result)
+
+    def test_request_failure_returns_none(self):
+        candidate = make_candidate(
+            name="https://huggingface.co/datasets/foo/bar",
+            source_url="https://huggingface.co/datasets/foo/bar",
+        )
+        with patch("requests.get", side_effect=RuntimeError("network down")):
+            result = data_agent._download_huggingface_csv(candidate)
         self.assertIsNone(result)
 
 
