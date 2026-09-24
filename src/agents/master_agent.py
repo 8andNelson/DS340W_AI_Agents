@@ -279,8 +279,9 @@ def _check_data(result: dict) -> list:
     if not result.get("selected_datasets"):
         return [_log_entry(
             "Correction", "Data Agent",
-            "Data Agent found zero usable datasets (verified, >= 100 entries) across the Parent "
-            f"Paper and its ranked alternates. Warnings: {'; '.join(result.get('warnings', [])) or 'none reported'}.",
+            "Data Agent found zero usable datasets (verified, in-scope, downloaded, and passing "
+            "the reproducibility-fit check) across the Parent Paper and its ranked alternates. "
+            f"Warnings: {'; '.join(result.get('warnings', [])) or 'none reported'}.",
             "Rejected",
             "Re-run Data Agent; if it fails again, halt for manual dataset review.",
         )]
