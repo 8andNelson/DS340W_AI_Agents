@@ -24,16 +24,32 @@ Per CLAUDE.md's "Autonomous Operation" policy, Master Agent never blocks on
 a human prompt -- retry-once-then-halt is itself the final decision, and
 every step is logged (both the structured JSON log and the saveable text
 reports) so a person can review the full trail after the fact.
+
+Slack is the human-observable layer on top of that same trail (Milestone
+7): every agent invocation posts its own start/finish message (via
+_supervise), and every Master Agent Correction/Approval also posts (via
+_print_entry) -- see src/slack/slack_client.py and message_formatter.py.
+Routine status (agent start/finish, Master Agent Approvals) goes to the
+main channel; Master Agent Corrections and agent exceptions go to the
+errors_corrections channel, so there's one place to check for anything
+that needs attention. Slack posting always fails soft, so a missing/
+unreachable Slack channel never changes pipeline behavior, only its
+visibility.
 """
 import json
 from pathlib import Path
 
+from src.slack import slack_client, message_formatter
+
 MIN_QUALIFYING = 5
 MAX_ATTEMPTS = 2  # first attempt + one retry
+DATA_REQUEST_TARGET_INCREMENT = 5000  # fallback bump when a Slack request
+                                       # doesn't state an explicit target=<int>
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 LOG_FILE = REPO_ROOT / "logs" / "master_agent_log.json"
 REPORT_DIR = REPO_ROOT / "logs" / "agent_reports"
+SLACK_SUMMARY_MAX_CHARS = 600
 
 
 def _log_entry(action: str, target: str, issue: str, decision: str, next_step: str) -> dict:
@@ -66,6 +82,27 @@ def _print_entry(entry: dict) -> None:
     print(f"ISSUE: {entry['issue']}")
     print(f"DECISION: {entry['decision']}")
     print(f"NEXT: {entry['next']}")
+    # Per CLAUDE.md's "Master Agent Slack Requirement": every correction,
+    # override, or approval Master Agent makes is posted to Slack, not
+    # just logged locally, so the supervision trail is observable live.
+    # Corrections go to the errors_corrections channel (one place to check
+    # for anything that needs attention); Approvals stay on the main
+    # channel alongside routine agent status.
+    text = message_formatter.format_master_entry(entry)
+    if entry["action"] == "Correction":
+        slack_client.post_error_message(text)
+    else:
+        slack_client.post_message(text)
+
+
+def _summarize_for_slack(text: str) -> str:
+    """Keep an agent's Slack "finished" post short -- the full report is
+    already saved to logs/agent_reports/ by _write_report, so Slack only
+    needs enough to be useful at a glance."""
+    text = text.strip()
+    if len(text) <= SLACK_SUMMARY_MAX_CHARS:
+        return text
+    return text[:SLACK_SUMMARY_MAX_CHARS].rstrip() + " …(see saved report for full detail)"
 
 
 def _write_report(agent_name: str, attempt: int, text: str) -> Path:
@@ -322,10 +359,16 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
 
     for attempt in range(1, max_attempts + 1):
         print(f"\n[Master Agent] Running {agent_name} (attempt {attempt}/{max_attempts})...")
+        slack_client.post_message(message_formatter.format_started(
+            agent_name, f"Stage starting (attempt {attempt}/{max_attempts})."
+        ))
 
         try:
             output = run_fn()
         except Exception as e:
+            slack_client.post_error_message(message_formatter.format_finished(
+                agent_name, "Failed", f"Raised an exception: {e}",
+            ))
             report_path = _write_report(agent_name, attempt, f"{agent_name} raised an exception:\n{e}")
             decision = "Retrying" if attempt < max_attempts else "Rejected"
             next_step = (
@@ -347,6 +390,9 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
 
         report_text = report_fn(output)
         report_path = _write_report(agent_name, attempt, report_text)
+        slack_client.post_message(message_formatter.format_finished(
+            agent_name, "Completed", _summarize_for_slack(report_text),
+        ))
 
         blockers = checker_fn(output)
 
@@ -387,6 +433,146 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
     return output, blockers
 
 
+def _max_ts(a: str | None, b: str | None) -> str | None:
+    """Numeric max of two Slack timestamps (either may be None/empty)."""
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if float(a) >= float(b) else b
+
+
+def check_agent_requests(parent_paper: dict = None, ranked_pool: list = None,
+                          floor_ts: str = None) -> dict | None:
+    """
+    Read any Slack messages posted since the last check and act on the one
+    request shape Master Agent currently knows how to fulfill: another
+    agent (today, no such agent exists yet -- this is the hook a future
+    Modeling/Experiment Agent uses) asking for Data Agent to be rerun with
+    a larger target, via message_formatter.format_request /
+    "REQUEST: Data Agent". This is Master Agent "overseeing the channel":
+    it does not poll continuously, but re-checks once per call, which is
+    enough as long as something (run_pipeline, a scheduled job, a manual
+    re-check) calls it periodically.
+
+    floor_ts is a hard lower bound on top of the persisted cursor
+    (logs/project_state.json's slack_last_checked_ts) -- pass the current
+    run's own "run started" banner ts (see run_pipeline) so this run can
+    never act on a message left over from a *different*, earlier topic's
+    run. The persisted cursor still advances normally across runs (so old
+    history isn't endlessly re-scanned); floor_ts is what actually
+    prevents cross-topic contamination, since a request only ever makes
+    sense in the context of the parent_paper/ranked_pool it was posted
+    against.
+
+    Anything Master Agent doesn't yet know how to act on -- a request
+    targeting an agent other than Data Agent, or a plain non-request
+    message -- is acknowledged in Slack rather than silently ignored, per
+    CLAUDE.md's "never silently drop" policy, but does not raise or block.
+
+    Returns None when Slack isn't configured, there is nothing new, or
+    nothing in the new messages was an actionable request. Otherwise
+    returns {"dataset_result": ..., "cleaning_result": ..., "blockers": [...]}
+    for the last acted-on request (blockers non-empty means that re-run
+    itself failed Master Agent's checks).
+    """
+    from src.agents import data_agent, cleaning_agent
+    from src.orchestration.state_manager import load_state, update_state
+
+    if not slack_client.is_configured():
+        return None
+
+    state = load_state()
+    effective_oldest_ts = _max_ts(state.get("slack_last_checked_ts"), floor_ts)
+    messages = slack_client.fetch_new_messages(oldest_ts=effective_oldest_ts)
+    if not messages:
+        return None
+
+    update_state({"slack_last_checked_ts": messages[-1]["ts"]})
+
+    acted = None
+    for msg in messages:
+        request = message_formatter.parse_request(msg.get("text", ""))
+        if not request:
+            continue
+
+        if request["target"] != "Data Agent":
+            slack_client.post_message(message_formatter.format_finished(
+                "Master Agent", "Noted",
+                f"Received a request from {request['sender']} for '{request['target']}', but Master "
+                "Agent does not yet know how to act on that agent -- no action taken.",
+            ))
+            continue
+
+        if not parent_paper or not ranked_pool:
+            slack_client.post_message(message_formatter.format_finished(
+                "Master Agent", "Blocked",
+                f"Received a Data Agent request from {request['sender']} ({request['reason']}), but no "
+                "Parent Paper/ranked candidate pool is available in this run to re-search against.",
+            ))
+            continue
+
+        new_target = (
+            message_formatter.parse_target_from_detail(request["detail"])
+            or data_agent.TARGET_ENTRIES + DATA_REQUEST_TARGET_INCREMENT
+        )
+
+        slack_client.post_message(message_formatter.format_started(
+            "Master Agent",
+            f"Relaying {request['sender']}'s request ({request['reason']}): "
+            f"re-running Data Agent with target={new_target}.",
+        ))
+
+        new_dataset_result, blockers = _supervise(
+            "Data Agent",
+            lambda: data_agent.run(parent_paper, ranked_pool, target_entries=new_target),
+            _check_data,
+            _format_data_report,
+        )
+        if blockers:
+            acted = {"dataset_result": None, "cleaning_result": None, "blockers": blockers}
+            continue
+
+        new_cleaning_result, blockers = _supervise(
+            "Cleaning Agent",
+            lambda: cleaning_agent.run(new_dataset_result["selected_datasets"]),
+            _check_cleaning,
+            _format_cleaning_report,
+        )
+        update_state({
+            "dataset": {
+                "selected_datasets": new_dataset_result["selected_datasets"],
+                "total_entries": new_dataset_result["total_entries"],
+                "target_met": new_dataset_result["target_met"],
+                "is_combined": new_dataset_result["is_combined"],
+            },
+            "cleaning": {
+                "master_csv_path": new_cleaning_result["master_csv_path"],
+                "datasets_merged": new_cleaning_result["datasets_merged"],
+                "rows_total": new_cleaning_result["rows_total"],
+                "target_met": new_cleaning_result["target_met"],
+                "conflicts": new_cleaning_result["conflicts"],
+            },
+        })
+        acted = {"dataset_result": new_dataset_result, "cleaning_result": new_cleaning_result, "blockers": blockers}
+
+    return acted
+
+
+def _relay_and_apply(result: dict, ranked_pool: list, floor_ts: str) -> None:
+    """Call check_agent_requests with this run's context/floor and, if it
+    successfully acted on a request, fold the fresh dataset_result/
+    cleaning_result into result. A relay attempt that itself failed
+    Master Agent's checks (blockers non-empty) is left alone -- it's
+    already been logged/posted by the nested _supervise calls, and must
+    not silently overwrite this run's last good dataset_result/
+    cleaning_result with None."""
+    relay = check_agent_requests(result["parent_paper"], ranked_pool, floor_ts=floor_ts)
+    if relay and not relay["blockers"]:
+        result["dataset_result"] = relay["dataset_result"]
+        result["cleaning_result"] = relay["cleaning_result"]
+
+
 def run_pipeline(topic: str) -> dict:
     """
     Drive the full pipeline (Intake -> Research -> Validation & Selection ->
@@ -412,6 +598,11 @@ def run_pipeline(topic: str) -> dict:
     from src.agents import intake_agent, research_agent, validation_agent, data_agent, cleaning_agent
     from src.orchestration.state_manager import update_state
     from src.orchestration import dataset_cache
+
+    # This run's own banner ts is the floor check_agent_requests uses below
+    # -- see check_agent_requests' floor_ts docstring for why this matters
+    # once the pipeline is run repeatedly for different topics.
+    run_floor_ts = slack_client.post_message(message_formatter.format_run_started(topic))
 
     result = {
         "success": False,
@@ -484,6 +675,13 @@ def run_pipeline(topic: str) -> dict:
     result["validation_result"] = validation_result
     result["parent_paper"] = validation_result["recommended_parent_paper"]
 
+    # A Data Agent request only becomes actionable once parent_paper/
+    # ranked_pool exist -- i.e. from here on. Checking any earlier would
+    # let this run's own first check permanently mark a not-yet-actionable
+    # request as "seen" (advancing the cursor) before it ever had context
+    # to act on, losing it for the rest of this run.
+    _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
+
     # --- Stage 4: Data Agent (dataset pool discovery + verification) ---
     dataset_cache.cache_validated_papers(validation_result["ranked_pool"])
 
@@ -508,6 +706,8 @@ def run_pipeline(topic: str) -> dict:
         "phase": "DATA_DISCOVERY",
     })
     result["dataset_result"] = dataset_result
+
+    _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
 
     # --- Stage 5: Cleaning Agent (merge downloaded datasets into a master CSV) ---
     cleaning_result, blockers = _supervise(
@@ -537,4 +737,7 @@ def run_pipeline(topic: str) -> dict:
         phase="DATA_CLEANING",
         cleaning_result=cleaning_result,
     )
+
+    _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
+
     return result

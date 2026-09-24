@@ -17,7 +17,8 @@ DEFAULT_STATE = {
     "baseline_results": {},
     "experiments": [],
     "report_status": "",
-    "presentation_status": ""
+    "presentation_status": "",
+    "slack_last_checked_ts": None,  # cursor for master_agent.check_agent_requests
 }
 
 

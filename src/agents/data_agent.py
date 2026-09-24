@@ -813,13 +813,19 @@ def _usable(candidate: dict | None, min_entries: int) -> bool:
     )
 
 
-def run(parent_paper: dict, ranked_pool: list) -> dict:
+def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTRIES) -> dict:
     """
-    Build a dataset pool of >= TARGET_ENTRIES total entries for the Parent
+    Build a dataset pool of >= target_entries total entries for the Parent
     Paper's replication, escalating through the three stages described in
     this module's docstring.
+
+    target_entries defaults to the project's standard TARGET_ENTRIES, but
+    is overridable so Master Agent can re-run this stage with a higher
+    target -- e.g. relaying a downstream agent's Slack request for more
+    data (see master_agent.check_agent_requests) -- without duplicating
+    this whole function.
     """
-    print(f"\n[Data Agent] Building dataset pool (target: {TARGET_ENTRIES} entries)...")
+    print(f"\n[Data Agent] Building dataset pool (target: {target_entries} entries)...")
 
     scope_description = _scope_description(parent_paper)
     stated_dataset = (parent_paper.get("dataset", "") if parent_paper else "") or ""
@@ -887,7 +893,7 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
                 break
             try_add(candidate)
 
-    target_met = total_entries >= TARGET_ENTRIES
+    target_met = total_entries >= target_entries
     if not selected_datasets:
         status = "NOT_FOUND"
     elif target_met:
@@ -896,7 +902,7 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
         status = "DEGRADED"
         warnings.append(
             f"Stopped after {len(selected_datasets)} unique dataset(s) with {total_entries} total "
-            f"entries -- below the {TARGET_ENTRIES}-entry target, even after all escalation stages."
+            f"entries -- below the {target_entries}-entry target, even after all escalation stages."
         )
 
     print(f"[Data Agent] Done. Status={status}, total_entries={total_entries}, "
@@ -904,7 +910,7 @@ def run(parent_paper: dict, ranked_pool: list) -> dict:
 
     return {
         "status": status,
-        "target_entries": TARGET_ENTRIES,
+        "target_entries": target_entries,
         "total_entries": total_entries,
         "target_met": target_met,
         "datasets_considered": datasets_considered,

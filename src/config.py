@@ -7,7 +7,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 SERPENT_API_KEY = os.getenv("SERPENT_API_KEY", "")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
-SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "")
+SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "")  # main status/activity channel
+SLACK_ERRORS_CHANNEL_ID = os.getenv("SLACK_ERRORS_CHANNEL_ID", "")  # Master Agent corrections/failures
 KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME", "")
 KAGGLE_KEY = os.getenv("KAGGLE_KEY", "")
 
