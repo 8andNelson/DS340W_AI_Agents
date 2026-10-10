@@ -16,6 +16,7 @@ DEFAULT_STATE = {
     "baseline_status": "",  # "OK" | "BLOCKED" | "TIMEOUT" once Replication Agent runs
     "baseline_results": {},  # {"source", "repo_url", "commit_sha", "entry_point", "exit_code",
                               #  "duration_seconds", "inferred_assumptions"} once Replication Agent runs
+    "evaluation_result": None,  # {"status", "metrics", "likely_causes"} once Evaluation Agent runs
     "experiments": [],
     "report_status": "",
     "presentation_status": "",

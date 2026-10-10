@@ -157,6 +157,19 @@ def _print_replication_summary(result: dict) -> None:
             print(f"    - {w}")
 
 
+def _print_evaluation_summary(result: dict) -> None:
+    print(f"\n--- Evaluation ({result['status']}) ---")
+    for m in result.get("metrics", []):
+        print(f"  - {m['metric']}: published={m['published_value']}, reproduced={m['reproduced_value']} "
+              f"-> {m['classification']}" + (f" ({m['notes']})" if m.get("notes") else ""))
+    if not result.get("metrics"):
+        print("  No comparable metrics found.")
+    if result.get("likely_causes"):
+        print("  Likely causes:")
+        for c in result["likely_causes"]:
+            print(f"    - {c}")
+
+
 def main():
     print(BANNER)
 
@@ -179,7 +192,7 @@ def main():
     print(f"\nTopic: {topic}")
     print("\n[Master Agent] Starting supervised pipeline "
           "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent -> "
-          "Code Discovery Agent -> Replication Agent)...")
+          "Code Discovery Agent -> Replication Agent -> Evaluation Agent)...")
 
     result = master_agent.run_pipeline(topic)
 
@@ -213,12 +226,15 @@ def main():
     if result["replication_result"]:
         _print_replication_summary(result["replication_result"])
 
+    if result["evaluation_result"]:
+        _print_evaluation_summary(result["evaluation_result"])
+
     print(f"\n[State] Phase -> {result['phase']}")
     print("[State] parent_paper_approved -> True")
     print("[State] Saved to logs/project_state.json")
     print("\nParent Paper approved, dataset pool built, master CSV cleaned, code discovery "
-          "attempted, and a baseline reproduction established. Next pipeline stage: "
-          "Evaluation Agent (Milestone 11).")
+          "attempted, a baseline reproduction established, and reproduced results evaluated "
+          "against the paper. Next pipeline stage: Experiment Agent (Milestone 12).")
 
 
 if __name__ == "__main__":

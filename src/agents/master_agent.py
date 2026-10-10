@@ -242,6 +242,24 @@ def _format_replication_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_evaluation_report(result: dict) -> str:
+    lines = [
+        "[Evaluation Agent] Reproduced vs. published results",
+        f"Overall: {result.get('status', '')}",
+    ]
+    for m in result.get("metrics", []):
+        lines.append(
+            f"  - {m['metric']}: published={m['published_value']}, reproduced={m['reproduced_value']} "
+            f"-> {m['classification']}" + (f" ({m['notes']})" if m.get("notes") else "")
+        )
+    if not result.get("metrics"):
+        lines.append("  No comparable metrics found.")
+    if result.get("likely_causes"):
+        lines.append("Likely causes:")
+        lines.extend(f"  - {c}" for c in result["likely_causes"])
+    return "\n".join(lines)
+
+
 # --- Per-stage checkers: each returns a list of blocker log entries ---
 
 def _check_intake(structured: dict) -> list:
@@ -427,6 +445,19 @@ def _check_replication(result: dict) -> list:
             "Rejected",
             "Re-run Replication Agent; if it fails again, halt for manual environment/code review.",
         )]
+    return []
+
+
+def _check_evaluation(result: dict) -> list:
+    """
+    Evaluation Agent never blocks the pipeline, regardless of status. A
+    FAILED or INCONCLUSIVE comparison is itself useful research
+    information, not an agent defect -- CLAUDE.md's Results Integrity
+    policy is explicit that "a failed or imperfect reproduction is still
+    useful research information." A raw exception during the stage is
+    still caught and retried by _supervise itself, independent of this
+    checker.
+    """
     return []
 
 
@@ -668,9 +699,9 @@ def run_pipeline(topic: str) -> dict:
     """
     Drive the full pipeline (Intake -> Research -> Validation & Selection ->
     Data Agent -> Cleaning Agent -> Code Discovery Agent -> Replication
-    Agent), supervising every stage. Master Agent invokes each agent
-    itself, checks its output, retries once on failure, and halts (with a
-    logged rejection) if the retry also fails.
+    Agent -> Evaluation Agent), supervising every stage. Master Agent
+    invokes each agent itself, checks its output, retries once on
+    failure, and halts (with a logged rejection) if the retry also fails.
 
     Returns:
         {
@@ -684,6 +715,7 @@ def run_pipeline(topic: str) -> dict:
           "cleaning_result": dict | None,
           "code_discovery_result": dict | None,
           "replication_result": dict | None,
+          "evaluation_result": dict | None,
           "blockers": [...],   # non-empty only when success is False
         }
     """
@@ -691,7 +723,7 @@ def run_pipeline(topic: str) -> dict:
     # orchestrator without creating an import cycle with src.main.
     from src.agents import (
         intake_agent, research_agent, validation_agent, data_agent, cleaning_agent, code_discovery_agent,
-        replication_agent,
+        replication_agent, evaluation_agent,
     )
     from src.orchestration.state_manager import update_state
     from src.orchestration import dataset_cache
@@ -712,6 +744,7 @@ def run_pipeline(topic: str) -> dict:
         "cleaning_result": None,
         "code_discovery_result": None,
         "replication_result": None,
+        "evaluation_result": None,
         "blockers": [],
     }
 
@@ -895,10 +928,39 @@ def run_pipeline(topic: str) -> dict:
         "phase": "BASELINE_REPLICATION",
     })
 
+    result["replication_result"] = replication_result
+
+    _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
+
+    # --- Stage 8: Evaluation Agent (compare reproduced vs. published results) ---
+    evaluation_result, blockers = _supervise(
+        "Evaluation Agent",
+        lambda: evaluation_agent.run(validation_result["recommended_parent_paper"], replication_result),
+        _check_evaluation,
+        _format_evaluation_report,
+    )
+    # _check_evaluation never returns blockers (see its docstring): a
+    # FAILED/INCONCLUSIVE comparison is itself useful research information,
+    # not an agent defect. This branch only fires on a raw exception
+    # _supervise couldn't resolve after a retry.
+    if blockers:
+        update_state({"phase": "BASELINE_EVALUATION"})
+        result.update(phase="BASELINE_EVALUATION", blockers=blockers)
+        return result
+
+    update_state({
+        "evaluation_result": {
+            "status": evaluation_result["status"],
+            "metrics": evaluation_result["metrics"],
+            "likely_causes": evaluation_result["likely_causes"],
+        },
+        "phase": "BASELINE_EVALUATION",
+    })
+
     result.update(
         success=True,
-        phase="BASELINE_REPLICATION",
-        replication_result=replication_result,
+        phase="BASELINE_EVALUATION",
+        evaluation_result=evaluation_result,
     )
 
     _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
