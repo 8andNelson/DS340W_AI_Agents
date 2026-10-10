@@ -2,19 +2,23 @@
 Data Agent (Milestone 6).
 
 Builds a dataset pool of at least TARGET_ENTRIES total entries to support
-the Parent Paper's replication, escalating through three stages:
+the Parent Paper's replication, escalating through three stages within a
+single run() call -- reaching stage 3 never requires an external re-run:
 
   1. Parent Paper's own stated dataset.
   2. The full ranked candidate pool (composite-score order, starting at the
      second-highest paper), each paper's own stated dataset -- no cap on
      how many papers are checked.
-  3. If nothing usable was found in stages 1-2, do NOT retry those same
-     (already-failed) dataset names again -- instead search curated dataset
-     directories (Google Dataset Search, Kaggle Datasets,
-     awesome-public-datasets) generally for anything relevant to the
-     project's scope, scoring each candidate on usability (entry count,
-     license, format, access method) since there's no single paper claim to
-     match against here.
+  3. Whenever stages 1-2 leave the entry-count target unmet -- whether they
+     found nothing usable at all, or found some datasets but total_entries
+     is still short -- fall through, in this same run, to a general web
+     search instead of retrying the specific (already-failed) dataset
+     names again: curated dataset directories (Google Dataset Search,
+     Kaggle Datasets, awesome-public-datasets) for anything relevant to
+     the project's scope, scoring each candidate on usability (entry
+     count, license, format, access method) since there's no single paper
+     claim to match against here. Skipped only when stages 1-2 already met
+     the target on their own.
 
 Collection does NOT stop the moment the entry-count target is reached --
 it keeps adding further qualifying, non-duplicate datasets (across all
@@ -881,13 +885,18 @@ def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTR
     if selected_datasets:
         search_stage = "paper_traversal"
 
-    # --- Stage 3: nothing usable in any paper's own named dataset -- search
-    # the web generally for datasets that fit the project's scope, instead
-    # of retrying the specific (already-failed) dataset names again. ---
-    if not selected_datasets:
-        search_stage = "exploration_sites"
-        print("[Data Agent] No usable dataset found among candidate papers; "
-              "searching generally for datasets relevant to the project scope...")
+    # --- Stage 3: fall through to a general web search in this SAME run
+    # whenever papers' own named datasets left the entry-count target
+    # unmet -- whether nothing usable was found at all, or something was
+    # found but total_entries is still short -- instead of retrying the
+    # specific (already-failed) dataset names again. This must never
+    # require a separate external re-run to reach: a partial paper-based
+    # result used to silently stop here even when far under target. ---
+    if total_entries < target_entries and len(selected_datasets) < MAX_DATASETS:
+        search_stage = "paper_traversal+exploration_sites" if selected_datasets else "exploration_sites"
+        print(f"[Data Agent] Candidate papers' own datasets left the entry target unmet "
+              f"({total_entries}/{target_entries}); searching generally for datasets "
+              "relevant to the project scope to fill the gap...")
         for candidate in _search_exploration_sites(scope_description, parent_paper):
             if len(selected_datasets) >= MAX_DATASETS:
                 break

@@ -202,7 +202,12 @@ class TestRunAlgorithm(unittest.TestCase):
         def fake_find(paper, _scope, _parent=None):
             return candidates[paper["dataset"]]
 
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
+        # Falling short of the target with room left under MAX_DATASETS
+        # now falls through to stage 3 in the same run (see
+        # TestEscalationStages) -- mocked to [] here since this test is
+        # specifically about stage 2's traversal, not stage 3.
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find), \
+             patch.object(data_agent, "_search_exploration_sites", return_value=[]):
             result = data_agent.run(parent, [parent] + alts)
 
         # Only 4 candidates exist and none individually meets the target,
@@ -304,9 +309,9 @@ class TestEscalationStages(unittest.TestCase):
         self.assertNotIn("Elusive Dataset", scope_arg)
         self.assertIn("Parent", scope_arg)
 
-    def test_exploration_does_not_fire_when_paper_traversal_succeeds(self):
+    def test_exploration_does_not_fire_when_paper_traversal_already_met_the_target(self):
         parent = make_paper(title="Parent", dataset="Findable Dataset")
-        found = make_link_candidate("https://kaggle.com/found", entry_count=3000)
+        found = make_link_candidate("https://kaggle.com/found", entry_count=15000)
 
         with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=found), \
              patch.object(data_agent, "_search_exploration_sites") as explore_mock:
@@ -314,6 +319,25 @@ class TestEscalationStages(unittest.TestCase):
 
         explore_mock.assert_not_called()
         self.assertEqual(result["search_stage"], "paper_traversal")
+
+    def test_exploration_fires_in_the_same_run_when_paper_traversal_falls_short_of_target(self):
+        """The behavior this whole stage exists to fix: papers finding
+        *something* (but not enough) must not require a separate external
+        re-run to reach the web-search fallback -- it happens in the same
+        run() call."""
+        parent = make_paper(title="Parent", dataset="Findable Dataset")
+        found = make_link_candidate("https://kaggle.com/found", entry_count=3000)
+        exploration_hit = make_link_candidate("https://kaggle.com/explored", entry_count=8000)
+
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=found), \
+             patch.object(data_agent, "_search_exploration_sites", return_value=[exploration_hit]) as explore_mock:
+            result = data_agent.run(parent, [parent])
+
+        explore_mock.assert_called_once()
+        self.assertEqual(result["search_stage"], "paper_traversal+exploration_sites")
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["total_entries"], 11000)
+        self.assertEqual(result["selected_datasets"], [found, exploration_hit])
 
     def test_exploration_stops_at_max_datasets_cap(self):
         """Stage 3 collects more than one dataset when more than one
