@@ -271,6 +271,30 @@ class TestReplicateFromRepository(ReplicationAgentTestCase):
         self.assertEqual(result["entry_point_source"], "convention")
         self.assertEqual(result["commit_sha"], "abc123")
 
+    def test_readme_llm_command_uses_the_isolated_venvs_python_not_bare_python(self):
+        """The dependencies just installed into the isolated venv must
+        actually be the ones used -- a bare "python" token from the
+        README-LLM extraction would instead resolve to whatever "python"
+        means on PATH, silently defeating the venv isolation."""
+        venv_dir = replication_agent.REPLICATION_DIR / replication_agent._slugify(make_paper()["title"]) / "venv"
+
+        with patch.object(replication_agent, "_clone_repo",
+                           return_value={"ok": True, "error": "", "commit_sha": "abc"}), \
+             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_freeze", return_value=""), \
+             patch.object(replication_agent, "_detect_entry_point_by_convention", return_value=""), \
+             patch.object(replication_agent, "_extract_entry_point_from_readme",
+                           return_value=["python", "src/train.py", "--epochs", "10"]), \
+             patch.object(replication_agent, "_wire_dataset_into_repo", return_value=[]), \
+             patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=0)) as run_mock:
+            result = replication_agent._replicate_from_repository(make_paper(), make_repository(), make_cleaning_result())
+
+        self.assertEqual(result["status"], "OK")
+        executed_command = run_mock.call_args.args[0]
+        self.assertEqual(executed_command, [str(replication_agent._venv_python(venv_dir)), "src/train.py", "--epochs", "10"])
+        self.assertNotIn("python", executed_command)
+
     def test_no_entry_point_found_blocks_without_executing(self):
         repo_dir = replication_agent.REPLICATION_DIR / replication_agent._slugify(make_paper()["title"]) / "repo"
         repo_dir.mkdir(parents=True, exist_ok=True)

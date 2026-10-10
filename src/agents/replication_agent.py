@@ -337,7 +337,14 @@ def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_re
     if not command:
         readme_command = _extract_entry_point_from_readme(repo_dir, paper_title)
         if readme_command:
-            command = readme_command
+            # The LLM returns a bare "python"/"python3" token -- substitute
+            # the isolated venv's own interpreter so the dependencies just
+            # installed into it are actually the ones used, same as the
+            # convention-detected case above.
+            if readme_command[0] in ("python", "python3"):
+                command = [str(_venv_python(venv_dir)), *readme_command[1:]]
+            else:
+                command = readme_command
             entry_point = " ".join(readme_command)
             entry_point_source = "readme_llm"
 
