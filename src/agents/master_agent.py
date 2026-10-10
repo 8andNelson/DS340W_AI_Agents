@@ -219,6 +219,29 @@ def _format_code_discovery_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_replication_report(result: dict) -> str:
+    lines = [
+        "[Replication Agent] Baseline reproduction",
+        f"Status: {result.get('status', '')}",
+        f"Source: {result.get('source', '')}",
+    ]
+    if result.get("repo_url"):
+        lines.append(f"Repository: {result['repo_url']} (commit {result.get('commit_sha', '') or 'unknown'})")
+    lines.append(f"Entry point: {result.get('entry_point', '')} (via {result.get('entry_point_source', '')})")
+    lines.append(f"Exit code: {result.get('exit_code')}  Duration: {result.get('duration_seconds')}s")
+    lines.append(f"Replication dir: {result.get('replication_dir', '')}")
+    if result.get("inferred_assumptions"):
+        lines.append("Inferred assumptions (reconstructed code, not the authors'):")
+        lines.extend(f"  - {a}" for a in result["inferred_assumptions"])
+    if result.get("modifications"):
+        lines.append("Modifications made to run the original repo:")
+        lines.extend(f"  - {m}" for m in result["modifications"])
+    if result.get("warnings"):
+        lines.append("Warnings:")
+        lines.extend(f"  - {w}" for w in result["warnings"])
+    return "\n".join(lines)
+
+
 # --- Per-stage checkers: each returns a list of blocker log entries ---
 
 def _check_intake(structured: dict) -> list:
@@ -383,6 +406,27 @@ def _check_code_discovery(result: dict) -> list:
     A raw exception during the stage is still caught and retried by
     _supervise itself, independent of this checker.
     """
+    return []
+
+
+def _check_replication(result: dict) -> list:
+    """
+    Unlike Code Discovery, Replication Agent IS blocked on anything other
+    than a clean "OK" -- CLAUDE.md's Baseline Replication Rule means the
+    pipeline genuinely needs a working, executed baseline before
+    advancing to evaluation/experimentation. BLOCKED (install/entry-point/
+    execution failure) and TIMEOUT both trigger Master Agent's normal
+    retry-once-then-halt, which matters especially for the reconstruction
+    path, where a fresh retry re-generates via a non-deterministic LLM call.
+    """
+    if result.get("status") != "OK":
+        return [_log_entry(
+            "Correction", "Replication Agent",
+            f"Replication Agent did not produce a working baseline (status={result.get('status', '')}, "
+            f"source={result.get('source', '')}). Warnings: {'; '.join(result.get('warnings', [])) or 'none reported'}.",
+            "Rejected",
+            "Re-run Replication Agent; if it fails again, halt for manual environment/code review.",
+        )]
     return []
 
 
@@ -623,10 +667,10 @@ def _relay_and_apply(result: dict, ranked_pool: list, floor_ts: str) -> None:
 def run_pipeline(topic: str) -> dict:
     """
     Drive the full pipeline (Intake -> Research -> Validation & Selection ->
-    Data Agent -> Cleaning Agent -> Code Discovery Agent), supervising
-    every stage. Master Agent invokes each agent itself, checks its
-    output, retries once on failure, and halts (with a logged rejection)
-    if the retry also fails.
+    Data Agent -> Cleaning Agent -> Code Discovery Agent -> Replication
+    Agent), supervising every stage. Master Agent invokes each agent
+    itself, checks its output, retries once on failure, and halts (with a
+    logged rejection) if the retry also fails.
 
     Returns:
         {
@@ -639,6 +683,7 @@ def run_pipeline(topic: str) -> dict:
           "dataset_result": dict | None,
           "cleaning_result": dict | None,
           "code_discovery_result": dict | None,
+          "replication_result": dict | None,
           "blockers": [...],   # non-empty only when success is False
         }
     """
@@ -646,6 +691,7 @@ def run_pipeline(topic: str) -> dict:
     # orchestrator without creating an import cycle with src.main.
     from src.agents import (
         intake_agent, research_agent, validation_agent, data_agent, cleaning_agent, code_discovery_agent,
+        replication_agent,
     )
     from src.orchestration.state_manager import update_state
     from src.orchestration import dataset_cache
@@ -665,6 +711,7 @@ def run_pipeline(topic: str) -> dict:
         "dataset_result": None,
         "cleaning_result": None,
         "code_discovery_result": None,
+        "replication_result": None,
         "blockers": [],
     }
 
@@ -816,10 +863,42 @@ def run_pipeline(topic: str) -> dict:
         },
         "phase": "CODE_DISCOVERY",
     })
+    result["code_discovery_result"] = code_discovery_result
+
+    _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
+
+    # --- Stage 7: Replication Agent (establish the baseline reproduction) ---
+    replication_result, blockers = _supervise(
+        "Replication Agent",
+        lambda: replication_agent.run(
+            validation_result["recommended_parent_paper"], code_discovery_result, cleaning_result,
+        ),
+        _check_replication,
+        _format_replication_report,
+    )
+    if blockers:
+        update_state({"baseline_status": replication_result["status"] if replication_result else "", "phase": "BASELINE_REPLICATION"})
+        result.update(phase="BASELINE_REPLICATION", blockers=blockers)
+        return result
+
+    update_state({
+        "baseline_status": replication_result["status"],
+        "baseline_results": {
+            "source": replication_result["source"],
+            "repo_url": replication_result["repo_url"],
+            "commit_sha": replication_result["commit_sha"],
+            "entry_point": replication_result["entry_point"],
+            "exit_code": replication_result["exit_code"],
+            "duration_seconds": replication_result["duration_seconds"],
+            "inferred_assumptions": replication_result["inferred_assumptions"],
+        },
+        "phase": "BASELINE_REPLICATION",
+    })
+
     result.update(
         success=True,
-        phase="CODE_DISCOVERY",
-        code_discovery_result=code_discovery_result,
+        phase="BASELINE_REPLICATION",
+        replication_result=replication_result,
     )
 
     _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)

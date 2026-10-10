@@ -137,6 +137,26 @@ def _print_code_discovery_summary(result: dict) -> None:
             print(f"    - {w}")
 
 
+def _print_replication_summary(result: dict) -> None:
+    print(f"\n--- Baseline Replication ({result['status']}) ---")
+    print(f"  Source: {result['source']}")
+    if result.get("repo_url"):
+        print(f"  Repository:  {result['repo_url']} (commit {result.get('commit_sha', '') or 'unknown'})")
+    print(f"  Entry point: {result.get('entry_point', '')} (via {result.get('entry_point_source', '')})")
+    print(f"  Exit code:   {result.get('exit_code')}  Duration: {result.get('duration_seconds')}s")
+    print(f"  Replication dir: {result.get('replication_dir', '')}")
+
+    if result.get("inferred_assumptions"):
+        print("  Inferred assumptions (reconstructed code, not the authors'):")
+        for a in result["inferred_assumptions"]:
+            print(f"    - {a}")
+
+    if result.get("warnings"):
+        print("  Warnings:")
+        for w in result["warnings"]:
+            print(f"    - {w}")
+
+
 def main():
     print(BANNER)
 
@@ -158,7 +178,8 @@ def main():
 
     print(f"\nTopic: {topic}")
     print("\n[Master Agent] Starting supervised pipeline "
-          "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent -> Code Discovery Agent)...")
+          "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent -> "
+          "Code Discovery Agent -> Replication Agent)...")
 
     result = master_agent.run_pipeline(topic)
 
@@ -189,11 +210,15 @@ def main():
     if result["code_discovery_result"]:
         _print_code_discovery_summary(result["code_discovery_result"])
 
+    if result["replication_result"]:
+        _print_replication_summary(result["replication_result"])
+
     print(f"\n[State] Phase -> {result['phase']}")
     print("[State] parent_paper_approved -> True")
     print("[State] Saved to logs/project_state.json")
-    print("\nParent Paper approved, dataset pool built, master CSV cleaned, and code "
-          "discovery attempted. Next pipeline stage: Replication Agent (Milestone 10).")
+    print("\nParent Paper approved, dataset pool built, master CSV cleaned, code discovery "
+          "attempted, and a baseline reproduction established. Next pipeline stage: "
+          "Evaluation Agent (Milestone 11).")
 
 
 if __name__ == "__main__":

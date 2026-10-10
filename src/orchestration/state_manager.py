@@ -13,8 +13,9 @@ DEFAULT_STATE = {
     "code_repository": None,  # {"status", "repository", "source_stage"} once Code Discovery Agent runs
     "dataset": None,
     "cleaning": None,
-    "baseline_status": "",
-    "baseline_results": {},
+    "baseline_status": "",  # "OK" | "BLOCKED" | "TIMEOUT" once Replication Agent runs
+    "baseline_results": {},  # {"source", "repo_url", "commit_sha", "entry_point", "exit_code",
+                              #  "duration_seconds", "inferred_assumptions"} once Replication Agent runs
     "experiments": [],
     "report_status": "",
     "presentation_status": "",
