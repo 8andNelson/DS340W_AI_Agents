@@ -17,7 +17,8 @@ DEFAULT_STATE = {
     "baseline_results": {},  # {"source", "repo_url", "commit_sha", "entry_point", "exit_code",
                               #  "duration_seconds", "inferred_assumptions"} once Replication Agent runs
     "evaluation_result": None,  # {"status", "metrics", "likely_causes"} once Evaluation Agent runs
-    "experiments": [],
+    "experiments": [],  # list of {"status", "category", "hypothesis", "overall", "comparison", ...} --
+                        # one entry appended per Experiment Agent run
     "report_status": "",
     "presentation_status": "",
     "slack_last_checked_ts": None,  # cursor for master_agent.check_agent_requests

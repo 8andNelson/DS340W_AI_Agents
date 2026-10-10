@@ -260,6 +260,26 @@ def _format_evaluation_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_experiment_report(result: dict) -> str:
+    lines = [
+        "[Experiment Agent] Controlled experiment vs. preserved baseline",
+        f"Status: {result.get('status', '')}",
+        f"Category: {result.get('category', '')}",
+    ]
+    if result.get("hypothesis"):
+        lines.append(f"Hypothesis: {result['hypothesis']}")
+    if result.get("what_changed"):
+        lines.append(f"What changed: {result['what_changed']}")
+    lines.append(f"Overall: {result.get('overall', '')}")
+    for c in result.get("comparison", []):
+        lines.append(f"  - {c['metric']}: baseline={c['baseline_value']}, experiment={c['experiment_value']} "
+                      f"-> {c['classification']}")
+    if result.get("warnings"):
+        lines.append("Warnings:")
+        lines.extend(f"  - {w}" for w in result["warnings"])
+    return "\n".join(lines)
+
+
 # --- Per-stage checkers: each returns a list of blocker log entries ---
 
 def _check_intake(structured: dict) -> list:
@@ -457,6 +477,19 @@ def _check_evaluation(result: dict) -> list:
     useful research information." A raw exception during the stage is
     still caught and retried by _supervise itself, independent of this
     checker.
+    """
+    return []
+
+
+def _check_experiment(result: dict) -> list:
+    """
+    Experiment Agent never blocks the pipeline, regardless of status. A
+    REGRESSED, BLOCKED, or SKIPPED experiment is itself useful research
+    information -- CLAUDE.md's Results Integrity policy ("a failed or
+    imperfect reproduction is still useful research information")
+    applies equally to a controlled experiment that didn't pan out. A
+    raw exception during the stage is still caught and retried by
+    _supervise itself, independent of this checker.
     """
     return []
 
@@ -699,9 +732,10 @@ def run_pipeline(topic: str) -> dict:
     """
     Drive the full pipeline (Intake -> Research -> Validation & Selection ->
     Data Agent -> Cleaning Agent -> Code Discovery Agent -> Replication
-    Agent -> Evaluation Agent), supervising every stage. Master Agent
-    invokes each agent itself, checks its output, retries once on
-    failure, and halts (with a logged rejection) if the retry also fails.
+    Agent -> Evaluation Agent -> Experiment Agent), supervising every
+    stage. Master Agent invokes each agent itself, checks its output,
+    retries once on failure, and halts (with a logged rejection) if the
+    retry also fails.
 
     Returns:
         {
@@ -716,6 +750,7 @@ def run_pipeline(topic: str) -> dict:
           "code_discovery_result": dict | None,
           "replication_result": dict | None,
           "evaluation_result": dict | None,
+          "experiment_result": dict | None,
           "blockers": [...],   # non-empty only when success is False
         }
     """
@@ -723,9 +758,9 @@ def run_pipeline(topic: str) -> dict:
     # orchestrator without creating an import cycle with src.main.
     from src.agents import (
         intake_agent, research_agent, validation_agent, data_agent, cleaning_agent, code_discovery_agent,
-        replication_agent, evaluation_agent,
+        replication_agent, evaluation_agent, experiment_agent,
     )
-    from src.orchestration.state_manager import update_state
+    from src.orchestration.state_manager import load_state, update_state
     from src.orchestration import dataset_cache
 
     # This run's own banner ts is the floor check_agent_requests uses below
@@ -745,6 +780,7 @@ def run_pipeline(topic: str) -> dict:
         "code_discovery_result": None,
         "replication_result": None,
         "evaluation_result": None,
+        "experiment_result": None,
         "blockers": [],
     }
 
@@ -957,10 +993,39 @@ def run_pipeline(topic: str) -> dict:
         "phase": "BASELINE_EVALUATION",
     })
 
+    result["evaluation_result"] = evaluation_result
+
+    _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
+
+    # --- Stage 9: Experiment Agent (one controlled change vs. the preserved baseline) ---
+    previous_experiments = load_state().get("experiments", [])
+    experiment_result, blockers = _supervise(
+        "Experiment Agent",
+        lambda: experiment_agent.run(
+            validation_result["recommended_parent_paper"], replication_result, evaluation_result,
+            cleaning_result, previous_experiments,
+        ),
+        _check_experiment,
+        _format_experiment_report,
+    )
+    # _check_experiment never returns blockers (see its docstring): a
+    # REGRESSED/BLOCKED/SKIPPED experiment is itself useful research
+    # information, not an agent defect. This branch only fires on a raw
+    # exception _supervise couldn't resolve after a retry.
+    if blockers:
+        update_state({"phase": "EXPERIMENTATION"})
+        result.update(phase="EXPERIMENTATION", blockers=blockers)
+        return result
+
+    update_state({
+        "experiments": previous_experiments + [experiment_result],
+        "phase": "EXPERIMENTATION",
+    })
+
     result.update(
         success=True,
-        phase="BASELINE_EVALUATION",
-        evaluation_result=evaluation_result,
+        phase="EXPERIMENTATION",
+        experiment_result=experiment_result,
     )
 
     _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)

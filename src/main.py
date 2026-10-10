@@ -170,6 +170,23 @@ def _print_evaluation_summary(result: dict) -> None:
             print(f"    - {c}")
 
 
+def _print_experiment_summary(result: dict) -> None:
+    print(f"\n--- Experiment ({result['status']}) ---")
+    print(f"  Category: {result.get('category', '')}")
+    if result.get("hypothesis"):
+        print(f"  Hypothesis: {result['hypothesis']}")
+    if result.get("what_changed"):
+        print(f"  What changed: {result['what_changed']}")
+    print(f"  Overall: {result.get('overall', '')}")
+    for c in result.get("comparison", []):
+        print(f"    - {c['metric']}: baseline={c['baseline_value']}, experiment={c['experiment_value']} "
+              f"-> {c['classification']}")
+    if result.get("warnings"):
+        print("  Warnings:")
+        for w in result["warnings"]:
+            print(f"    - {w}")
+
+
 def main():
     print(BANNER)
 
@@ -192,7 +209,7 @@ def main():
     print(f"\nTopic: {topic}")
     print("\n[Master Agent] Starting supervised pipeline "
           "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent -> "
-          "Code Discovery Agent -> Replication Agent -> Evaluation Agent)...")
+          "Code Discovery Agent -> Replication Agent -> Evaluation Agent -> Experiment Agent)...")
 
     result = master_agent.run_pipeline(topic)
 
@@ -229,12 +246,16 @@ def main():
     if result["evaluation_result"]:
         _print_evaluation_summary(result["evaluation_result"])
 
+    if result["experiment_result"]:
+        _print_experiment_summary(result["experiment_result"])
+
     print(f"\n[State] Phase -> {result['phase']}")
     print("[State] parent_paper_approved -> True")
     print("[State] Saved to logs/project_state.json")
     print("\nParent Paper approved, dataset pool built, master CSV cleaned, code discovery "
-          "attempted, a baseline reproduction established, and reproduced results evaluated "
-          "against the paper. Next pipeline stage: Experiment Agent (Milestone 12).")
+          "attempted, a baseline reproduction established, results evaluated against the "
+          "paper, and one controlled experiment run against the preserved baseline. Next "
+          "pipeline stage: Report Agent (Milestone 13).")
 
 
 if __name__ == "__main__":
