@@ -198,6 +198,27 @@ def _format_cleaning_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_code_discovery_report(result: dict) -> str:
+    lines = [
+        "[Code Discovery Agent] Implementation search for Parent Paper",
+        f"Status:       {result.get('status', '')}",
+        f"Source stage: {result.get('source_stage', '')}",
+        f"Candidates considered: {len(result.get('candidates_considered', []))}",
+    ]
+    repo = result.get("repository")
+    if repo:
+        lines.append(f"Repository:  {repo.get('repo_url', '')} ({repo.get('source', '')})")
+        lines.append(f"License:     {repo.get('license', '') or 'unknown'}")
+        lines.append(f"Stars:       {repo.get('stars', 'n/a')}")
+        lines.append(f"Dependency files: {', '.join(repo.get('dependency_files', [])) or 'none found'}")
+    else:
+        lines.append("No verified implementation found -- Replication Agent will reconstruct from the paper.")
+    if result.get("warnings"):
+        lines.append("Warnings:")
+        lines.extend(f"  - {w}" for w in result["warnings"])
+    return "\n".join(lines)
+
+
 # --- Per-stage checkers: each returns a list of blocker log entries ---
 
 def _check_intake(structured: dict) -> list:
@@ -348,6 +369,20 @@ def _check_cleaning(result: dict) -> list:
             "Rejected",
             "Re-run Cleaning Agent; if it fails again, halt for manual dataset review.",
         )]
+    return []
+
+
+def _check_code_discovery(result: dict) -> list:
+    """
+    Code Discovery Agent never blocks the pipeline, regardless of status.
+    Unlike Data Agent/Cleaning Agent, finding zero usable implementations
+    is an explicitly valid outcome per CLAUDE.md's Preferred Implementation
+    Order: option 6 is to reconstruct from the paper itself when no usable
+    code can be located. There is nothing here for Master Agent to reject;
+    a NOT_FOUND status just gets passed through to the Replication Agent.
+    A raw exception during the stage is still caught and retried by
+    _supervise itself, independent of this checker.
+    """
     return []
 
 
@@ -588,9 +623,10 @@ def _relay_and_apply(result: dict, ranked_pool: list, floor_ts: str) -> None:
 def run_pipeline(topic: str) -> dict:
     """
     Drive the full pipeline (Intake -> Research -> Validation & Selection ->
-    Data Agent -> Cleaning Agent), supervising every stage. Master Agent
-    invokes each agent itself, checks its output, retries once on failure,
-    and halts (with a logged rejection) if the retry also fails.
+    Data Agent -> Cleaning Agent -> Code Discovery Agent), supervising
+    every stage. Master Agent invokes each agent itself, checks its
+    output, retries once on failure, and halts (with a logged rejection)
+    if the retry also fails.
 
     Returns:
         {
@@ -602,12 +638,15 @@ def run_pipeline(topic: str) -> dict:
           "parent_paper": dict | None,
           "dataset_result": dict | None,
           "cleaning_result": dict | None,
+          "code_discovery_result": dict | None,
           "blockers": [...],   # non-empty only when success is False
         }
     """
     # Imported here (not at module load) so master_agent stays the sole
     # orchestrator without creating an import cycle with src.main.
-    from src.agents import intake_agent, research_agent, validation_agent, data_agent, cleaning_agent
+    from src.agents import (
+        intake_agent, research_agent, validation_agent, data_agent, cleaning_agent, code_discovery_agent,
+    )
     from src.orchestration.state_manager import update_state
     from src.orchestration import dataset_cache
 
@@ -625,6 +664,7 @@ def run_pipeline(topic: str) -> dict:
         "parent_paper": None,
         "dataset_result": None,
         "cleaning_result": None,
+        "code_discovery_result": None,
         "blockers": [],
     }
 
@@ -749,10 +789,37 @@ def run_pipeline(topic: str) -> dict:
         "phase": "DATA_CLEANING",
     })
 
+    result["cleaning_result"] = cleaning_result
+
+    _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
+
+    # --- Stage 6: Code Discovery Agent (locate the Parent Paper's implementation) ---
+    code_discovery_result, blockers = _supervise(
+        "Code Discovery Agent",
+        lambda: code_discovery_agent.run(validation_result["recommended_parent_paper"]),
+        _check_code_discovery,
+        _format_code_discovery_report,
+    )
+    # _check_code_discovery never returns blockers (see its docstring), so
+    # this branch only fires on a raw exception _supervise couldn't resolve
+    # after a retry -- handled identically to every other stage regardless.
+    if blockers:
+        update_state({"phase": "CODE_DISCOVERY"})
+        result.update(phase="CODE_DISCOVERY", blockers=blockers)
+        return result
+
+    update_state({
+        "code_repository": {
+            "status": code_discovery_result["status"],
+            "repository": code_discovery_result["repository"],
+            "source_stage": code_discovery_result["source_stage"],
+        },
+        "phase": "CODE_DISCOVERY",
+    })
     result.update(
         success=True,
-        phase="DATA_CLEANING",
-        cleaning_result=cleaning_result,
+        phase="CODE_DISCOVERY",
+        code_discovery_result=code_discovery_result,
     )
 
     _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)

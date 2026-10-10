@@ -75,3 +75,36 @@ def search_dataset_sites(query: str, count: int = 10) -> list:
                 seen_urls.add(url)
                 merged.append(r)
     return merged
+
+
+# Curated code-hosting/index targets for the Code Discovery Agent. Kaggle's
+# "code" (notebooks/kernels) section is included here rather than given its
+# own authenticated API path like Data Agent's dataset downloads -- this
+# agent only needs to identify and describe a repo, not download/execute it.
+CODE_EXPLORATION_SITES = (
+    "site:github.com",
+    "site:paperswithcode.com",
+    "site:kaggle.com/code",
+    "site:gitlab.com",
+)
+
+
+def search_code_sites(query: str, count: int = 10) -> list:
+    """Search each curated code-hosting site separately and merge results,
+    same per-site-query-then-dedup approach as search_dataset_sites (and
+    for the same reason: a single OR query lets one site's ranking crowd
+    out the others)."""
+    per_site_count = max(2, count // len(CODE_EXPLORATION_SITES))
+    seen_urls = set()
+    merged = []
+    for site_filter in CODE_EXPLORATION_SITES:
+        try:
+            results = search(f"{query} {site_filter}", count=per_site_count)
+        except Exception:
+            continue
+        for r in results:
+            url = r.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                merged.append(r)
+    return merged

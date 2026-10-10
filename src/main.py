@@ -117,6 +117,26 @@ def _print_cleaning_summary(result: dict) -> None:
             print(f"    - {c.get('dataset', '')} ({c.get('link', '')}): {c.get('reason', '')}")
 
 
+def _print_code_discovery_summary(result: dict) -> None:
+    print(f"\n--- Code Discovery ({result['status']}) ---")
+    print(f"  Source stage: {result['source_stage']}")
+    print(f"  Candidates considered: {len(result['candidates_considered'])}")
+
+    repo = result.get("repository")
+    if repo:
+        print(f"  Repository: {repo.get('repo_url', '')} ({repo.get('source', '')})")
+        print(f"  License:    {repo.get('license', '') or 'unknown'}")
+        print(f"  Stars:      {repo.get('stars', 'n/a')}")
+        print(f"  Dependency files: {', '.join(repo.get('dependency_files', [])) or 'none found'}")
+    else:
+        print("  No verified implementation found -- Replication Agent will reconstruct from the paper.")
+
+    if result.get("warnings"):
+        print("  Warnings:")
+        for w in result["warnings"]:
+            print(f"    - {w}")
+
+
 def main():
     print(BANNER)
 
@@ -138,7 +158,7 @@ def main():
 
     print(f"\nTopic: {topic}")
     print("\n[Master Agent] Starting supervised pipeline "
-          "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent)...")
+          "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent -> Code Discovery Agent)...")
 
     result = master_agent.run_pipeline(topic)
 
@@ -166,11 +186,14 @@ def main():
     if result["cleaning_result"]:
         _print_cleaning_summary(result["cleaning_result"])
 
+    if result["code_discovery_result"]:
+        _print_code_discovery_summary(result["code_discovery_result"])
+
     print(f"\n[State] Phase -> {result['phase']}")
     print("[State] parent_paper_approved -> True")
     print("[State] Saved to logs/project_state.json")
-    print("\nParent Paper approved, dataset pool built, and master CSV cleaned. "
-          "Next pipeline stage: Code Discovery (Milestone 9).")
+    print("\nParent Paper approved, dataset pool built, master CSV cleaned, and code "
+          "discovery attempted. Next pipeline stage: Replication Agent (Milestone 10).")
 
 
 if __name__ == "__main__":

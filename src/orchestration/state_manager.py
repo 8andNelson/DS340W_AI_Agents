@@ -10,7 +10,7 @@ DEFAULT_STATE = {
     "papers": [],
     "parent_paper": None,
     "parent_paper_approved": False,
-    "code_repository": "",
+    "code_repository": None,  # {"status", "repository", "source_stage"} once Code Discovery Agent runs
     "dataset": None,
     "cleaning": None,
     "baseline_status": "",
