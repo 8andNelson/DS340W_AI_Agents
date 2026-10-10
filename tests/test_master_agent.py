@@ -203,6 +203,14 @@ def make_cleaning_result(**overrides) -> dict:
         "target_rows": 10000,
         "target_met": rows_total >= 10000,
         "conflicts": [],
+        "train_csv_path": "data/processed/train.csv" if merged else "",
+        "test_csv_path": "data/processed/test.csv" if merged else "",
+        "validation_csv_path": "data/processed/validation.csv" if merged else "",
+        "split_rows": {
+            "train": round(rows_total * 0.7), "test": round(rows_total * 0.2),
+            "validation": rows_total - round(rows_total * 0.7) - round(rows_total * 0.2),
+        } if merged else {"train": 0, "test": 0, "validation": 0},
+        "split_seed": 42,
         "notes": "",
     }
     result.update(overrides)

@@ -184,6 +184,13 @@ def _format_cleaning_report(result: dict) -> str:
         f"(target: {result.get('target_rows', 10000)}, target met: {result.get('target_met', False)})",
         f"Master CSV:        {result.get('master_csv_path', '')}",
     ]
+    split_rows = result.get("split_rows") or {}
+    if result.get("train_csv_path"):
+        lines.append(
+            f"Train/Test/Val:    {split_rows.get('train', 0)}/{split_rows.get('test', 0)}/"
+            f"{split_rows.get('validation', 0)} rows (seed={result.get('split_seed', '')}) -> "
+            f"{result['train_csv_path']}, {result.get('test_csv_path', '')}, {result.get('validation_csv_path', '')}"
+        )
     if result.get("conflicts"):
         lines.append("Conflicts:")
         for c in result["conflicts"]:
@@ -552,6 +559,11 @@ def check_agent_requests(parent_paper: dict = None, ranked_pool: list = None,
                 "rows_total": new_cleaning_result["rows_total"],
                 "target_met": new_cleaning_result["target_met"],
                 "conflicts": new_cleaning_result["conflicts"],
+                "train_csv_path": new_cleaning_result["train_csv_path"],
+                "test_csv_path": new_cleaning_result["test_csv_path"],
+                "validation_csv_path": new_cleaning_result["validation_csv_path"],
+                "split_rows": new_cleaning_result["split_rows"],
+                "split_seed": new_cleaning_result["split_seed"],
             },
         })
         acted = {"dataset_result": new_dataset_result, "cleaning_result": new_cleaning_result, "blockers": blockers}
@@ -728,6 +740,11 @@ def run_pipeline(topic: str) -> dict:
             "rows_total": cleaning_result["rows_total"],
             "target_met": cleaning_result["target_met"],
             "conflicts": cleaning_result["conflicts"],
+            "train_csv_path": cleaning_result["train_csv_path"],
+            "test_csv_path": cleaning_result["test_csv_path"],
+            "validation_csv_path": cleaning_result["validation_csv_path"],
+            "split_rows": cleaning_result["split_rows"],
+            "split_seed": cleaning_result["split_seed"],
         },
         "phase": "DATA_CLEANING",
     })

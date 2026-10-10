@@ -103,6 +103,14 @@ def _print_cleaning_summary(result: dict) -> None:
     if result.get("master_csv_path"):
         print(f"  Master CSV:      {result['master_csv_path']}")
 
+    split_rows = result.get("split_rows") or {}
+    if result.get("train_csv_path"):
+        print(f"  Train/Test/Val:  {split_rows.get('train', 0)}/{split_rows.get('test', 0)}/"
+              f"{split_rows.get('validation', 0)} rows (seed={result.get('split_seed', '')})")
+        print(f"                   {result['train_csv_path']}")
+        print(f"                   {result.get('test_csv_path', '')}")
+        print(f"                   {result.get('validation_csv_path', '')}")
+
     if result.get("conflicts"):
         print("  Conflicts:")
         for c in result["conflicts"]:

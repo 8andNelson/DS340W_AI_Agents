@@ -32,6 +32,14 @@ Kaggle's own dataset-search API, which doesn't expose row counts up
 front, can be used for discovery); this is the one place total volume
 actually gets checked, since it's the only point where the true, final,
 deduplicated row count is known.
+
+Once the master CSV is written, it's also split into train (70%), test
+(20%), and validation (10%) CSVs for the future Modeling Agent to consume.
+The split is a single fixed-seed shuffle-then-slice (SPLIT_SEED) -- not
+stratified, since Cleaning Agent has no notion of what the eventual
+modeling target column will be -- so it's reproducible across runs
+(CLAUDE.md's Environment Reproducibility: record random seeds) without
+assuming anything about the data's shape.
 """
 import json
 import re
@@ -43,9 +51,17 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 PROCESSED_DATA_DIR = REPO_ROOT / "data" / "processed"
 CONFLICTS_LOG = REPO_ROOT / "logs" / "cleaning_conflicts.json"
 MASTER_CSV_NAME = "master_dataset.csv"
+TRAIN_CSV_NAME = "train.csv"
+TEST_CSV_NAME = "test.csv"
+VALIDATION_CSV_NAME = "validation.csv"
 
 SOURCE_COLUMN = "_source_dataset"
 TARGET_ROWS = 10000
+
+TRAIN_FRAC = 0.7
+TEST_FRAC = 0.2
+VALIDATION_FRAC = 0.1  # implicit: whatever's left after train/test
+SPLIT_SEED = 42
 
 
 def _normalize_column_name(col) -> str:
@@ -95,6 +111,55 @@ def _log_conflict(conflicts: list, label: str, link: str, reason: str) -> None:
 def _write_conflicts_log(conflicts: list) -> None:
     CONFLICTS_LOG.parent.mkdir(parents=True, exist_ok=True)
     CONFLICTS_LOG.write_text(json.dumps(conflicts, indent=2))
+
+
+def _split_train_test_validation(master: pd.DataFrame, seed: int = SPLIT_SEED) -> tuple:
+    """
+    Deterministic 70/20/10 train/test/validation split: shuffle once with
+    a fixed seed, then slice by row count. Not stratified -- Cleaning
+    Agent doesn't know what the Modeling Agent's eventual target column
+    will be, so a plain random split is the only one that doesn't assume
+    anything about the data's shape or task.
+
+    Slicing (rather than three independent random draws) guarantees every
+    row ends up in exactly one split and the three split sizes always sum
+    to the master's total row count, regardless of rounding.
+    """
+    shuffled = master.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    n = len(shuffled)
+    train_end = round(n * TRAIN_FRAC)
+    test_end = train_end + round(n * TEST_FRAC)
+    train_df = shuffled.iloc[:train_end]
+    test_df = shuffled.iloc[train_end:test_end]
+    validation_df = shuffled.iloc[test_end:]
+    return train_df, test_df, validation_df
+
+
+def _write_split_csvs(master: pd.DataFrame) -> dict:
+    """Split the merged master CSV and write train/test/validation CSVs
+    alongside it. Returns their paths and row counts for the pipeline
+    result/state, so the future Modeling Agent (and this run's report) can
+    find them without recomputing the split."""
+    train_df, test_df, validation_df = _split_train_test_validation(master)
+
+    train_path = PROCESSED_DATA_DIR / TRAIN_CSV_NAME
+    test_path = PROCESSED_DATA_DIR / TEST_CSV_NAME
+    validation_path = PROCESSED_DATA_DIR / VALIDATION_CSV_NAME
+    train_df.to_csv(train_path, index=False)
+    test_df.to_csv(test_path, index=False)
+    validation_df.to_csv(validation_path, index=False)
+
+    print(f"[Cleaning Agent] Split into train/test/validation: "
+          f"{len(train_df)}/{len(test_df)}/{len(validation_df)} rows "
+          f"(seed={SPLIT_SEED}) -> {train_path}, {test_path}, {validation_path}.")
+
+    return {
+        "train_csv_path": str(train_path),
+        "test_csv_path": str(test_path),
+        "validation_csv_path": str(validation_path),
+        "split_rows": {"train": len(train_df), "test": len(test_df), "validation": len(validation_df)},
+        "split_seed": SPLIT_SEED,
+    }
 
 
 def run(selected_datasets: list) -> dict:
@@ -158,6 +223,11 @@ def run(selected_datasets: list) -> dict:
             "target_rows": TARGET_ROWS,
             "target_met": False,
             "conflicts": conflicts,
+            "train_csv_path": "",
+            "test_csv_path": "",
+            "validation_csv_path": "",
+            "split_rows": {"train": 0, "test": 0, "validation": 0},
+            "split_seed": SPLIT_SEED,
             "notes": "No dataset could be merged into a master CSV.",
         }
 
@@ -184,6 +254,8 @@ def run(selected_datasets: list) -> dict:
           f"rows={len(master)}/{TARGET_ROWS} (target met: {target_met}), "
           f"columns={master.shape[1]}, wrote {master_path}.")
 
+    split_info = _write_split_csvs(master)
+
     return {
         "status": status,
         "master_csv_path": str(master_path),
@@ -195,4 +267,5 @@ def run(selected_datasets: list) -> dict:
         "target_met": target_met,
         "conflicts": conflicts,
         "notes": notes,
+        **split_info,
     }

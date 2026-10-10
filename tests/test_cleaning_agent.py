@@ -202,6 +202,65 @@ class TestConflicts(CleaningAgentTestCase):
         self.assertEqual(result["master_csv_path"], "")
 
 
+class TestTrainTestValidationSplit(CleaningAgentTestCase):
+    """The merged master CSV is also split into train (70%) / test (20%) /
+    validation (10%) CSVs, for the future Modeling Agent to consume."""
+
+    def test_split_sizes_sum_to_total_rows_with_no_overlap(self):
+        big = pd.DataFrame({"id": range(1000), "amount": range(1000)})
+        path = self._write_csv("big.csv", big)
+        result = cleaning_agent.run([make_candidate(name="https://example.com/big", local_csv_path=path)])
+
+        train = pd.read_csv(result["train_csv_path"])
+        test = pd.read_csv(result["test_csv_path"])
+        validation = pd.read_csv(result["validation_csv_path"])
+
+        self.assertEqual(len(train) + len(test) + len(validation), result["rows_total"])
+        # Every original id appears in exactly one split -- a real
+        # partition, not independent resampling.
+        all_ids = pd.concat([train["id"], test["id"], validation["id"]])
+        self.assertEqual(sorted(all_ids), list(range(1000)))
+
+    def test_split_proportions_are_approximately_70_20_10(self):
+        big = pd.DataFrame({"id": range(1000)})
+        path = self._write_csv("big.csv", big)
+        result = cleaning_agent.run([make_candidate(name="https://example.com/big", local_csv_path=path)])
+
+        self.assertAlmostEqual(result["split_rows"]["train"], 700, delta=2)
+        self.assertAlmostEqual(result["split_rows"]["test"], 200, delta=2)
+        self.assertAlmostEqual(result["split_rows"]["validation"], 100, delta=2)
+
+    def test_split_is_deterministic_across_runs(self):
+        big = pd.DataFrame({"id": range(500), "amount": range(500)})
+        path = self._write_csv("big.csv", big)
+
+        result_1 = cleaning_agent.run([make_candidate(name="https://example.com/big", local_csv_path=path)])
+        train_1 = pd.read_csv(result_1["train_csv_path"])["id"].tolist()
+
+        result_2 = cleaning_agent.run([make_candidate(name="https://example.com/big", local_csv_path=path)])
+        train_2 = pd.read_csv(result_2["train_csv_path"])["id"].tolist()
+
+        self.assertEqual(train_1, train_2)
+        self.assertEqual(result_1["split_seed"], result_2["split_seed"])
+
+    def test_split_files_are_written_to_processed_dir(self):
+        path = self._write_csv("small.csv", pd.DataFrame({"x": [1, 2, 3]}))
+        result = cleaning_agent.run([make_candidate(name="https://example.com/small", local_csv_path=path)])
+
+        self.assertTrue(Path(result["train_csv_path"]).exists())
+        self.assertTrue(Path(result["test_csv_path"]).exists())
+        self.assertTrue(Path(result["validation_csv_path"]).exists())
+        self.assertEqual(Path(result["train_csv_path"]).parent, cleaning_agent.PROCESSED_DATA_DIR)
+
+    def test_not_found_returns_empty_split_info_without_crashing(self):
+        result = cleaning_agent.run([])
+
+        self.assertEqual(result["train_csv_path"], "")
+        self.assertEqual(result["test_csv_path"], "")
+        self.assertEqual(result["validation_csv_path"], "")
+        self.assertEqual(result["split_rows"], {"train": 0, "test": 0, "validation": 0})
+
+
 class TestPerDatasetCleaning(CleaningAgentTestCase):
     def test_fully_empty_rows_and_columns_are_dropped(self):
         df = pd.DataFrame({"a": [1, None, 3], "b": [None, None, None]})
