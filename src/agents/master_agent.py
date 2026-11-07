@@ -40,6 +40,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.orchestration import run_store
 from src.slack import slack_client, message_formatter
 
 MIN_QUALIFYING = 5
@@ -51,6 +52,11 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 LOG_FILE = REPO_ROOT / "logs" / "master_agent_log.json"
 REPORT_DIR = REPO_ROOT / "logs" / "agent_reports"
 SLACK_SUMMARY_MAX_CHARS = 600
+
+# The run database row for the pipeline run in progress (see run_pipeline).
+# Module-level, like Slack, so every _supervise call -- including the ones
+# check_agent_requests makes -- records its attempt without extra plumbing.
+_current_run_id = None
 
 
 def _log_entry(action: str, target: str, issue: str, decision: str, next_step: str) -> dict:
@@ -564,6 +570,8 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             )
             _print_entry(entry)
             _append_log([entry])
+            run_store.record_stage(_current_run_id, agent_name, attempt, decision, None,
+                                   f"{agent_name} raised an exception:\n{e}")
             blockers = [entry]
             if attempt < max_attempts:
                 continue
@@ -586,11 +594,14 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             )
             _print_entry(approval)
             _append_log([approval])
+            run_store.record_stage(_current_run_id, agent_name, attempt, "Approved", output, report_text)
             return output, []
 
         for b in blockers:
             _print_entry(b)
         _append_log(blockers)
+        run_store.record_stage(_current_run_id, agent_name, attempt,
+                               "Retrying" if attempt < max_attempts else "Rejected", output, report_text)
 
         if attempt < max_attempts:
             retry_note = _log_entry(
@@ -765,6 +776,35 @@ def _relay_and_apply(result: dict, ranked_pool: list, floor_ts: str) -> None:
 
 
 def run_pipeline(topic: str) -> dict:
+    """
+    Run the pipeline (see _run_stages) inside one run database record
+    (src/orchestration/run_store.py): every agent attempt and the files it
+    produced are stored as they happen, and the run is closed with its final
+    status even if a stage raises.
+    """
+    global _current_run_id
+    from src.config import LLM_PROVIDER
+
+    _current_run_id = run_store.start_run(topic, llm_provider=LLM_PROVIDER)
+    try:
+        result = _run_stages(topic)
+    except BaseException:
+        run_store.finish_run(_current_run_id, "crashed")
+        _current_run_id = None
+        raise
+
+    if _current_run_id:
+        print(f"\n[Run Store] Run {_current_run_id} saved to {run_store.DB_FILE}")
+    run_store.finish_run(
+        _current_run_id, "success" if result["success"] else "halted", result["phase"] or "",
+        parent_paper=result["parent_paper"], result=result,
+    )
+    result["run_id"] = _current_run_id
+    _current_run_id = None
+    return result
+
+
+def _run_stages(topic: str) -> dict:
     """
     Drive the full pipeline (Intake -> Research -> Validation & Selection ->
     Data Agent -> Cleaning Agent -> Code Discovery Agent -> Replication

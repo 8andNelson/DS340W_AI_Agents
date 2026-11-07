@@ -252,6 +252,9 @@ def main():
     print(f"\n[State] Phase -> {result['phase']}")
     print("[State] parent_paper_approved -> True")
     print("[State] Saved to logs/project_state.json")
+    if result.get("run_id"):
+        print(f"[Run Store] Run {result['run_id']} recorded -- view it with: "
+              f"python -m src.orchestration.run_store show {result['run_id']}")
     print("\nParent Paper approved, dataset pool built, master CSV cleaned, code discovery "
           "attempted, a baseline reproduction established, results evaluated against the "
           "paper, and one controlled experiment run against the preserved baseline. Next "
