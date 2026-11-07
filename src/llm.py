@@ -1,14 +1,18 @@
 """
-Shared LLM call for every agent, routed to one of two providers by
+Shared LLM call for every agent, routed to one provider by
 config.LLM_PROVIDER:
 
   - "openrouter" (default): OpenRouter's chat-completions API.
+  - "freellmapi": a local FreeLLMAPI router (OpenAI-compatible) that pools
+    many providers' free tiers and fails over between them.
   - "anthropic": Claude through the official Anthropic SDK -- implemented
-    and unit-tested, not yet run live (no Claude API access yet); select
-    it with LLM_PROVIDER=anthropic.
+    and unit-tested, not yet run live (no Claude API access yet).
 
-Both paths take the same arguments and return the response text, so no
-agent knows which provider served it.
+Every path takes the same arguments and returns the response text, so no
+agent knows which provider served it. Every call -- whichever provider --
+is appended to logs/llm_calls.jsonl with the model that actually answered:
+a router like FreeLLMAPI can serve each call from a different model, and a
+replication must be able to say which model generated its code.
 
 OpenRouter's free model returns HTTP 429 (Too Many Requests) often enough to
 halt the pipeline -- the Intake Agent failed both supervised attempts three
@@ -17,14 +21,22 @@ exponential backoff. The Anthropic SDK retries 429/5xx itself (max_retries).
 """
 import json
 import re
+import threading
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
 from src.config import (
-    ANTHROPIC_API_KEY, CLAUDE_EFFORT, CLAUDE_MODEL, DEFAULT_MODEL, LLM_PROVIDER, OPENROUTER_API_KEY,
+    ANTHROPIC_API_KEY, CLAUDE_EFFORT, CLAUDE_MODEL, DEFAULT_MODEL, FREELLMAPI_AGENT_MODELS, FREELLMAPI_API_KEY,
+    FREELLMAPI_BASE_URL, FREELLMAPI_MODEL, FREELLMAPI_SMART_MODEL, LLM_PROVIDER, OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
 )
+
+CALL_LOG = Path(__file__).parent.parent / "logs" / "llm_calls.jsonl"
+_log_lock = threading.Lock()
+_last_call = threading.local()  # per thread: research/validation call concurrently
 
 RATE_LIMIT_RETRIES = 5  # 5+10+20+40+80s: the free tier's per-minute window often outlasts 35s
 RATE_LIMIT_BACKOFF_SECONDS = 5
@@ -44,15 +56,67 @@ CLAUDE_FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5"
 _claude_client = None
 
 
-def chat(prompt: str, system: str = "", timeout: int = 60, model: str = None, effort: str = None) -> str:
+HIGH_EFFORT = {"high", "xhigh", "max"}
+
+
+def chat(prompt: str, system: str = "", timeout: int = 60, model: str = None, effort: str = None,
+         agent: str = None) -> str:
     """Send one user prompt (plus optional system prompt) and return the
-    response text. model overrides the active provider's configured model;
-    effort applies to Claude only (low|medium|high|xhigh|max)."""
+    response text. model overrides the active provider's configured model.
+    effort (low|medium|high|xhigh|max) sets Claude's effort; on FreeLLMAPI,
+    high effort and above requests FREELLMAPI_SMART_MODEL. agent (e.g.
+    "research_agent") selects that agent's primary/backup models from
+    FREELLMAPI_AGENT_MODELS on FreeLLMAPI; other providers ignore it."""
     if LLM_PROVIDER == "openrouter":
-        return _chat_openrouter(prompt, system, timeout, model or DEFAULT_MODEL)
+        if not OPENROUTER_API_KEY:
+            raise EnvironmentError("OPENROUTER_API_KEY is not set in .env")
+        return _chat_openai_compatible("openrouter", OPENROUTER_BASE_URL, OPENROUTER_API_KEY,
+                                       model or DEFAULT_MODEL, prompt, system, timeout)
+    if LLM_PROVIDER == "freellmapi":
+        if not FREELLMAPI_API_KEY:
+            raise EnvironmentError("FREELLMAPI_API_KEY is not set in .env (copy it from FreeLLMAPI's Keys page)")
+        auto_model = FREELLMAPI_SMART_MODEL if effort in HIGH_EFFORT else FREELLMAPI_MODEL
+        if model:
+            chain = [model]
+        else:
+            chain = [m for m in FREELLMAPI_AGENT_MODELS.get(agent, ()) if m] + [auto_model]
+        return _chat_freellmapi_chain(chain, prompt, system, timeout, agent)
     if LLM_PROVIDER == "anthropic":
         return _chat_claude(prompt, system, timeout, model or CLAUDE_MODEL, effort or CLAUDE_EFFORT)
-    raise ValueError(f"Unknown LLM_PROVIDER '{LLM_PROVIDER}' (expected 'anthropic' or 'openrouter').")
+    raise ValueError(f"Unknown LLM_PROVIDER '{LLM_PROVIDER}' (expected 'openrouter', 'freellmapi' or 'anthropic').")
+
+
+def last_served_by() -> str:
+    """The model that answered this thread's most recent chat() call,
+    e.g. "groq/llama-3.3-70b-versatile" -- for recording in a replication's
+    environment notes. "" before any call."""
+    return getattr(_last_call, "served_by", "")
+
+
+def _record_call(provider: str, requested: str, served_by: str, started: float, usage: dict = None,
+                 agent: str = None, error: str = None) -> None:
+    """Append one call to CALL_LOG. A failed attempt (error set) is logged
+    too, so a fallback from an agent's primary model stays visible."""
+    if not error:
+        _last_call.served_by = served_by
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "provider": provider,
+        "agent": agent,
+        "requested_model": requested,
+        "served_by": served_by,
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "usage": usage or {},
+    }
+    if error:
+        entry["error"] = error
+    try:
+        with _log_lock:
+            CALL_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(CALL_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass  # the call log must never fail the call itself
 
 
 def _client() -> "anthropic.Anthropic":
@@ -82,9 +146,14 @@ def _chat_claude(prompt: str, system: str, timeout: int, model: str, effort: str
         kwargs["betas"] = [CLAUDE_FALLBACK_BETA]
         kwargs["fallbacks"] = "default"
 
+    started = time.monotonic()
     client = _client().with_options(timeout=float(max(timeout, CLAUDE_MIN_TIMEOUT_SECONDS)))
     with client.beta.messages.stream(**kwargs) as stream:
         message = stream.get_final_message()
+    usage = getattr(message, "usage", None)
+    _record_call("anthropic", model, str(getattr(message, "model", "") or model), started,
+                 {"input_tokens": getattr(usage, "input_tokens", None),
+                  "output_tokens": getattr(usage, "output_tokens", None)} if usage else None)
 
     if message.stop_reason == "refusal":
         category = getattr(message.stop_details, "category", None) if message.stop_details else None
@@ -125,18 +194,68 @@ def _daily_quota_message(response) -> str:
             "Adding credits raises the free-model limit to 1000 requests/day.")
 
 
-def _chat_openrouter(prompt: str, system: str, timeout: int, model: str) -> str:
-    if not OPENROUTER_API_KEY:
-        raise EnvironmentError("OPENROUTER_API_KEY is not set in .env")
+def _served_by(response, requested: str) -> str:
+    """Which model answered: FreeLLMAPI's X-Routed-Via header
+    ("<platform>/<model>"), else the response body's own "model" field."""
+    routed = (getattr(response, "headers", None) or {}).get("X-Routed-Via")
+    if isinstance(routed, str) and routed:
+        return routed
+    try:
+        model = response.json().get("model")
+        return model if isinstance(model, str) and model else requested
+    except Exception:
+        return requested
 
+
+def _chat_freellmapi_chain(chain: list, prompt: str, system: str, timeout: int, agent: str = None) -> str:
+    """Try each FreeLLMAPI model in order and return the first answer.
+
+    A pinned model id is not failed over by the router itself, so a
+    timeout, connection error, HTTP error or empty answer moves on to the
+    next model here. Every model except the last skips the long 429
+    backoff -- switching to the backup is faster than waiting out a
+    per-minute window. The last model's error is raised if all fail."""
+    for i, model in enumerate(chain):
+        is_last = i == len(chain) - 1
+        started = time.monotonic()
+        try:
+            content = _chat_openai_compatible(
+                "freellmapi", FREELLMAPI_BASE_URL, FREELLMAPI_API_KEY, model, prompt, system, timeout,
+                rate_limit_retries=RATE_LIMIT_RETRIES if is_last else 0, agent=agent,
+            )
+        except requests.RequestException as e:
+            if is_last:
+                raise
+            _record_call("freellmapi", model, "", started, agent=agent, error=_short_error(e))
+            print(f"  [LLM] {model} failed for {agent or 'call'} ({_short_error(e)}); trying {chain[i + 1]}...")
+            continue
+        if (content and content.strip()) or is_last:
+            return content
+        print(f"  [LLM] {model} returned an empty answer for {agent or 'call'}; trying {chain[i + 1]}...")
+
+
+def _short_error(e: Exception) -> str:
+    response = getattr(e, "response", None)
+    if response is not None:
+        return f"HTTP {response.status_code}"
+    return type(e).__name__
+
+
+def _chat_openai_compatible(provider: str, base_url: str, api_key: str, model: str,
+                            prompt: str, system: str, timeout: int,
+                            rate_limit_retries: int = RATE_LIMIT_RETRIES, agent: str = None) -> str:
+    """POST /chat/completions on an OpenAI-compatible API (OpenRouter,
+    FreeLLMAPI). Per-minute 429s are retried with backoff; OpenRouter's
+    daily free-tier cap fails fast (backoff cannot outlast a day)."""
     messages = [{"role": "system", "content": system}] if system else []
     messages.append({"role": "user", "content": prompt})
+    started = time.monotonic()
 
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
+    for attempt in range(rate_limit_retries + 1):
         response = requests.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
+            f"{base_url}/chat/completions",
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json={"model": model, "messages": messages},
@@ -144,13 +263,16 @@ def _chat_openrouter(prompt: str, system: str, timeout: int, model: str) -> str:
         )
         if response.status_code == 429 and _is_daily_quota(response):
             raise DailyQuotaExceeded(_daily_quota_message(response))
-        if response.status_code == 429 and attempt < RATE_LIMIT_RETRIES:
+        if response.status_code == 429 and attempt < rate_limit_retries:
             wait = RATE_LIMIT_BACKOFF_SECONDS * (2 ** attempt)
             print(f"  [LLM] Rate limited (429). Waiting {wait}s before retry...")
             time.sleep(wait)
             continue
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        body = response.json()
+        _record_call(provider, model, _served_by(response, model), started,
+                     body.get("usage") if isinstance(body.get("usage"), dict) else None, agent=agent)
+        return body["choices"][0]["message"]["content"]
 
 
 _PYTHON_BLOCK = re.compile(r"```(?:python|py)[^\n]*\n([\s\S]*?)```", re.IGNORECASE)

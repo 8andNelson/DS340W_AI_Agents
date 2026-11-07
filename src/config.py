@@ -28,6 +28,8 @@ DEFAULT_MODEL = FREE_MODEL
 # --- LLM provider ---
 # Which provider every agent's LLM call goes through (src/llm.py):
 #   "openrouter" -- OpenRouter's chat-completions API with DEFAULT_MODEL above (default)
+#   "freellmapi" -- a local FreeLLMAPI router (OpenAI-compatible) that pools many
+#                   providers' free tiers and fails over between them on 429/5xx
 #   "anthropic"  -- Claude via the official Anthropic SDK. Implemented and
 #                   unit-tested, but not yet run live: the project has no
 #                   Claude API access yet. Set LLM_PROVIDER=anthropic plus
@@ -38,3 +40,30 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
 # level is a visible project setting. Code generation/repair calls ask for
 # "high" (see the effort= arguments in replication/experiment agents).
 CLAUDE_EFFORT = os.getenv("CLAUDE_EFFORT", "medium")
+
+# FreeLLMAPI (LLM_PROVIDER=freellmapi): self-hosted router, default port 3001.
+# "auto" lets the router pick any healthy model; code generation/repair calls
+# (effort="high" or above) ask for FREELLMAPI_SMART_MODEL instead.
+FREELLMAPI_BASE_URL = os.getenv("FREELLMAPI_BASE_URL", "http://localhost:3001/v1").rstrip("/")
+FREELLMAPI_API_KEY = os.getenv("FREELLMAPI_API_KEY", "")
+FREELLMAPI_MODEL = os.getenv("FREELLMAPI_MODEL", "auto")
+FREELLMAPI_SMART_MODEL = os.getenv("FREELLMAPI_SMART_MODEL", "auto:smart")
+
+# Per-agent model routing on FreeLLMAPI: (primary, backup) router model ids.
+# A requested model id is strict on FreeLLMAPI -- verified live, a timed-out
+# gemini-3.8-flash returned 502 instead of moving to another model -- so
+# src/llm.py tries the backup itself, then FREELLMAPI_MODEL/SMART_MODEL
+# ("auto") as a last resort so one provider outage cannot halt the pipeline.
+# An agent not listed here uses auto routing directly.
+FREELLMAPI_AGENT_MODELS = {
+    "intake_agent":         ("gemini-3.5-flash-lite", "ministral-14b"),      # speed
+    "research_agent":       ("gemini-3.6-flash",      "dots3-note-preview"), # reasoning
+    "validation_agent":     ("dots3-note-preview",    "qwen3.8-27b"),        # accuracy
+    "data_agent":           ("gemini-3.5-flash-lite", "gemini-3.6-flash"),   # efficiency
+    "cleaning_agent":       ("qwen3.8-27b",           "gemini-3.7-flash"),   # coding (incl. column mapping)
+    "code_discovery_agent": ("gemini-3.6-flash",      "qwen3.8-27b"),        # code analysis
+    "replication_agent":    ("gemini-3.6-flash",      "qwen3.8-27b"),        # coding
+    "experiment_agent":     ("qwen3.8-27b",           "gemini-3.7-flash"),   # technical reasoning
+    "evaluation_agent":     ("dots3-note-preview",    "gemini-3.6-flash"),   # critical reasoning
+    "report_agent":         ("gemini-3.6-flash",      "dots3-note-preview"), # synthesis
+}

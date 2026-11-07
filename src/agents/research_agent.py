@@ -121,7 +121,7 @@ For each included result return a JSON object. Use only information visible in t
 Return a JSON array. If no results qualify, return [].
 Return ONLY valid JSON. No explanation or markdown."""
 
-    content = llm.chat(prompt, timeout=300)
+    content = llm.chat(prompt, timeout=300, agent="research_agent")
 
     try:
         extracted = json.loads(content)

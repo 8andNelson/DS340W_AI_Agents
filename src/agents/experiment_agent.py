@@ -100,6 +100,7 @@ _RESULT_DEFAULTS = {
     "experiment_metrics": {},
     "comparison": [],
     "overall": "INCONCLUSIVE",    # "IMPROVED" | "REGRESSED" | "NEUTRAL" | "INCONCLUSIVE"
+    "generated_by": "",           # model that proposed a code-level change (when routed)
     "warnings": [],
     "notes": "",
 }
@@ -279,7 +280,7 @@ Then the full modified script:
 ```"""
 
     try:
-        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high")
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="experiment_agent")
     except Exception as e:
         print(f"[Experiment Agent] Proposal call failed: {e}")
         return {}
@@ -293,6 +294,7 @@ Then the full modified script:
         "hypothesis": str(meta.get("hypothesis") or ""),
         "what_changed": str(meta.get("what_changed") or ""),
         "code": code,
+        "generated_by": llm.last_served_by(),
     }
 
 
@@ -337,6 +339,7 @@ def _run_code_level_experiment(category: str, parent_paper: dict, baseline_dir: 
     return {
         "hypothesis": proposal["hypothesis"],
         "what_changed": proposal["what_changed"],
+        "generated_by": proposal.get("generated_by", ""),
         "command": command,
         "run_result": run_result,
     }
@@ -418,5 +421,5 @@ def run(parent_paper: dict, replication_result: dict, evaluation_result: dict, c
         experiment_dir=str(experiment_dir), command=command, exit_code=run_result["exit_code"],
         stdout_path=str(stdout_path), stderr_path=str(stderr_path), duration_seconds=run_result["duration_seconds"],
         baseline_metrics=baseline_metrics, experiment_metrics=experiment_metrics, comparison=comparison,
-        overall=overall, warnings=warnings,
+        overall=overall, warnings=warnings, generated_by=outcome.get("generated_by", ""),
     )

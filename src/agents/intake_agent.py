@@ -22,7 +22,7 @@ Return ONLY valid JSON with no explanation or markdown."""
 
 
 def _call_openrouter(prompt: str) -> str:
-    return llm.chat(prompt, system=SYSTEM_PROMPT, timeout=120)
+    return llm.chat(prompt, system=SYSTEM_PROMPT, timeout=120, agent="intake_agent")
 
 
 def _extract_json(text: str) -> dict:

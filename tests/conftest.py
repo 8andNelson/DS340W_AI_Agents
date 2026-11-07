@@ -46,5 +46,6 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "LLM_PROVIDER", "openrouter")
     monkeypatch.setattr(cleaning_agent, "MAPPINGS_LOG", logs / "column_mappings.json")
     monkeypatch.setattr(column_mapping, "MAPPING_CACHE", logs / "column_mapping_cache.json")
+    monkeypatch.setattr(llm, "CALL_LOG", logs / "llm_calls.jsonl")
     monkeypatch.setattr(run_store, "DB_FILE", tmp_path / "database" / "project_runs.db")
     monkeypatch.setattr(run_store, "_project_git_commit", lambda: "test-commit")

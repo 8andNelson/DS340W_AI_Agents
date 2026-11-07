@@ -122,7 +122,7 @@ Return ONLY a JSON array:
 Return [] if no column maps."""
 
     try:
-        content = llm.chat(prompt, timeout=300)
+        content = llm.chat(prompt, timeout=300, agent="cleaning_agent")
     except Exception as e:
         print(f"[Cleaning Agent] Column-mapping proposal call failed: {e}")
         return []

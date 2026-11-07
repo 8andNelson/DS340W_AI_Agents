@@ -211,7 +211,7 @@ For each valid dataset page, return a JSON object:
 Return a JSON array of valid dataset candidates, best match first. If none are found, return an empty array [].
 Return ONLY valid JSON. No explanation or markdown."""
 
-    content = llm.chat(prompt, timeout=300)
+    content = llm.chat(prompt, timeout=300, agent="data_agent")
 
     try:
         candidates = json.loads(content)
@@ -259,7 +259,7 @@ Find the number of rows/samples/records/instances/examples in this dataset, ONLY
 Return ONLY valid JSON: {{"entry_count": <integer if explicitly stated, else null>}}"""
 
     try:
-        content = llm.chat(prompt, timeout=300)
+        content = llm.chat(prompt, timeout=300, agent="data_agent")
         match = re.search(r"\{[\s\S]*\}", content)
         data = json.loads(match.group(0)) if match else json.loads(content)
         count = data.get("entry_count")

@@ -105,6 +105,7 @@ _RESULT_DEFAULTS = {
     "duration_seconds": None,
     "pip_freeze_path": "",
     "inferred_assumptions": [],
+    "generated_by": [],            # model(s) that wrote/repaired a reconstructed script, in order
     "modifications": [],
     "warnings": [],
     "notes": "",
@@ -247,7 +248,7 @@ or, if no run command is documented:
 Return ONLY valid JSON. No explanation or markdown."""
 
     try:
-        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS)
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, agent="replication_agent")
     except Exception:
         return []
 
@@ -507,7 +508,7 @@ Then the full script:
 ```"""
 
     try:
-        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high")
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent")
     except Exception as e:
         print(f"[Replication Agent] Script generation call failed: {e}")
         return {}
@@ -523,6 +524,9 @@ Then the full script:
         "code": code,
         "inferred_assumptions": [str(a) for a in assumptions] if isinstance(assumptions, list) else [],
         "libraries_required": [str(l) for l in libraries] if isinstance(libraries, list) else [],
+        # A router (FreeLLMAPI) may serve each call from a different model;
+        # the replication records which one wrote its code.
+        "generated_by": llm.last_served_by(),
     }
 
 
@@ -560,7 +564,7 @@ Respond with the full fixed script in one fenced block and nothing else:
 ```"""
 
     try:
-        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high")
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent")
     except Exception as e:
         print(f"[Replication Agent] Repair call failed: {e}")
         return ""
@@ -634,6 +638,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
     attempts = 0
     run_result = None
     metrics = {}
+    generated_by = [m for m in [generated.get("generated_by", "")] if m]
 
     for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
         attempts = attempt
@@ -662,6 +667,8 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
             if not repaired:
                 warnings.append(f"Repair call after attempt {attempt} returned no script.")
                 break
+            if llm.last_served_by():
+                generated_by.append(llm.last_served_by())
             code = repaired
 
     _write_notes_doc(recon_dir, generated.get("inferred_assumptions", []))
@@ -670,6 +677,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
         "Source": "reconstructed", "Entry point": "train.py", "Command": " ".join(command),
         "Data environment": ", ".join(f"{k}={v}" for k, v in env.items()) or "none",
         "Libraries installed": ", ".join(installed_libs) or "none",
+        "Script generated/repaired by (in order)": ", ".join(generated_by) or "unknown",
     })
 
     if run_result["timed_out"]:
@@ -693,7 +701,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
         exit_code=run_result["exit_code"], stdout_path=stdout_path, stderr_path=stderr_path,
         duration_seconds=run_result["duration_seconds"], pip_freeze_path=str(pip_freeze_path),
         inferred_assumptions=generated.get("inferred_assumptions", []), warnings=warnings,
-        notes=f"Repair attempts: {attempts}.",
+        notes=f"Repair attempts: {attempts}.", generated_by=generated_by,
     )
 
 

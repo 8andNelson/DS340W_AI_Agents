@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -160,3 +161,115 @@ def test_daily_quota_fails_fast_without_retries(sleep):
             llm.chat("hi")
     assert post.call_count == 1
     sleep.assert_not_called()
+
+
+class TestFreeLLMAPIProvider:
+    def _chat(self, routed="groq/llama-3.3-70b-versatile", **kwargs):
+        reply = response(200, "routed answer")
+        reply.headers = {"X-Routed-Via": routed} if routed else {}
+        with patch.object(llm, "LLM_PROVIDER", "freellmapi"), \
+             patch.object(llm, "FREELLMAPI_API_KEY", "freellmapi-key"), \
+             patch("src.llm.requests.post", return_value=reply) as post:
+            return llm.chat("hi", **kwargs), post
+
+    def test_posts_to_local_router_with_auto_model(self):
+        text, post = self._chat()
+        assert text == "routed answer"
+        assert post.call_args.args[0] == f"{llm.FREELLMAPI_BASE_URL}/chat/completions"
+        assert post.call_args.kwargs["json"]["model"] == llm.FREELLMAPI_MODEL
+        assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer freellmapi-key"
+
+    def test_high_effort_requests_the_smart_model(self):
+        _, post = self._chat(effort="high")
+        assert post.call_args.kwargs["json"]["model"] == llm.FREELLMAPI_SMART_MODEL
+
+    def test_serving_model_is_recorded_and_logged(self):
+        self._chat()
+        assert llm.last_served_by() == "groq/llama-3.3-70b-versatile"
+        entry = json.loads(llm.CALL_LOG.read_text().splitlines()[-1])
+        assert entry["provider"] == "freellmapi"
+        assert entry["requested_model"] == llm.FREELLMAPI_MODEL
+        assert entry["served_by"] == "groq/llama-3.3-70b-versatile"
+
+    def test_falls_back_to_body_model_without_header(self):
+        reply = response(200, "x")
+        reply.headers = {}
+        reply.json.return_value = {"model": "mistral/mistral-small", "choices": [{"message": {"content": "x"}}]}
+        with patch.object(llm, "LLM_PROVIDER", "freellmapi"), patch.object(llm, "FREELLMAPI_API_KEY", "k"), \
+             patch("src.llm.requests.post", return_value=reply):
+            llm.chat("hi")
+        assert llm.last_served_by() == "mistral/mistral-small"
+
+    def test_missing_key_is_a_clear_error(self):
+        with patch.object(llm, "LLM_PROVIDER", "freellmapi"), patch.object(llm, "FREELLMAPI_API_KEY", ""), \
+             pytest.raises(EnvironmentError, match="FREELLMAPI_API_KEY"):
+            llm.chat("hi")
+
+
+class TestFreeLLMAPIAgentRouting:
+    MODELS = {"research_agent": ("primary-model", "backup-model")}
+
+    def _chat(self, replies, **kwargs):
+        def reply(r):
+            if isinstance(r, Exception):
+                return r
+            r.headers = {"X-Routed-Via": "p/served"}
+            return r
+        with patch.object(llm, "LLM_PROVIDER", "freellmapi"), \
+             patch.object(llm, "FREELLMAPI_API_KEY", "k"), \
+             patch.object(llm, "FREELLMAPI_AGENT_MODELS", self.MODELS), \
+             patch("src.llm.time.sleep") as sleep, \
+             patch("src.llm.requests.post", side_effect=[reply(r) for r in replies]) as post:
+            text = llm.chat("hi", **kwargs)
+        return text, [c.kwargs["json"]["model"] for c in post.call_args_list], sleep
+
+    def test_agent_uses_its_primary_model(self):
+        text, models, _ = self._chat([response(200, "a")], agent="research_agent")
+        assert text == "a"
+        assert models == ["primary-model"]
+
+    def test_primary_failure_moves_to_backup(self):
+        text, models, _ = self._chat([response(502), response(200, "b")], agent="research_agent")
+        assert text == "b"
+        assert models == ["primary-model", "backup-model"]
+
+    def test_timeout_and_rate_limit_move_on_without_backoff(self):
+        text, models, sleep = self._chat(
+            [requests.Timeout("slow"), response(429), response(200, "c")], agent="research_agent")
+        assert text == "c"
+        assert models == ["primary-model", "backup-model", llm.FREELLMAPI_MODEL]
+        sleep.assert_not_called()
+
+    def test_empty_answer_moves_to_backup(self):
+        text, models, _ = self._chat([response(200, "  "), response(200, "d")], agent="research_agent")
+        assert text == "d"
+        assert models == ["primary-model", "backup-model"]
+
+    def test_last_resort_auto_error_is_raised(self):
+        with pytest.raises(requests.HTTPError):
+            self._chat([response(502), response(502), response(500)], agent="research_agent")
+
+    def test_high_effort_last_resort_is_the_smart_model(self):
+        _, models, _ = self._chat([response(502), response(502), response(200, "e")],
+                                  agent="research_agent", effort="high")
+        assert models[-1] == llm.FREELLMAPI_SMART_MODEL
+
+    def test_unlisted_agent_uses_auto_routing(self):
+        _, models, _ = self._chat([response(200, "f")], agent="unknown_agent")
+        assert models == [llm.FREELLMAPI_MODEL]
+
+    def test_explicit_model_overrides_agent_routing(self):
+        _, models, _ = self._chat([response(200, "g")], agent="research_agent", model="pinned")
+        assert models == ["pinned"]
+
+    def test_failed_attempt_and_agent_are_logged(self):
+        self._chat([response(502), response(200, "h")], agent="research_agent")
+        entries = [json.loads(l) for l in llm.CALL_LOG.read_text().splitlines()]
+        assert entries[-2]["requested_model"] == "primary-model" and "error" in entries[-2]
+        assert entries[-1]["requested_model"] == "backup-model" and entries[-1]["agent"] == "research_agent"
+        assert llm.last_served_by() == "p/served"
+
+    def test_every_configured_agent_has_two_models(self):
+        from src.config import FREELLMAPI_AGENT_MODELS
+        for agent, models in FREELLMAPI_AGENT_MODELS.items():
+            assert len(models) == 2 and all(models), agent

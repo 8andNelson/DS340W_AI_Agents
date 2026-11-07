@@ -194,7 +194,7 @@ Rules:
 
 Return ONLY a valid JSON array. No explanation or markdown."""
 
-    content = llm.chat(prompt, timeout=300)
+    content = llm.chat(prompt, timeout=300, agent="validation_agent")
 
     try:
         assessments = json.loads(content)

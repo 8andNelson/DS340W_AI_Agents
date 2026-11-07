@@ -119,7 +119,7 @@ If no metric is explicitly stated, return {{}}.
 Return ONLY valid JSON. No explanation or markdown."""
 
     try:
-        content = llm.chat(prompt, timeout=300)
+        content = llm.chat(prompt, timeout=300, agent="evaluation_agent")
     except Exception:
         return {}
 
