@@ -49,18 +49,18 @@ valid research finding (CLAUDE.md: "a failed or imperfect reproduction
 is still useful research information" applies equally here), not an
 agent defect.
 """
-import json
-import re
 import shutil
 from pathlib import Path
 
 import pandas as pd
-import requests
 
-from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL
+from src import llm
 from src.agents.cleaning_agent import _split_train_test_validation
-from src.agents.replication_agent import REPLICATION_DIR, _slugify, _venv_python, _run_bounded, _wire_dataset_into_repo
-from src.agents.evaluation_agent import _extract_metrics
+from src.agents.replication_agent import (
+    REPLICATION_DIR, _slugify, _venv_python, _run_bounded, _wire_dataset_into_repo, _repair_generated_script,
+    _dataset_profile, data_env,
+)
+from src.agents.evaluation_agent import METRIC_LINE_FORMAT, _extract_metrics, parse_metric_lines, to_percentage_points
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 EXPERIMENTS_DIR = REPO_ROOT / "experiments"
@@ -68,6 +68,11 @@ EXPERIMENTS_DIR = REPO_ROOT / "experiments"
 EXPERIMENT_TIMEOUT_SECONDS = 1800
 EXPERIMENT_SPLIT_SEED = 7  # deliberately different from cleaning_agent.SPLIT_SEED (42)
 NEUTRAL_THRESHOLD_POINTS = 1.0  # percentage points
+GENERATION_TIMEOUT_SECONDS = 600
+# A modified script gets up to 2 repairs. A repair is told to keep the
+# experiment's change -- it fixes the script, it does not undo the
+# experiment.
+MAX_EXPERIMENT_ATTEMPTS = 3
 
 DATASET_SPLIT_CATEGORY = "different_dataset_split"
 # Code-level categories are only attempted for the "reconstructed" source
@@ -135,9 +140,7 @@ def _classify_change(baseline: float, experiment: float) -> tuple:
     distance-only comparison): an experiment either helps, hurts, or
     doesn't move the needle, which matters more here than how close it
     lands to a fixed target."""
-    base, exp = baseline, experiment
-    if abs(base) <= 1.0 and abs(exp) <= 1.0:
-        base, exp = base * 100, exp * 100
+    base, exp = to_percentage_points(baseline), to_percentage_points(experiment)
     diff = exp - base
     if diff > NEUTRAL_THRESHOLD_POINTS:
         return "IMPROVED", diff
@@ -227,7 +230,7 @@ def _run_dataset_split_experiment(source: str, baseline_dir: Path, replication_r
         baseline_script_path = baseline_dir / "reconstructed" / "train.py"
         script_text = baseline_script_path.read_text(errors="ignore") if baseline_script_path.is_file() else ""
         script_text = _rewrite_hardcoded_csv_paths(script_text, cleaning_result, new_split)
-        (run_cwd / "train.py").write_text(script_text)
+        (run_cwd / "train.py").write_text(script_text, encoding="utf-8")
         venv_dir = baseline_dir / "venv"
         command = [str(_venv_python(venv_dir)), str(run_cwd / "train.py")]
 
@@ -236,7 +239,10 @@ def _run_dataset_split_experiment(source: str, baseline_dir: Path, replication_r
         "seed=42) should produce similar performance if the model generalizes rather than overfitting to the "
         "baseline split's particular partition; a large change would suggest split-sensitivity."
     )
-    run_result = _run_bounded(command, cwd=run_cwd, timeout=EXPERIMENT_TIMEOUT_SECONDS)
+    # The reconstructed script reads its data paths from environment
+    # variables (replication_agent.DATA_ENV_VARS); pointing them at the new
+    # split is what actually makes this run use it.
+    run_result = _run_bounded(command, cwd=run_cwd, timeout=EXPERIMENT_TIMEOUT_SECONDS, env=data_env(new_split))
     return {
         "hypothesis": hypothesis,
         "what_changed": f"Train/test/validation split reseeded from 42 to {EXPERIMENT_SPLIT_SEED}.",
@@ -261,39 +267,37 @@ Baseline script (already a working reproduction):
 Previously inferred assumptions in the baseline (context only -- do not change these unless the category above specifically calls for it):
 {chr(10).join(inferred_assumptions) or "(none)"}
 
-Modify ONLY what the "{category}" category calls for (e.g. "alternative_model" -> swap the model class; "hyperparameter_change" -> change one hyperparameter; "different_preprocessing" -> change one preprocessing step; "different_feature_selection" -> change which features are used; "alternative_loss_function" -> change the loss/objective; "alternative_sampling_technique" -> change how class imbalance/sampling is handled; "additional_evaluation_metric" -> add one new metric to the printed output without changing the model). Keep everything else identical to the baseline script, including its input file paths and its metric-printing format.
+Modify ONLY what the "{category}" category calls for (e.g. "alternative_model" -> swap the model class; "hyperparameter_change" -> change one hyperparameter; "different_preprocessing" -> change one preprocessing step; "different_feature_selection" -> change which features are used; "alternative_loss_function" -> change the loss/objective; "alternative_sampling_technique" -> change how class imbalance/sampling is handled; "additional_evaluation_metric" -> add one new metric to the printed output without changing the model). Keep everything else identical to the baseline script, including how it reads its input paths (the TRAIN_CSV/TEST_CSV/VALIDATION_CSV environment variables) and its "{METRIC_LINE_FORMAT}" metric lines. Use only libraries the baseline script already imports, plus the Python standard library -- nothing new is installed for an experiment.
 
-Return ONLY a JSON object:
-{{
-  "hypothesis": "<1-2 sentences: what you expect to happen and why>",
-  "what_changed": "<1 sentence: exactly what was changed>",
-  "code": "<the full modified Python script as a single string, with \\n for newlines>"
-}}
-Return ONLY valid JSON. No explanation or markdown."""
+Respond with exactly two fenced blocks and nothing else. First, a JSON block:
+```json
+{{"hypothesis": "<1-2 sentences: what you expect to happen and why>", "what_changed": "<1 sentence: exactly what was changed>"}}
+```
+Then the full modified script:
+```python
+<the script>
+```"""
 
     try:
-        response = requests.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}]},
-            timeout=90,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-    except Exception:
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high")
+    except Exception as e:
+        print(f"[Experiment Agent] Proposal call failed: {e}")
         return {}
 
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", content)
-        data = json.loads(match.group(0)) if match else {}
-
-    return data if isinstance(data, dict) and data.get("code") else {}
+    code = llm.parse_code(content)
+    if not code:
+        return {}
+    meta = llm.parse_json(content, default={})
+    meta = meta if isinstance(meta, dict) else {}
+    return {
+        "hypothesis": str(meta.get("hypothesis") or ""),
+        "what_changed": str(meta.get("what_changed") or ""),
+        "code": code,
+    }
 
 
 def _run_code_level_experiment(category: str, parent_paper: dict, baseline_dir: Path,
-                                replication_result: dict, experiment_dir: Path) -> dict:
+                                replication_result: dict, experiment_dir: Path, cleaning_result: dict = None) -> dict:
     baseline_script_path = baseline_dir / "reconstructed" / "train.py"
     baseline_code = baseline_script_path.read_text(errors="ignore") if baseline_script_path.is_file() else ""
     if not baseline_code:
@@ -304,10 +308,31 @@ def _run_code_level_experiment(category: str, parent_paper: dict, baseline_dir: 
         return {"error": "LLM could not propose a code-level modification for this category."}
 
     script_path = experiment_dir / "train.py"
-    script_path.write_text(proposal["code"])
     venv_dir = baseline_dir / "venv"
     command = [str(_venv_python(venv_dir)), str(script_path)]
-    run_result = _run_bounded(command, cwd=experiment_dir, timeout=EXPERIMENT_TIMEOUT_SECONDS)
+    env = data_env(cleaning_result)
+    dataset_profile = _dataset_profile(cleaning_result)
+    code = proposal["code"]
+    run_result = None
+
+    for attempt in range(1, MAX_EXPERIMENT_ATTEMPTS + 1):
+        script_path.write_text(code, encoding="utf-8")
+        print(f"[Experiment Agent] Running modified script (attempt {attempt}/{MAX_EXPERIMENT_ATTEMPTS})...")
+        run_result = _run_bounded(command, cwd=experiment_dir, timeout=EXPERIMENT_TIMEOUT_SECONDS, env=env)
+        if run_result["timed_out"] or (run_result["exit_code"] == 0 and parse_metric_lines(run_result["stdout"])):
+            break
+        if attempt == MAX_EXPERIMENT_ATTEMPTS:
+            break
+        feedback = run_result.get("stderr") or ""
+        if run_result["exit_code"] == 0:
+            feedback = f"The script exited successfully but printed no '{METRIC_LINE_FORMAT}' lines.\n" + feedback
+        repaired = _repair_generated_script(
+            code, f"This script is an experiment ({proposal['what_changed']}); keep that change.\n{feedback}",
+            parent_paper, stdout=run_result.get("stdout", ""), dataset_profile=dataset_profile,
+        )
+        if not repaired:
+            break
+        code = repaired
 
     return {
         "hypothesis": proposal["hypothesis"],
@@ -352,7 +377,8 @@ def run(parent_paper: dict, replication_result: dict, evaluation_result: dict, c
     if category == DATASET_SPLIT_CATEGORY:
         outcome = _run_dataset_split_experiment(source, baseline_dir, replication_result, cleaning_result, experiment_dir)
     else:
-        outcome = _run_code_level_experiment(category, parent_paper, baseline_dir, replication_result, experiment_dir)
+        outcome = _run_code_level_experiment(category, parent_paper, baseline_dir, replication_result, experiment_dir,
+                                             cleaning_result)
 
     if "error" in outcome:
         return _default_result(
@@ -366,8 +392,8 @@ def run(parent_paper: dict, replication_result: dict, evaluation_result: dict, c
 
     stdout_path = experiment_dir / "run_stdout.txt"
     stderr_path = experiment_dir / "run_stderr.txt"
-    stdout_path.write_text(run_result.get("stdout", "") or "")
-    stderr_path.write_text(run_result.get("stderr", "") or "")
+    stdout_path.write_text(run_result.get("stdout", "") or "", encoding="utf-8")
+    stderr_path.write_text(run_result.get("stderr", "") or "", encoding="utf-8")
 
     warnings = []
     if run_result["timed_out"]:
@@ -378,7 +404,10 @@ def run(parent_paper: dict, replication_result: dict, evaluation_result: dict, c
         status = "BLOCKED"
         warnings.append(f"Experiment script exited with code {run_result['exit_code']}.")
 
-    experiment_metrics = _extract_metrics(run_result.get("stdout", "") or "", "an experiment run's captured output") if status == "OK" else {}
+    experiment_metrics = {}
+    if status == "OK":
+        experiment_metrics = parse_metric_lines(run_result.get("stdout", "")) or _extract_metrics(
+            (run_result.get("stdout", "") or "")[-4000:], "an experiment run's captured output")
     comparison = _compare_to_baseline(baseline_metrics, experiment_metrics) if status == "OK" else []
     overall = _overall_from_comparison(comparison) if status == "OK" else "INCONCLUSIVE"
 

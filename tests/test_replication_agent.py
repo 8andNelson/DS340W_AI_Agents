@@ -343,21 +343,22 @@ class TestReplicateByReconstruction(ReplicationAgentTestCase):
              patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
              patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)) as pip_mock, \
              patch.object(replication_agent, "_pip_freeze", return_value=""), \
-             patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="done")):
+             patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="METRIC accuracy=0.9")):
             result = replication_agent._replicate_by_reconstruction(make_paper(), make_cleaning_result())
 
-        pip_mock.assert_called_once_with(unittest.mock.ANY, unittest.mock.ANY, ["install", "pandas"])
+        pip_mock.assert_called_once_with(unittest.mock.ANY, unittest.mock.ANY,
+                                         ["install", "numpy", "pandas", "scikit-learn"])
         self.assertTrue(any("some-sketchy-package" in w for w in result["warnings"]))
         self.assertEqual(result["status"], "OK")
 
     def test_repair_loop_succeeds_on_second_attempt(self):
         generated = {"code": "broken code", "inferred_assumptions": [], "libraries_required": []}
-        attempts = [run_result(exit_code=1, stderr="SyntaxError"), run_result(exit_code=0, stdout="accuracy: 0.8")]
+        attempts = [run_result(exit_code=1, stderr="SyntaxError"), run_result(exit_code=0, stdout="METRIC accuracy=0.8")]
 
         with patch.object(replication_agent, "_generate_baseline_script", return_value=generated), \
              patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
              patch.object(replication_agent, "_pip_freeze", return_value=""), \
-             patch.object(replication_agent, "_run_bounded", side_effect=attempts), \
+             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)),              patch.object(replication_agent, "_run_bounded", side_effect=attempts), \
              patch.object(replication_agent, "_repair_generated_script", return_value="fixed code"):
             result = replication_agent._replicate_by_reconstruction(make_paper(), make_cleaning_result())
 
@@ -385,7 +386,7 @@ class TestReplicateByReconstruction(ReplicationAgentTestCase):
         with patch.object(replication_agent, "_generate_baseline_script", return_value=generated), \
              patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
              patch.object(replication_agent, "_pip_freeze", return_value=""), \
-             patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="ok")):
+             patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="METRIC f1=0.7")):
             result = replication_agent._replicate_by_reconstruction(make_paper(), make_cleaning_result())
 
         self.assertEqual(result["inferred_assumptions"], generated["inferred_assumptions"])
@@ -419,3 +420,64 @@ class TestRunDispatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReconstructionLiveRunFixes(ReplicationAgentTestCase):
+    def test_exit_zero_without_metric_lines_is_repaired_then_blocked(self):
+        generated = {"code": "print('trained')", "inferred_assumptions": [], "libraries_required": []}
+        with patch.object(replication_agent, "_generate_baseline_script", return_value=generated), \
+             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_freeze", return_value=""), \
+             patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="trained")), \
+             patch.object(replication_agent, "_repair_generated_script", return_value="print('again')") as repair_mock:
+            result = replication_agent._replicate_by_reconstruction(make_paper(), make_cleaning_result())
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("METRIC", repair_mock.call_args.args[1])
+        self.assertTrue(any("printed no" in w for w in result["warnings"]))
+
+    def test_script_gets_data_paths_through_env(self):
+        generated = {"code": "print(1)", "inferred_assumptions": [], "libraries_required": []}
+        with patch.object(replication_agent, "_generate_baseline_script", return_value=generated), \
+             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_freeze", return_value=""), \
+             patch.object(replication_agent, "_run_bounded",
+                          return_value=run_result(exit_code=0, stdout="METRIC accuracy=0.9")) as run_mock:
+            result = replication_agent._replicate_by_reconstruction(make_paper(), make_cleaning_result())
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(run_mock.call_args.kwargs["env"], {
+            "TRAIN_CSV": "data/processed/train.csv", "TEST_CSV": "data/processed/test.csv",
+            "VALIDATION_CSV": "data/processed/validation.csv",
+        })
+        attempts_dir = Path(result["replication_dir"]) / "reconstructed" / "attempts"
+        self.assertTrue((attempts_dir / "attempt_1.py").is_file())
+
+    def test_install_falls_back_to_one_library_at_a_time(self):
+        def pip(venv, cwd, args):
+            return run_result(exit_code=1 if "tensorflow" in args else 0)
+
+        with patch.object(replication_agent, "_pip_install", side_effect=pip):
+            installed, failed = replication_agent._install_libraries(Path("v"), Path("c"), ["pandas", "tensorflow"])
+        self.assertEqual((installed, failed), (["pandas"], ["tensorflow"]))
+
+    def test_generation_parses_json_and_python_blocks(self):
+        content = ('```json\n{"inferred_assumptions": ["Used 100 trees."], "libraries_required": ["xgboost"]}\n```\n'
+                   '```python\nimport os\nprint(os.environ["TRAIN_CSV"])\n```')
+        with patch("requests.post", return_value=llm_response(content)):
+            generated = replication_agent._generate_baseline_script(make_paper(), make_cleaning_result(), "profile")
+        self.assertEqual(generated["inferred_assumptions"], ["Used 100 trees."])
+        self.assertEqual(generated["libraries_required"], ["xgboost"])
+        self.assertIn('os.environ["TRAIN_CSV"]', generated["code"])
+
+    def test_dataset_profile_describes_real_columns(self):
+        train = Path(self._tmpdir.name) / "train.csv"
+        train.write_text("amt,category,is_fraud,_source_dataset\n1.5,food,0,x\n9.0,travel,1,x\n")
+        profile = replication_agent._dataset_profile(make_cleaning_result(
+            train_csv_path=str(train), split_rows={"train": 2, "test": 1, "validation": 1}))
+        self.assertIn("is_fraud", profile)
+        self.assertIn("train=2", profile)
+        self.assertIn("candidate labels", profile)
+        self.assertIn("_source_dataset", profile)

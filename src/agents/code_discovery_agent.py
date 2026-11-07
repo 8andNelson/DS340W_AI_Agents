@@ -32,7 +32,7 @@ import re
 
 import requests
 
-from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL
+from src import llm
 from src.search import brave_search
 from src.orchestration import code_discovery_cache
 from src.agents.validation_agent import _check_url_reachable
@@ -196,21 +196,7 @@ For each candidate repository, return a JSON object:
 Return a JSON array of candidate repositories, best match first. If none are found, return an empty array [].
 Return ONLY valid JSON. No explanation or markdown."""
 
-    response = requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": DEFAULT_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-
-    content = response.json()["choices"][0]["message"]["content"]
+    content = llm.chat(prompt, timeout=300)
 
     try:
         candidates = json.loads(content)

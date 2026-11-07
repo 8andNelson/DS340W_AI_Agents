@@ -1,4 +1,7 @@
 import unittest
+from unittest.mock import patch
+
+import pytest
 
 from src.agents import validation_agent
 
@@ -175,5 +178,113 @@ class TestNoHallucination(unittest.TestCase):
         self.assertIn("estimate", rec["justification"].lower())
 
 
+class TestDatasetNaming(unittest.TestCase):
+    """A Parent Paper must clearly identify its dataset -- a generic name
+    that only restates the topic doesn't count."""
+
+    def test_generic_names_are_not_specific(self):
+        cases = [
+            ("real-world data", "AI-based credit card fraud detection on real-world data"),
+            ("online credit card data", "Anomaly detection in online credit card data using GNNs"),
+            ("", "Any Paper"),
+            ("public transaction dataset", "Fraud detection"),
+        ]
+        for dataset, title in cases:
+            self.assertFalse(validation_agent._is_specific_dataset_name(dataset, title), dataset)
+
+    def test_real_names_are_specific(self):
+        cases = [
+            ("European cardholders dataset", "Credit card fraud detection"),
+            ("IEEE-CIS Fraud Detection", "Credit card fraud detection"),
+            ("PaySim", "Mobile money fraud"),
+        ]
+        for dataset, title in cases:
+            self.assertTrue(validation_agent._is_specific_dataset_name(dataset, title), dataset)
+
+    def test_generic_name_alone_is_not_specified(self):
+        paper = make_paper(title="Fraud detection on real-world data", dataset="real-world data")
+        self.assertEqual(validation_agent._dataset_availability(paper), "Not specified")
+
+    def test_named_dataset_outranks_otherwise_identical_generic_one(self):
+        generic = make_paper(title="Fraud detection on real-world data", dataset="real-world data")
+        named = make_paper(title="Fraud detection study", dataset="European cardholders dataset")
+        rec = validation_agent.rank_and_recommend(validation_results_from(verified=[generic, named]))
+        self.assertEqual(rec["recommended_parent_paper"]["title"], "Fraud detection study")
+        self.assertEqual(rec["dataset_warning"], "")
+
+    def test_warns_when_no_candidate_names_a_dataset(self):
+        papers = [make_paper(title=f"Paper {i}", dataset="") for i in range(3)]
+        rec = validation_agent.rank_and_recommend(validation_results_from(verified=papers))
+        self.assertIsNotNone(rec["recommended_parent_paper"])
+        self.assertIn("No candidate paper names a specific dataset", rec["dataset_warning"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestValidationRunLayers:
+    """validation_agent.run()'s three validation layers (concurrent URL
+    checks and LLM batches, retraction rejection)."""
+
+    @pytest.fixture(autouse=True)
+    def no_openalex(self):
+        with patch("src.search.openalex.work_by_doi", return_value=None),              patch("src.search.openalex.match_title", return_value=None):
+            yield
+
+    def _paper(self, title, url):
+        return {"title": title, "paper_url": url, "abstract": "", "year": 2023,
+                "peer_reviewed": True, "dataset": "", "results_summary": ""}
+
+    def test_rejects_retracted_paper_in_layer_1(self):
+        papers = [self._paper("Retracted: Fraud detection", "https://ieeexplore.ieee.org/document/1")]
+        with patch("src.agents.validation_agent._check_url_reachable") as reach, \
+             patch("src.agents.validation_agent._llm_validate_batch") as batch:
+            result = validation_agent.run(papers)
+        assert result["rejected"][0]["rejection_reason"] == "Retracted paper"
+        reach.assert_not_called()
+        batch.assert_not_called()
+
+    def test_every_paper_is_checked_and_none_stays_pending(self):
+        papers = [self._paper(f"Paper {i}", f"https://doi.org/10.1/{i}") for i in range(6)]
+
+        def assess(batch):
+            # Mark only the first paper of each batch; the rest are "omitted".
+            batch[0]["validation_status"] = "VERIFIED"
+            return batch
+
+        with patch("src.agents.validation_agent._check_url_reachable", return_value=(True, 200)) as reach, \
+             patch("src.agents.validation_agent._llm_validate_batch", side_effect=assess):
+            result = validation_agent.run(papers)
+
+        assert reach.call_count == 6
+        assert all(p["url_reachable"] for p in papers)
+        assert len(result["verified"]) == 2  # 6 papers -> batches of 4 and 2
+        assert len(result["unverified"]) == 4
+        assert not [p for p in papers if p["validation_status"] == "PENDING"]
+
+    def test_failed_llm_batch_falls_back_to_unverified(self):
+        papers = [self._paper("Paper", "https://doi.org/10.1/x")]
+        with patch("src.agents.validation_agent._check_url_reachable", return_value=(True, 200)), \
+             patch("src.agents.validation_agent._llm_validate_batch", side_effect=RuntimeError("429")):
+            result = validation_agent.run(papers)
+        assert result["unverified"][0]["validation_notes"] == "LLM assessment unavailable"
+
+
+class TestAttachOfficialRecord:
+    def test_attaches_abstract_on_title_match(self):
+        paper = {"title": "Fraud Model", "doi": "10.1/x", "abstract": "Their approach yielded 99%."}
+        record = {"title": "Fraud model", "abstract": "We propose a model.", "is_retracted": False, "doi": "10.1/x"}
+        with patch("src.search.openalex.work_by_doi", return_value=record):
+            validation_agent._attach_official_record(paper)
+        assert paper["official_abstract"] == "We propose a model."
+        assert paper["abstract_source"] == "openalex"
+        assert paper["openalex_retracted"] is False
+
+    def test_rejects_a_different_paper(self):
+        paper = {"title": "Fraud Model", "doi": ""}
+        with patch("src.search.openalex.work_by_doi", return_value=None),              patch("src.search.openalex.match_title", return_value={"title": "Other", "abstract": "x",
+                                                                    "is_retracted": False}):
+            validation_agent._attach_official_record(paper)
+        assert "official_abstract" not in paper
+        assert paper["abstract_source"] == "search_snippet"

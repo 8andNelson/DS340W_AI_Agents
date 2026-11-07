@@ -37,6 +37,7 @@ unreachable Slack channel never changes pipeline behavior, only its
 visibility.
 """
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.slack import slack_client, message_formatter
@@ -60,6 +61,7 @@ def _log_entry(action: str, target: str, issue: str, decision: str, next_step: s
         "issue": issue,
         "decision": decision,  # "Approved" | "Rejected" | "Retrying"
         "next": next_step,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
 
@@ -151,6 +153,8 @@ def _format_validation_report(result: dict) -> str:
     if chosen:
         lines.append(f"Recommended Parent Paper: {chosen.get('title', '')}")
         lines.append(f"Justification:\n{result.get('justification', '')}")
+        if result.get("dataset_warning"):
+            lines.append(f"Warning: {result['dataset_warning']}")
     else:
         lines.append(f"No Parent Paper recommended. Reason: {result.get('degraded_reason', '')}")
     return "\n".join(lines)
@@ -378,6 +382,33 @@ def _check_validation_and_selection(recommendation: dict) -> list:
                 "methodology, or results -- insufficient detail to realistically replicate.",
                 "Rejected",
                 "Select the next-ranked candidate with clearer implementation detail, or escalate for manual review.",
+            ))
+
+        # The Parent Paper must clearly identify its dataset. If a ranked
+        # alternative names a specific dataset but the chosen paper doesn't,
+        # the ranking broke that rule. If no candidate names one, there is
+        # no better choice to make -- that case is reported by the
+        # Validation Agent's dataset_warning instead of blocking every run.
+        if not row.get("dataset_named", True):
+            named_alternatives = [
+                r["title"] for r in recommendation["comparison_table"][1:] if r.get("dataset_named")
+            ]
+            if named_alternatives:
+                blockers.append(_log_entry(
+                    "Correction", "Validation Agent",
+                    f"Recommended paper '{chosen.get('title', '')}' does not name a specific dataset "
+                    f"(stated: '{chosen.get('dataset', '') or 'none'}'), while {len(named_alternatives)} "
+                    f"ranked alternative(s) do, e.g. '{named_alternatives[0]}'.",
+                    "Rejected",
+                    "Re-rank so that a candidate which names a specific dataset is recommended.",
+                ))
+
+        if chosen.get("openalex_retracted"):
+            blockers.append(_log_entry(
+                "Correction", "Validation Agent",
+                f"Recommended paper '{chosen.get('title', '')}' is marked as retracted in OpenAlex.",
+                "Rejected",
+                "Recommend a paper that has not been retracted.",
             ))
 
         audit = recommendation.get("code_availability_audit", {})
@@ -675,7 +706,11 @@ def check_agent_requests(parent_paper: dict = None, ranked_pool: list = None,
 
         new_dataset_result, blockers = _supervise(
             "Data Agent",
-            lambda: data_agent.run(parent_paper, ranked_pool, target_entries=new_target),
+            lambda: data_agent.run(
+                parent_paper, ranked_pool, target_entries=new_target,
+                search_query=load_state().get("project_topic", ""),
+                target_terms=load_state().get("target_terms", []),
+            ),
             _check_data,
             _format_data_report,
         )
@@ -685,7 +720,8 @@ def check_agent_requests(parent_paper: dict = None, ranked_pool: list = None,
 
         new_cleaning_result, blockers = _supervise(
             "Cleaning Agent",
-            lambda: cleaning_agent.run(new_dataset_result["selected_datasets"]),
+            lambda: cleaning_agent.run(new_dataset_result["selected_datasets"],
+                                       target_terms=load_state().get("target_terms", [])),
             _check_cleaning,
             _format_cleaning_report,
         )
@@ -799,6 +835,7 @@ def run_pipeline(topic: str) -> dict:
     update_state({
         "project_topic": topic,
         "research_question": structured.get("domain", ""),
+        "target_terms": structured.get("target_terms", []),
         "phase": "TOPIC_ANALYSIS",
     })
     result["structured"] = structured
@@ -855,7 +892,10 @@ def run_pipeline(topic: str) -> dict:
 
     dataset_result, blockers = _supervise(
         "Data Agent",
-        lambda: data_agent.run(validation_result["recommended_parent_paper"], validation_result["ranked_pool"]),
+        lambda: data_agent.run(
+            validation_result["recommended_parent_paper"], validation_result["ranked_pool"],
+            search_query=topic, target_terms=structured.get("target_terms", []),
+        ),
         _check_data,
         _format_data_report,
     )
@@ -880,7 +920,8 @@ def run_pipeline(topic: str) -> dict:
     # --- Stage 5: Cleaning Agent (merge downloaded datasets into a master CSV) ---
     cleaning_result, blockers = _supervise(
         "Cleaning Agent",
-        lambda: cleaning_agent.run(dataset_result["selected_datasets"]),
+        lambda: cleaning_agent.run(dataset_result["selected_datasets"],
+                                   target_terms=structured.get("target_terms", [])),
         _check_cleaning,
         _format_cleaning_report,
     )

@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from src.agents import master_agent
 
@@ -150,6 +150,18 @@ class TestValidationAndSelectionChecks(MasterAgentTestCase):
             make_recommendation(row=make_row(code_availability=True), deciding_factor=False)
         )
         self.assertEqual(blockers, [])
+
+    def test_rejects_unnamed_dataset_when_a_ranked_alternative_names_one(self):
+        rec = make_recommendation(row=make_row(title="Vague Data Paper", dataset_named=False))
+        rec["comparison_table"].append(make_row(title="Named Data Paper", dataset_named=True))
+        blockers = master_agent._check_validation_and_selection(rec)
+        issues = [b["issue"] for b in blockers]
+        self.assertTrue(any("does not name a specific dataset" in i and "Named Data Paper" in i for i in issues))
+
+    def test_does_not_reject_unnamed_dataset_when_no_candidate_names_one(self):
+        rec = make_recommendation(row=make_row(dataset_named=False))
+        rec["comparison_table"].append(make_row(title="Also Vague", dataset_named=False))
+        self.assertEqual(master_agent._check_validation_and_selection(rec), [])
 
 
 def make_dataset_candidate(**overrides) -> dict:
@@ -503,7 +515,8 @@ class TestDataAgentPipelineWiring(MasterAgentTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["dataset_result"], data_result)
         cache_papers.assert_called_once_with(ranked_pool)
-        data_run.assert_called_once_with(ranked_pool[0], ranked_pool)
+        data_run.assert_called_once_with(ranked_pool[0], ranked_pool, search_query="credit card fraud detection",
+                                         target_terms=[])
 
     def test_halts_on_zero_datasets(self):
         data_result = make_data_result(selected_datasets=[], warnings=["nothing found"])
@@ -552,7 +565,7 @@ class TestCleaningAgentPipelineWiring(MasterAgentTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["phase"], "EXPERIMENTATION")
         self.assertEqual(result["cleaning_result"], cleaning_result)
-        cleaning_run.assert_called_once_with(data_result["selected_datasets"])
+        cleaning_run.assert_called_once_with(data_result["selected_datasets"], target_terms=[])
 
     def test_halts_when_nothing_could_be_merged(self):
         data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
@@ -1054,7 +1067,8 @@ class TestCheckAgentRequests(MasterAgentTestCase):
              patch("src.agents.cleaning_agent.run", return_value=new_cleaning_result):
             result = master_agent.check_agent_requests(parent_paper, ranked_pool)
 
-        data_run.assert_called_once_with(parent_paper, ranked_pool, target_entries=25000)
+        data_run.assert_called_once_with(parent_paper, ranked_pool, target_entries=25000, search_query=ANY,
+                                         target_terms=ANY)
         self.assertEqual(result["dataset_result"], new_data_result)
         self.assertEqual(result["cleaning_result"], new_cleaning_result)
         self.assertEqual(result["blockers"], [])
@@ -1071,7 +1085,9 @@ class TestCheckAgentRequests(MasterAgentTestCase):
 
         from src.agents import data_agent
         expected_target = data_agent.TARGET_ENTRIES + master_agent.DATA_REQUEST_TARGET_INCREMENT
-        data_run.assert_called_once_with(parent_paper, ranked_pool, target_entries=expected_target)
+        data_run.assert_called_once_with(
+            parent_paper, ranked_pool, target_entries=expected_target, search_query=ANY, target_terms=ANY,
+        )
 
     def test_blocked_when_no_parent_paper_available(self):
         messages = [make_dataset_agent_request()]

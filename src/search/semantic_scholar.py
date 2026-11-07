@@ -38,6 +38,35 @@ def search_papers(query: str, limit: int = 10, min_year: int = 2022, retries: in
     return results
 
 
+SS_MATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search/match"
+
+
+def match_title(title: str, retries: int = 1) -> dict | None:
+    """Return Semantic Scholar's single best title match (title, year,
+    venue, externalIds), or None when there is no match or the API is
+    unavailable. Callers must still confirm the returned title is the same
+    paper -- the endpoint always returns its closest match, not an exact one.
+
+    retries is low by default: this is a best-effort metadata lookup, so a
+    rate-limited request is skipped rather than allowed to stall a stage."""
+    if not title:
+        return None
+    params = {"query": title, "fields": "title,year,venue,externalIds"}
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(SS_MATCH_URL, params=params, timeout=15)
+        except requests.RequestException:
+            return None
+        if response.status_code == 429 and attempt < retries:
+            time.sleep(5 * (2 ** attempt))
+            continue
+        if response.status_code != 200:
+            return None
+        data = response.json().get("data") or []
+        return data[0] if data else None
+    return None
+
+
 def normalize_paper(raw: dict) -> dict:
     """Convert a raw Semantic Scholar record to the project paper schema."""
     ext = raw.get("externalIds") or {}

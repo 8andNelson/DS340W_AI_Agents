@@ -100,7 +100,7 @@ class TestRunAlgorithm(unittest.TestCase):
         second = make_paper(title="Second", dataset="Second Dataset")
         second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=2000)
 
-        def fake_find(paper, _scope, _parent=None):
+        def fake_find(paper, _scope, _parent=None, _ctx=None):
             return big if paper["title"] == "Parent" else second_candidate
 
         with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
@@ -116,7 +116,7 @@ class TestRunAlgorithm(unittest.TestCase):
         alt = make_paper(title="Alt", dataset="Alt Dataset")
         alt_candidate = make_link_candidate("https://kaggle.com/alt", entry_count=12000)
 
-        def fake_find(paper, _scope, _parent=None):
+        def fake_find(paper, _scope, _parent=None, _ctx=None):
             if paper["title"] == "Parent":
                 return None  # no dataset name -> nothing to search
             return alt_candidate
@@ -136,7 +136,7 @@ class TestRunAlgorithm(unittest.TestCase):
 
         calls = []
 
-        def fake_find(paper, _scope, _parent=None):
+        def fake_find(paper, _scope, _parent=None, _ctx=None):
             calls.append(paper["title"])
             if paper["title"] == "Parent":
                 return empty
@@ -157,7 +157,7 @@ class TestRunAlgorithm(unittest.TestCase):
         second = make_paper(title="Second", dataset="Second Dataset")
         second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=7000)
 
-        def fake_find(paper, _scope, _parent=None):
+        def fake_find(paper, _scope, _parent=None, _ctx=None):
             return mid if paper["title"] == "Parent" else second_candidate
 
         with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
@@ -175,7 +175,7 @@ class TestRunAlgorithm(unittest.TestCase):
         third = make_paper(title="Third", dataset="Unique Dataset")
         third_candidate = make_link_candidate("https://kaggle.com/unique", entry_count=7000)
 
-        def fake_find(paper, _scope, _parent=None):
+        def fake_find(paper, _scope, _parent=None, _ctx=None):
             if paper["title"] == "Parent":
                 return shared
             if paper["title"] == "Dup":
@@ -199,7 +199,7 @@ class TestRunAlgorithm(unittest.TestCase):
             for i in range(4)
         }
 
-        def fake_find(paper, _scope, _parent=None):
+        def fake_find(paper, _scope, _parent=None, _ctx=None):
             return candidates[paper["dataset"]]
 
         # Falling short of the target with room left under MAX_DATASETS
@@ -227,7 +227,7 @@ class TestRunAlgorithm(unittest.TestCase):
         }
         checked = []
 
-        def fake_find(paper, _scope, _parent=None):
+        def fake_find(paper, _scope, _parent=None, _ctx=None):
             checked.append(paper["dataset"])
             return candidates[paper["dataset"]]
 
@@ -260,6 +260,31 @@ class TestKaggleSearchIntegration(unittest.TestCase):
         kaggle_mock.assert_called_once_with("fraud detection scope")
         results_arg = extract_mock.call_args.args[0]
         self.assertIn(kaggle_hit, results_arg)
+
+    def test_exploration_searches_with_short_query_but_scope_checks_with_full_description(self):
+        """Verified live: the long scope description returns zero Kaggle
+        results, so the short search_query is what gets sent -- while the
+        extraction/scope check still sees the full description."""
+        with patch("src.search.brave_search.search_dataset_sites", return_value=[]) as brave_mock, \
+             patch.object(data_agent, "_search_kaggle_datasets", return_value=[{"title": "t", "url": "u"}]) as kaggle_mock, \
+             patch.object(data_agent, "_extract_dataset_candidates_from_results", return_value=[]) as extract_mock:
+            data_agent._search_exploration_sites(
+                "Long paper title -- long abstract text", search_query="credit card fraud",
+            )
+
+        self.assertEqual(brave_mock.call_args.args[0], "credit card fraud")
+        kaggle_mock.assert_called_once_with("credit card fraud")
+        self.assertEqual(extract_mock.call_args.args[3], "Long paper title -- long abstract text")
+
+    def test_run_passes_search_query_to_exploration_stage(self):
+        parent = {"title": "P", "dataset": "", "abstract": "a"}
+        with patch.object(data_agent, "_search_exploration_sites", return_value=[]) as explore_mock:
+            data_agent.run(parent, [parent], search_query="credit card fraud")
+        self.assertEqual(explore_mock.call_args.args[2], "credit card fraud")
+
+    def test_results_per_query_within_brave_limit(self):
+        from src.search import brave_search
+        self.assertLessEqual(data_agent.RESULTS_PER_QUERY, brave_search.BRAVE_MAX_COUNT)
 
     def test_kaggle_results_merged_into_resolve_dataset_extraction(self):
         kaggle_hit = {"title": "Kaggle Hit", "url": "https://www.kaggle.com/datasets/a/b", "description": ""}
@@ -441,7 +466,7 @@ class TestResolveDataset(unittest.TestCase):
             '"source_url": "https://github.com/example/big", "entry_count": null}]'
         )
 
-        def fake_download(candidate):
+        def fake_download(candidate, _target_terms=None):
             candidate["local_csv_path"] = "data/raw/big-dataset.csv"
             candidate["entry_count"] = 25000
             candidate["entry_count_source"] = "downloaded file"
@@ -497,7 +522,7 @@ class TestResolveDataset(unittest.TestCase):
             '"source_url": "https://kaggle.com/anon", "entry_count": null}]'
         )
 
-        def fake_download(candidate):
+        def fake_download(candidate, _target_terms=None):
             candidate["local_csv_path"] = "data/raw/anon.csv"
             candidate["entry_count"] = 50000
             candidate["entry_count_source"] = "downloaded file"
@@ -534,7 +559,7 @@ class TestResolveDataset(unittest.TestCase):
         def fake_reachable(url):
             return (True, 200) if url == "https://example.com/second" else (False, 0)
 
-        def fake_download(candidate):
+        def fake_download(candidate, _target_terms=None):
             candidate["local_csv_path"] = "data/raw/second.csv"
             candidate["entry_count"] = candidate.get("entry_count") or 6000
             candidate["entry_count_source"] = "downloaded file"
@@ -929,7 +954,7 @@ class TestDownloadAndConvertToCsv(unittest.TestCase):
             ok = data_agent._download_and_convert_to_csv(candidate)
 
         hf_mock.assert_called_once_with(candidate)
-        kaggle_mock.assert_called_once_with(candidate)
+        kaggle_mock.assert_called_once_with(candidate, None)
         get_mock.assert_not_called()  # generic path never reached
         self.assertTrue(ok)
         self.assertEqual(candidate["entry_count"], 2)
@@ -1265,3 +1290,28 @@ class TestNormalizeDatasetLink(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_target_fit_rejects_a_cached_wrong_target_dataset(tmp_path):
+    """A cache hit predates the target-fit check, so try_add applies it:
+    the loan-default dataset (served from cache in a live run) must be
+    rejected for a fraud project, and the fraud dataset kept."""
+    loan_csv, fraud_csv = tmp_path / "loan.csv", tmp_path / "fraud.csv"
+    pd.DataFrame({"limit_bal": [1, 2], "default.payment.next.month": [0, 1]}).to_csv(loan_csv, index=False)
+    pd.DataFrame({"amt": [1.0, 2.0], "is_fraud": [0, 1]}).to_csv(fraud_csv, index=False)
+    loan = make_candidate(name="https://kaggle.com/loan", display_name="Default of Credit Card Clients",
+                          scope_explanation="Credit card clients.", local_csv_path=str(loan_csv),
+                          verification_method="cache_hit")
+    fraud = make_candidate(name="https://kaggle.com/fraud", display_name="Transactions",
+                           local_csv_path=str(fraud_csv))
+    parent, other = make_paper(title="Parent", dataset="Loan"), make_paper(title="Other", dataset="Fraud")
+
+    def fake_find(paper, _scope, _parent=None, _ctx=None):
+        return loan if paper["title"] == "Parent" else fraud
+
+    with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find), \
+         patch.object(data_agent, "_search_exploration_sites", return_value=[]):
+        result = data_agent.run(parent, [parent, other], target_terms=["fraud"])
+
+    assert result["selected_datasets"] == [fraud]
+    assert any("Default of Credit Card Clients" in w for w in result["warnings"])

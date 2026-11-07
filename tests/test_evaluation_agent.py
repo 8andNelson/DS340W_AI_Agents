@@ -97,10 +97,11 @@ class TestClassify(unittest.TestCase):
         self.assertAlmostEqual(diff, 0.5)
 
     def test_mixed_scale_percentage_vs_fraction(self):
-        # published as a percentage (94.0), reproduced as a fraction that
-        # happens to be <= 1.0 is NOT rescaled unless BOTH are <= 1.0.
+        # published as a percentage (94.0), reproduced as a fraction (0.94):
+        # each value is normalized on its own, so these are the same number.
         classification, diff = evaluation_agent._classify(94.0, 0.94)
-        self.assertEqual(classification, "FAILED")
+        self.assertEqual(classification, "EXACT")
+        self.assertAlmostEqual(diff, 0.0)
 
 
 class TestReadStdout(unittest.TestCase):
@@ -211,3 +212,48 @@ class TestRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestParseMetricLines(unittest.TestCase):
+    def test_reads_metric_lines_and_later_line_wins(self):
+        text = "epoch 1\nMETRIC accuracy=0.5\nNOTE: subsampled\nMETRIC accuracy=0.97\nMETRIC roc_auc: 0.9912\n"
+        self.assertEqual(evaluation_agent.parse_metric_lines(text), {"accuracy": 0.97, "roc_auc": 0.9912})
+
+    def test_ignores_other_lines(self):
+        self.assertEqual(evaluation_agent.parse_metric_lines("accuracy = 0.9\nMETRICS are below"), {})
+
+    def test_reproduced_metrics_skips_llm_when_lines_present(self):
+        with patch.object(evaluation_agent, "_extract_metrics") as extract_mock:
+            metrics = evaluation_agent.reproduced_metrics("METRIC f1=0.8", "run output")
+        extract_mock.assert_not_called()
+        self.assertEqual(metrics, {"f1": 0.8})
+
+    def test_reproduced_metrics_falls_back_to_llm(self):
+        with patch.object(evaluation_agent, "_extract_metrics", return_value={"f1": 0.8}) as extract_mock:
+            evaluation_agent.reproduced_metrics("F1 score: 0.8", "run output")
+        extract_mock.assert_called_once()
+
+
+
+class TestPublishedSource(unittest.TestCase):
+    def test_official_abstract_replaces_snippet_text(self):
+        paper = {"title": "T", "official_abstract": "Our model reaches an F1 of 0.91.",
+                 "results_summary": "accuracy rate of 99%", "abstract": "Their approach yielded 99%."}
+        with patch.object(evaluation_agent, "_extract_metrics", return_value={"f1": 0.91}) as extract_mock:
+            result = evaluation_agent.run(paper, {"stdout_path": ""})
+        self.assertEqual(extract_mock.call_args_list[0].args[0], "Our model reaches an F1 of 0.91.")
+        self.assertEqual(result["published_source"], "official_abstract")
+
+    def test_snippet_source_is_flagged_unverified(self):
+        paper = {"title": "T", "results_summary": "accuracy rate of 99%"}
+        with patch.object(evaluation_agent, "_extract_metrics", return_value={"accuracy": 99.0}):
+            result = evaluation_agent.run(paper, {"stdout_path": ""})
+        self.assertEqual(result["published_source"], "search_snippet")
+        self.assertTrue(any("UNVERIFIED" in c for c in result["likely_causes"]))
+
+
+class TestMixedScales(unittest.TestCase):
+    def test_percentage_against_fraction(self):
+        classification, diff = evaluation_agent._classify(99.0, 0.9965)
+        self.assertEqual(classification, "EXACT")
+        self.assertAlmostEqual(diff, 0.65)

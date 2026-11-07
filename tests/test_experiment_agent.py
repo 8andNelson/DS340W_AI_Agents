@@ -388,3 +388,45 @@ class TestRun(ExperimentAgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDataEnvAndRepair(ExperimentAgentTestCase):
+    def _baseline(self, script="print('baseline')"):
+        slug = experiment_agent._slugify(make_paper()["title"])
+        baseline_dir = experiment_agent.REPLICATION_DIR / slug
+        (baseline_dir / "reconstructed").mkdir(parents=True)
+        (baseline_dir / "reconstructed" / "train.py").write_text(script)
+        (baseline_dir / "venv").mkdir(parents=True)
+
+    def test_dataset_split_points_data_env_at_the_new_split(self):
+        self._baseline()
+        previous = [{"category": c} for c in experiment_agent.CODE_LEVEL_CATEGORIES]
+        with tempfile.TemporaryDirectory() as data_tmp:
+            master_path = Path(data_tmp) / "master.csv"
+            pd.DataFrame({"id": range(100), "label": [0, 1] * 50}).to_csv(master_path, index=False)
+            with patch.object(experiment_agent, "_run_bounded",
+                              return_value=run_result(exit_code=0, stdout="METRIC accuracy=0.93")) as run_mock:
+                result = experiment_agent.run(
+                    make_paper(), make_replication_result(source="reconstructed"), make_evaluation_result(),
+                    make_cleaning_result(master_csv_path=str(master_path)), previous,
+                )
+
+        env = run_mock.call_args.kwargs["env"]
+        self.assertTrue(env["TRAIN_CSV"].startswith(result["experiment_dir"]))
+        self.assertTrue(env["TEST_CSV"].startswith(result["experiment_dir"]))
+        self.assertEqual(result["experiment_metrics"], {"accuracy": 0.93})
+
+    def test_code_level_experiment_repairs_a_failing_script(self):
+        self._baseline()
+        proposal = {"hypothesis": "h", "what_changed": "Swapped the model.", "code": "broken"}
+        runs = [run_result(exit_code=1, stderr="NameError"), run_result(exit_code=0, stdout="METRIC accuracy=0.9")]
+        with patch.object(experiment_agent, "_propose_code_change", return_value=proposal), \
+             patch.object(experiment_agent, "_run_bounded", side_effect=runs), \
+             patch.object(experiment_agent, "_repair_generated_script", return_value="fixed") as repair_mock:
+            result = experiment_agent.run(
+                make_paper(), make_replication_result(source="reconstructed"), make_evaluation_result(),
+                make_cleaning_result(), [],
+            )
+        self.assertEqual(result["status"], "OK")
+        self.assertIn("Swapped the model.", repair_mock.call_args.args[1])
+        self.assertEqual((Path(result["experiment_dir"]) / "train.py").read_text(), "fixed")

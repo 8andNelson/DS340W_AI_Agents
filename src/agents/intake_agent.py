@@ -1,7 +1,6 @@
 import json
 import re
-import requests
-from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL
+from src import llm
 
 
 SYSTEM_PROMPT = """You are a research intake assistant for an academic AI research system.
@@ -17,31 +16,13 @@ Return a JSON object with:
 - "ml_task": the specific ML or data science task type (e.g. "binary classification", "anomaly detection")
 - "keywords": a list of 5-7 academic search keywords
 - "search_queries": a list of 3-4 specific search queries suitable for finding peer-reviewed papers on Google Scholar or Semantic Scholar
+- "target_terms": 1-3 short lower-case keywords naming the outcome being predicted, as it would appear in a dataset's label column (e.g. ["fraud"] for credit card fraud detection, ["churn"] for customer churn). Name the outcome itself, not the domain: for credit card fraud this is "fraud", not "credit card".
 
 Return ONLY valid JSON with no explanation or markdown."""
 
 
 def _call_openrouter(prompt: str) -> str:
-    if not OPENROUTER_API_KEY:
-        raise EnvironmentError("OPENROUTER_API_KEY is not set in .env")
-
-    response = requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": DEFAULT_MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    return llm.chat(prompt, system=SYSTEM_PROMPT, timeout=120)
 
 
 def _extract_json(text: str) -> dict:
@@ -69,5 +50,8 @@ def run(topic: str) -> dict:
     structured.setdefault("ml_task", "")
     structured.setdefault("keywords", [])
     structured.setdefault("search_queries", [])
+    structured.setdefault("target_terms", [])
+    terms = structured["target_terms"] if isinstance(structured["target_terms"], list) else []
+    structured["target_terms"] = [str(t).strip().lower() for t in terms if str(t).strip()][:3]
 
     return structured

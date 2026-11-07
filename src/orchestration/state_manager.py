@@ -6,6 +6,7 @@ STATE_FILE = Path(__file__).parent.parent.parent / "logs" / "project_state.json"
 DEFAULT_STATE = {
     "project_topic": "",
     "research_question": "",
+    "target_terms": [],  # Intake Agent's prediction-target keywords, e.g. ["fraud"]
     "phase": "USER_INPUT",
     "papers": [],
     "parent_paper": None,

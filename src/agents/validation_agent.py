@@ -13,10 +13,13 @@ this agent's output (see master_agent.py); this agent only recommends.
 """
 import json
 import re
-import time
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
 
-from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL
+from src import llm
+from src.agents.research_agent import _title_key, is_retracted
+from src.search import openalex
 
 # Domains that are prohibited as academic paper sources
 PROHIBITED_DOMAINS = [
@@ -62,10 +65,29 @@ CREDIBLE_DOMAINS = [
 MIN_YEAR = 2022
 URL_TIMEOUT = 10
 ASSESSMENT_BATCH = 4
+# Reachability checks are network-bound and independent per paper, and the
+# LLM batches are independent per batch, so both run concurrently. LLM
+# concurrency is kept small because the free model rate-limits (429s);
+# llm.chat retries those with backoff.
+URL_CHECK_WORKERS = 8
+LLM_WORKERS = 3
 
 # --- Parent Paper selection (moved from paper_selection_agent.py) ---
 MIN_QUALIFYING = 5
 JUSTIFICATION_TOP_N = 3  # chosen paper + up to 2 runner-ups discussed in prose
+UNNAMED_DATASET_PENALTY = 3.0  # composite-score penalty, see _composite_score
+
+# Words that never identify a dataset on their own -- see
+# _is_specific_dataset_name.
+GENERIC_DATASET_WORDS = {
+    "a", "an", "the", "of", "and", "or", "with", "from", "on", "in", "for", "by",
+    "data", "dataset", "datasets", "database", "databases", "set", "sets",
+    "real", "world", "public", "publicly", "available", "private", "proprietary",
+    "open", "source", "large", "scale", "small", "online", "synthetic", "benchmark",
+    "transaction", "transactions", "transactional", "record", "records",
+    "sample", "samples", "collected", "various", "multiple", "several", "different",
+    "historical", "customer", "customers", "user", "users", "bank", "banking", "financial",
+}
 
 COMPUTE_HEAVY_KEYWORDS = [
     "transformer", "bert", "gpt", "diffusion", "gan",
@@ -172,21 +194,7 @@ Rules:
 
 Return ONLY a valid JSON array. No explanation or markdown."""
 
-    response = requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": DEFAULT_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-
-    content = response.json()["choices"][0]["message"]["content"]
+    content = llm.chat(prompt, timeout=300)
 
     try:
         assessments = json.loads(content)
@@ -212,13 +220,32 @@ Return ONLY a valid JSON array. No explanation or markdown."""
     return papers
 
 
+def _is_specific_dataset_name(dataset: str, title: str) -> bool:
+    """
+    True if a stated dataset name actually identifies a dataset, rather than
+    just restating the paper's topic. A name is generic when every word in
+    it is either a generic data word or already in the paper's own title --
+    e.g. "real-world data" for a paper titled "...on real-world data", or
+    "online credit card data" for "Anomaly detection in online credit card
+    data...". Such a name gives the Data Agent nothing to search for, so
+    CLAUDE.md's "clearly identify the dataset" requirement isn't met.
+    """
+    tokens = re.findall(r"[a-z0-9]+", (dataset or "").lower())
+    if not tokens:
+        return False
+    title_tokens = set(re.findall(r"[a-z0-9]+", (title or "").lower()))
+    return any(t not in GENERIC_DATASET_WORDS and t not in title_tokens for t in tokens)
+
+
 def _dataset_availability(paper: dict) -> str:
-    """Label how clearly the dataset is identified."""
+    """Label how clearly the dataset is identified. A generic name (see
+    _is_specific_dataset_name) does not count as a name."""
     dataset = (paper.get("dataset") or "").strip()
     source = (paper.get("dataset_source") or "").strip()
-    if dataset and source:
+    specific = _is_specific_dataset_name(dataset, paper.get("title", ""))
+    if specific and source:
         return "Named + sourced"
-    if dataset or paper.get("validated_has_dataset"):
+    if specific or source or paper.get("validated_has_dataset"):
         return "Mentioned"
     return "Not specified"
 
@@ -326,6 +353,7 @@ def _compute_criteria_row(paper: dict) -> dict:
         "research_topic": paper.get("venue", "") or "",
         "dataset_availability": dataset_availability,
         "dataset_source": paper.get("dataset_source", "") or "",
+        "dataset_named": _is_specific_dataset_name(paper.get("dataset", ""), paper.get("title", "")),
         "methodology_clarity": methodology_clarity,
         "implementation_clarity": implementation_clarity,
         "code_availability": bool(paper.get("has_code")),
@@ -373,6 +401,13 @@ def _composite_score(row: dict, code_weight: float = 0.5) -> float:
         score += 2.0
     elif row["dataset_availability"] == "Mentioned":
         score += 1.0
+
+    # A Parent Paper must clearly identify its dataset (CLAUDE.md), and the
+    # Data Agent can only search for a dataset that has a real name -- so an
+    # unnamed or generic one is penalized enough to rank below any
+    # comparable paper that does name its dataset.
+    if not row.get("dataset_named", True):
+        score -= UNNAMED_DATASET_PENALTY
 
     score += _CLARITY_POINTS.get(row["methodology_clarity"], 0)
     score += _CLARITY_POINTS.get(row["implementation_clarity"], 0)
@@ -554,6 +589,18 @@ def rank_and_recommend(validation_results: dict) -> dict:
     deciding = _is_code_deciding_factor(rows, chosen_idx)
     justification = _template_justify(rows[chosen_idx], [rows[i] for i in runner_up_indices])
 
+    # Reported, not hidden: when no candidate names a specific dataset, the
+    # best paper is still recommended, but the Data Agent will have to rely
+    # on its general topic search instead of the paper's own data.
+    dataset_warning = ""
+    if not any(r["dataset_named"] for r in rows):
+        dataset_warning = (
+            "No candidate paper names a specific dataset (only generic or empty dataset fields), "
+            "so the Data Agent cannot search for the Parent Paper's own data and will rely on a "
+            "general search for datasets relevant to the topic."
+        )
+        print(f"[Validation Agent] WARNING: {dataset_warning}")
+
     print(f"[Validation Agent] Recommended: {pool[chosen_idx]['title'][:70]}")
 
     return {
@@ -570,7 +617,38 @@ def rank_and_recommend(validation_results: dict) -> dict:
         "justification": justification,
         "expected_difficulty": rows[chosen_idx]["expected_difficulty"],
         "code_availability_deciding_factor": deciding,
+        "dataset_warning": dataset_warning,
     }
+
+
+def _attach_official_record(paper: dict) -> None:
+    """Attach the Parent Paper's official abstract and retraction status
+    from OpenAlex (by DOI, else exact title).
+
+    The stored "abstract" is only a search-result snippet, and a snippet
+    can quote a paper's related-work section -- e.g. "their approach
+    yielded an accuracy of 99%" describing another paper. Replication and
+    Evaluation need the paper's own abstract instead. A record is accepted
+    only when its title is this paper's title. Best-effort: when nothing
+    matches, abstract_source stays "search_snippet" and consumers say so."""
+    if not paper:
+        return
+    paper["abstract_source"] = "search_snippet"
+    title_key = _title_key(paper.get("title", ""))
+    record = openalex.work_by_doi(paper.get("doi", ""))
+    if not record or _title_key(record.get("title", "")) != title_key:
+        record = openalex.match_title(paper.get("title", ""))
+    if not record or _title_key(record.get("title", "")) != title_key:
+        print("[Validation Agent] Official abstract not found on OpenAlex; the Parent Paper's abstract "
+              "remains a search snippet (UNVERIFIED).")
+        return
+    paper["openalex_retracted"] = record["is_retracted"]
+    if not paper.get("doi") and record.get("doi"):
+        paper["doi"] = record["doi"]
+    if record.get("abstract"):
+        paper["official_abstract"] = record["abstract"]
+        paper["abstract_source"] = "openalex"
+        print("[Validation Agent] Attached the Parent Paper's official abstract from OpenAlex.")
 
 
 def run(papers: list) -> dict:
@@ -583,10 +661,12 @@ def run(papers: list) -> dict:
     print(f"\n[Validation Agent] Validating {len(papers)} papers...")
     print("[Validation Agent] Layer 1: Checking for prohibited sources...")
 
-    # Layer 1 — prohibited source check (instant, no network)
+    # Layer 1 — prohibited source and retraction check (instant, no network)
     for p in papers:
         url = p.get("paper_url", "")
         rejection = _check_prohibited_source(url)
+        if not rejection and is_retracted(p.get("title", ""), p.get("abstract", "")):
+            rejection = "Retracted paper"
         if rejection:
             p["validation_status"] = "REJECTED"
             p["rejection_reason"] = rejection
@@ -600,24 +680,25 @@ def run(papers: list) -> dict:
 
     # Layer 2 — URL reachability check
     print(f"[Validation Agent] Layer 2: Checking URL reachability for {len(pending)} papers...")
-    for p in pending:
-        url = p.get("paper_url", "")
-        reachable, status = _check_url_reachable(url)
+    with ThreadPoolExecutor(max_workers=URL_CHECK_WORKERS) as pool:
+        reachability = list(pool.map(lambda p: _check_url_reachable(p.get("paper_url", "")), pending))
+    for p, (reachable, status) in zip(pending, reachability):
         p["url_reachable"] = reachable
-        credible = _is_credible_domain(url)
+        credible = _is_credible_domain(p.get("paper_url", ""))
 
         status_str = f"HTTP {status}" if status else "unreachable"
         domain_str = "credible domain" if credible else "unknown domain"
         flag = "[OK]" if reachable else "[WARN]"
         print(f"  {flag} {status_str} | {domain_str} | {p['title'][:55]}")
-        time.sleep(0.3)
 
-    # Layer 3 — LLM independent re-assessment (batched)
+    # Layer 3 — LLM independent re-assessment (batched, batches concurrent)
     print(f"[Validation Agent] Layer 3: LLM independent assessment...")
-    for i in range(0, len(pending), ASSESSMENT_BATCH):
-        batch = pending[i: i + ASSESSMENT_BATCH]
+    batches = [pending[i: i + ASSESSMENT_BATCH] for i in range(0, len(pending), ASSESSMENT_BATCH)]
+    with ThreadPoolExecutor(max_workers=LLM_WORKERS) as pool:
+        futures = [pool.submit(_llm_validate_batch, batch) for batch in batches]
+    for batch, future in zip(batches, futures):
         try:
-            _llm_validate_batch(batch)
+            future.result()
         except Exception as e:
             print(f"  WARNING: LLM assessment failed for batch — {e}")
             for p in batch:
@@ -630,8 +711,13 @@ def run(papers: list) -> dict:
                 p.setdefault("validated_has_results", bool(p.get("results_summary")))
                 p.setdefault("validated_reproducibility", 0)
                 p.setdefault("validation_notes", "LLM assessment unavailable")
-        if i + ASSESSMENT_BATCH < len(pending):
-            time.sleep(1)
+
+    # A paper the LLM's response skipped would otherwise stay PENDING and
+    # fall out of every tally below without a trace.
+    for p in pending:
+        if p.get("validation_status") == "PENDING":
+            p["validation_status"] = "UNVERIFIED"
+            p.setdefault("validation_notes", "Omitted from the LLM assessment response")
 
     # Tally results
     verified = [p for p in papers if p.get("validation_status") == "VERIFIED"]
@@ -652,4 +738,5 @@ def run(papers: list) -> dict:
     }
 
     selection = rank_and_recommend(tally)
+    _attach_official_record(selection.get("recommended_parent_paper"))
     return {**tally, **selection}

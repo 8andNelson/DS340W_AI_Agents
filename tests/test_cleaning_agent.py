@@ -292,3 +292,54 @@ class TestPerDatasetCleaning(CleaningAgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLabelAwareMerge:
+    """Mirrors the live-run failure: a loan-default dataset listed first
+    must not push out the two real fraud datasets."""
+
+    def _write(self, tmp_path, name, frame):
+        path = tmp_path / f"{name}.csv"
+        frame.to_csv(path, index=False)
+        return {"name": f"https://example.com/{name}", "display_name": name, "local_csv_path": str(path)}
+
+    def _datasets(self, tmp_path):
+        loan = self._write(tmp_path, "loan", pd.DataFrame({
+            "limit_bal": [1000, 2000], "default.payment.next.month": [0, 1]}))
+        kartik = self._write(tmp_path, "kartik", pd.DataFrame({
+            "amt": [10.0, 20.0, 30.0], "state": ["NC", "CA", "TX"], "is_fraud": [0, 1, 0]}))
+        ibm = self._write(tmp_path, "ibm", pd.DataFrame({
+            "Amount": ["$11.00", "$19.00", "$31.00"], "Merchant State": ["CA", "TX", "NY"],
+            "Is Fraud?": ["No", "Yes", "No"]}))
+        return [loan, kartik, ibm]
+
+    def test_fraud_datasets_merge_and_loan_dataset_is_logged(self, tmp_path):
+        proposals = [{"source": "amount", "target": "amt", "relation": "same", "factor": None},
+                     {"source": "merchant_state", "target": "state", "relation": "same", "factor": None}]
+        with patch("src.orchestration.column_mapping.propose_mappings", return_value=proposals):
+            result = cleaning_agent.run(self._datasets(tmp_path), target_terms=["fraud"])
+
+        assert result["datasets_merged"] == 2
+        assert result["label_column"] == "is_fraud"
+        assert [c["dataset"] for c in result["conflicts"]] == ["loan"]
+        master = pd.read_csv(result["master_csv_path"])
+        assert sorted(master["is_fraud"].unique()) == [0, 1]  # "Yes"/"No" normalized
+        assert len(master) == 6
+        assert master["amt"].notna().sum() == 6  # "$11.00" merged into amt as 11.0
+        log = json.loads(cleaning_agent.MAPPINGS_LOG.read_text())
+        assert log[0]["label"]["source"] == "is_fraud"  # normalized from "Is Fraud?"
+        assert any(r["accepted"] for r in log[0]["columns"])
+
+    def test_without_target_terms_the_name_rule_still_applies(self, tmp_path):
+        result = cleaning_agent.run(self._datasets(tmp_path))
+        assert result["datasets_merged"] == 1  # loan first; the others share no column name
+
+    def test_master_is_capped_to_the_row_budget(self, tmp_path):
+        big = self._write(tmp_path, "big", pd.DataFrame({
+            "amt": range(1000), "is_fraud": [1 if i % 10 == 0 else 0 for i in range(1000)]}))
+        with patch.object(cleaning_agent, "MAX_MASTER_ROWS", 100):
+            result = cleaning_agent.run([big], target_terms=["fraud"])
+        master = pd.read_csv(result["master_csv_path"])
+        assert len(master) == 100
+        assert master["is_fraud"].sum() == 10
+        assert result["sampled"]

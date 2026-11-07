@@ -60,9 +60,13 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, KAGGLE_USERNAME, KAGGLE_KEY
+from src import llm
+from src.config import KAGGLE_USERNAME, KAGGLE_KEY
 from src.search import brave_search
 from src.orchestration import dataset_cache
+from src.orchestration.dataset_budget import (
+    MAX_ROWS_PER_DATASET, check_target_fit, find_label_column, read_csv_capped, stratified_cap,
+)
 from src.agents.validation_agent import _check_url_reachable
 
 TARGET_ENTRIES = 10000
@@ -71,11 +75,14 @@ MIN_ENTRIES_TO_CONSIDER = 1  # any real, non-empty download counts -- the
                              # master CSV by the Cleaning Agent, not per
                              # individual dataset here
 MAX_DATASETS = 5
-RESULTS_PER_QUERY = 25
+RESULTS_PER_QUERY = 20  # Brave's maximum (brave_search.BRAVE_MAX_COUNT)
 PAGE_FETCH_TIMEOUT = 15
 PAGE_TEXT_CHAR_LIMIT = 6000
 DOWNLOAD_TIMEOUT = 30
 KAGGLE_DOWNLOAD_TIMEOUT = 90  # Kaggle dataset zips are often large (tens of MB)
+# A download larger than this is skipped before it is read: even capped to
+# MAX_ROWS_PER_DATASET rows, a multi-gigabyte file can stall a local run.
+MAX_DOWNLOAD_BYTES = 3 * 1024 ** 3
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 RAW_DATA_DIR = REPO_ROOT / "data" / "raw"
@@ -148,7 +155,7 @@ def _build_query(dataset_name: str, dataset_source: str) -> str:
 
 
 def _extract_dataset_candidates_from_results(
-    results: list, dataset_name: str, paper_title: str, scope_description: str
+    results: list, dataset_name: str, paper_title: str, scope_description: str, target_terms: list = None
 ) -> list:
     """Use LLM to extract structured dataset candidates from search results,
     including whether each one fits the project's scope."""
@@ -166,12 +173,18 @@ def _extract_dataset_candidates_from_results(
         "No specific dataset name is targeted -- find any dataset relevant to the project scope below."
     )
 
+    target_line = (
+        f"Prediction target: {', '.join(target_terms)} -- a dataset is in scope only if it labels this outcome "
+        "(a dataset on a related topic that predicts something else, e.g. loan default for a fraud project, "
+        "is NOT in scope).\n" if target_terms else ""
+    )
+
     prompt = f"""You are extracting dataset metadata from web search results.
 
 Paper title: "{paper_title}"
 {target_desc}
 Project scope (what the dataset must be relevant to): "{scope_description}"
-
+{target_line}
 Search results:
 {chr(10).join(snippets)}
 
@@ -198,21 +211,7 @@ For each valid dataset page, return a JSON object:
 Return a JSON array of valid dataset candidates, best match first. If none are found, return an empty array [].
 Return ONLY valid JSON. No explanation or markdown."""
 
-    response = requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": DEFAULT_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-
-    content = response.json()["choices"][0]["message"]["content"]
+    content = llm.chat(prompt, timeout=300)
 
     try:
         candidates = json.loads(content)
@@ -260,17 +259,7 @@ Find the number of rows/samples/records/instances/examples in this dataset, ONLY
 Return ONLY valid JSON: {{"entry_count": <integer if explicitly stated, else null>}}"""
 
     try:
-        response = requests.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}]},
-            timeout=60,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        content = llm.chat(prompt, timeout=300)
         match = re.search(r"\{[\s\S]*\}", content)
         data = json.loads(match.group(0)) if match else json.loads(content)
         count = data.get("entry_count")
@@ -357,7 +346,7 @@ def _slugify(candidate: dict) -> str:
     return f"{slug}-{link_hash}" if slug else link_hash
 
 
-def _parse_tabular_content(resp: "requests.Response", url: str) -> "pd.DataFrame | None":
+def _parse_tabular_content(resp: "requests.Response", url: str, target_terms: list = None) -> "pd.DataFrame | None":
     """Sniff a downloaded response and try to read it as tabular data.
     Never raises -- returns None if nothing works. Rejects immediately on
     an HTML content type: a landing page (the single most common failure
@@ -371,7 +360,7 @@ def _parse_tabular_content(resp: "requests.Response", url: str) -> "pd.DataFrame
     content = resp.content
 
     if "zip" in content_type or lower_url.endswith(".zip"):
-        return _parse_zip_for_csv(content)
+        return _parse_zip_for_csv(content, target_terms)
 
     if "json" in content_type or lower_url.endswith((".json", ".jsonl")):
         try:
@@ -386,10 +375,13 @@ def _parse_tabular_content(resp: "requests.Response", url: str) -> "pd.DataFrame
             pass
 
     # Default / fallback: most direct-download dataset links are CSV/TSV
-    # even when the server doesn't set an accurate Content-Type.
+    # even when the server doesn't set an accurate Content-Type. Read in
+    # chunks under the row budget so a huge file is never fully loaded.
     try:
-        df = pd.read_csv(io.BytesIO(content), sep=None, engine="python")
+        df, _info = read_csv_capped(io.BytesIO(content), MAX_ROWS_PER_DATASET, target_terms,
+                                    sep=None, engine="python")
         if df.shape[1] > 0 and df.shape[0] > 0:
+            df.attrs["sampling"] = _info
             return df
     except Exception:
         pass
@@ -397,9 +389,9 @@ def _parse_tabular_content(resp: "requests.Response", url: str) -> "pd.DataFrame
     return None
 
 
-def _parse_zip_for_csv(content: bytes) -> "pd.DataFrame | None":
+def _parse_zip_for_csv(content: bytes, target_terms: list = None) -> "pd.DataFrame | None":
     """Extract the largest CSV member from a downloaded zip (Kaggle-style
-    packaging) and read it. Never raises."""
+    packaging) and read it in chunks under the row budget. Never raises."""
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
             csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
@@ -407,7 +399,9 @@ def _parse_zip_for_csv(content: bytes) -> "pd.DataFrame | None":
                 return None
             largest = max(csv_names, key=lambda n: zf.getinfo(n).file_size)
             with zf.open(largest) as f:
-                return pd.read_csv(f)
+                df, info = read_csv_capped(f, MAX_ROWS_PER_DATASET, target_terms)
+                df.attrs["sampling"] = info
+                return df
     except Exception:
         return None
 
@@ -442,7 +436,7 @@ def _download_huggingface_csv(candidate: dict) -> "pd.DataFrame | None":
         return None
 
 
-def _download_kaggle_dataset(candidate: dict) -> "pd.DataFrame | None":
+def _download_kaggle_dataset(candidate: dict, target_terms: list = None) -> "pd.DataFrame | None":
     """Kaggle blocks plain unauthenticated access behind a reCAPTCHA
     challenge (confirmed repeatedly this session) -- when KAGGLE_USERNAME/
     KAGGLE_KEY are configured, use the classic, long-stable REST endpoint
@@ -480,7 +474,7 @@ def _download_kaggle_dataset(candidate: dict) -> "pd.DataFrame | None":
     except Exception:
         return None
 
-    return _parse_tabular_content(resp, url)
+    return _parse_tabular_content(resp, url, target_terms)
 
 
 def _search_kaggle_datasets(query: str, count: int = RESULTS_PER_QUERY) -> list:
@@ -526,7 +520,14 @@ def _search_kaggle_datasets(query: str, count: int = RESULTS_PER_QUERY) -> list:
     return results
 
 
-def _download_and_convert_to_csv(candidate: dict) -> bool:
+def _too_large(resp) -> bool:
+    try:
+        return int(resp.headers.get("Content-Length", "0")) > MAX_DOWNLOAD_BYTES
+    except (TypeError, ValueError):
+        return False
+
+
+def _download_and_convert_to_csv(candidate: dict, target_terms: list = None) -> bool:
     """Download the candidate's resolved link and convert it to a local
     CSV under data/raw/. Tries the Hugging Face special case first (its
     dataset pages are HTML and would otherwise fail outright), then the
@@ -541,7 +542,7 @@ def _download_and_convert_to_csv(candidate: dict) -> bool:
 
     df = _download_huggingface_csv(candidate)
     if df is None:
-        df = _download_kaggle_dataset(candidate)
+        df = _download_kaggle_dataset(candidate, target_terms)
     if df is None:
         if not url:
             candidate["download_status"] = "failed: no source URL"
@@ -553,7 +554,11 @@ def _download_and_convert_to_csv(candidate: dict) -> bool:
             candidate["download_status"] = f"failed: could not fetch URL ({e})"
             print(f"[Data Agent] Could not download '{label}' from {url}: {e}")
             return False
-        df = _parse_tabular_content(resp, url)
+        if _too_large(resp):
+            candidate["download_status"] = f"failed: larger than the {MAX_DOWNLOAD_BYTES // 1024 ** 3} GB download ceiling"
+            print(f"[Data Agent] '{label}' from {url} exceeds the download ceiling; skipped.")
+            return False
+        df = _parse_tabular_content(resp, url, target_terms)
 
     if df is None or df.empty or df.shape[1] == 0:
         candidate["download_status"] = (
@@ -563,6 +568,14 @@ def _download_and_convert_to_csv(candidate: dict) -> bool:
         print(f"[Data Agent] '{label}' from {url} did not resolve to usable tabular data; skipped.")
         return False
 
+    # CSV/ZIP were already capped while reading; JSON/Parquet arrive whole.
+    sampling = df.attrs.get("sampling")
+    if sampling is None:
+        df, sampling = stratified_cap(df, MAX_ROWS_PER_DATASET, find_label_column(df.head(5000), target_terms))
+    if sampling["sampled"]:
+        print(f"[Data Agent] '{label}': kept a stratified sample of {sampling['sampled_rows']} of "
+              f"{sampling['original_rows']} rows (row budget {MAX_ROWS_PER_DATASET}).")
+
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = RAW_DATA_DIR / f"{_slugify(candidate)}.csv"
     df.to_csv(path, index=False)
@@ -571,6 +584,8 @@ def _download_and_convert_to_csv(candidate: dict) -> bool:
     candidate["download_status"] = "ok"
     candidate["entry_count"] = len(df)
     candidate["entry_count_source"] = "downloaded file"
+    candidate["original_entry_count"] = sampling["original_rows"]
+    candidate["sampled"] = sampling["sampled"]
     return True
 
 
@@ -612,6 +627,43 @@ def _check_reproducibility_fit(candidate: dict, parent_paper: dict) -> tuple[boo
     return True, ""
 
 
+def _dataset_text(candidate: dict) -> str:
+    return " ".join(str(candidate.get(k) or "") for k in ("display_name", "name", "source_url", "notes",
+                                                          "scope_explanation"))
+
+
+def _check_fit(candidate: dict, parent_paper: dict, ctx: dict = None) -> tuple[bool, str]:
+    """Both deterministic fit checks on a downloaded dataset: readable
+    (non-anonymized) columns, and a label for the project's prediction
+    target (dataset_budget.check_target_fit)."""
+    fit, explanation = _check_reproducibility_fit(candidate, parent_paper)
+    if not fit:
+        return fit, explanation
+    target_fit, target_explanation = check_target_fit(
+        candidate["local_csv_path"], (ctx or {}).get("target_terms"), _dataset_text(candidate))
+    candidate["target_fit_notes"] = target_explanation
+    return target_fit, explanation if target_fit else target_explanation
+
+
+def _already_rejected(candidate: dict, ctx: dict = None) -> bool:
+    """A link already downloaded and rejected in this run is not
+    downloaded again (in a live run the same ~150 MB anonymized dataset
+    was fetched and rejected under six different names)."""
+    key = dataset_cache.normalize_dataset_link(candidate.get("source_url") or candidate.get("name", ""))
+    rejected = (ctx or {}).get("rejected_links")
+    if key and rejected is not None and key in rejected:
+        label = candidate.get("display_name") or candidate.get("name", "")
+        print(f"[Data Agent] '{label}' was already rejected this run; not downloading again.")
+        return True
+    return False
+
+
+def _remember_rejection(candidate: dict, ctx: dict = None) -> None:
+    key = dataset_cache.normalize_dataset_link(candidate.get("source_url") or candidate.get("name", ""))
+    if key and ctx is not None and ctx.get("rejected_links") is not None:
+        ctx["rejected_links"].add(key)
+
+
 _VERIFICATION_METHOD_DESCRIPTIONS = {
     "cache_hit": "reused from an earlier search",
     "brave_search": "found via Brave search for the paper's stated dataset name",
@@ -646,7 +698,7 @@ def _describe_provenance(candidate: dict) -> str:
 
 def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
                       scope_description: str, query_builder, parent_paper: dict = None,
-                      top_k: int = 1) -> dict:
+                      top_k: int = 1, ctx: dict = None) -> dict:
     """
     Search, extract, verify, and scope-check candidates for a dataset name,
     checking the cache first. Only a reachable, in-scope, downloadable
@@ -672,7 +724,7 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
 
     try:
         candidates = _extract_dataset_candidates_from_results(
-            results, dataset_name, paper_title, scope_description
+            results, dataset_name, paper_title, scope_description, (ctx or {}).get("target_terms")
         )
     except Exception as e:
         return _default_candidate(display_name=dataset_name, notes=f"Dataset search/extraction failed: {e}")
@@ -689,8 +741,10 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
         c["name"] = c.get("source_url", "")
         if not c.get("in_scope"):
             continue
-        if _download_and_convert_to_csv(c):
-            fit, explanation = _check_reproducibility_fit(c, parent_paper)
+        if _already_rejected(c, ctx):
+            continue
+        if _download_and_convert_to_csv(c, (ctx or {}).get("target_terms")):
+            fit, explanation = _check_fit(c, parent_paper, ctx)
             c["reproducibility_fit"] = fit
             c["reproducibility_notes"] = explanation
             if fit:
@@ -698,6 +752,7 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
                 return c
             label = c.get("display_name") or c.get("name", "")
             print(f"[Data Agent] '{label}' downloaded but rejected: {explanation}")
+            _remember_rejection(c, ctx)
             best_in_scope = c
             continue
         # Reachable and in scope, but couldn't actually be downloaded --
@@ -717,7 +772,8 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
     )
 
 
-def _find_and_verify_dataset_for_paper(paper: dict, scope_description: str, parent_paper: dict = None) -> dict | None:
+def _find_and_verify_dataset_for_paper(paper: dict, scope_description: str, parent_paper: dict = None,
+                                       ctx: dict = None) -> dict | None:
     """Find and verify the dataset a specific paper claims to use. Returns
     None if the paper states no dataset name at all."""
     dataset_name = (paper.get("dataset") or "").strip()
@@ -726,7 +782,7 @@ def _find_and_verify_dataset_for_paper(paper: dict, scope_description: str, pare
     dataset_source = (paper.get("dataset_source") or "").strip()
     return _resolve_dataset(
         dataset_name, dataset_source, paper.get("title", ""), scope_description,
-        query_builder=_build_query, parent_paper=parent_paper, top_k=3,
+        query_builder=_build_query, parent_paper=parent_paper, top_k=3, ctx=ctx,
     )
 
 
@@ -761,21 +817,32 @@ def _usability_score(candidate: dict) -> float:
     return round(score, 2)
 
 
-def _search_exploration_sites(scope_description: str, parent_paper: dict = None) -> list:
+def _search_exploration_sites(scope_description: str, parent_paper: dict = None,
+                              search_query: str = "", ctx: dict = None) -> list:
     """Stage 3: last-resort generic search against curated dataset
-    directories, scored on usability since there's no paper to match."""
+    directories, scored on usability since there's no paper to match.
+
+    search_query (normally the user's project topic) is what's actually
+    sent to Brave/Kaggle; scope_description is only used for the in-scope
+    check. Verified live: sending the full scope description (paper title
+    + 400 chars of abstract) as the query returns zero Kaggle results and
+    only the paper's own pages from Brave, while a short topic query
+    returns relevant datasets. Falls back to the scope description when no
+    short query is given."""
     if not scope_description:
         return []
+    query = search_query.strip() or scope_description
     try:
-        results = brave_search.search_dataset_sites(scope_description, count=RESULTS_PER_QUERY)
+        results = brave_search.search_dataset_sites(query, count=RESULTS_PER_QUERY)
     except Exception:
         results = []
-    results = results + _search_kaggle_datasets(scope_description)
+    results = results + _search_kaggle_datasets(query)
     if not results:
         return []
 
     try:
-        candidates = _extract_dataset_candidates_from_results(results, "", "", scope_description)
+        candidates = _extract_dataset_candidates_from_results(results, "", "", scope_description,
+                                                              (ctx or {}).get("target_terms"))
     except Exception:
         return []
 
@@ -789,13 +856,14 @@ def _search_exploration_sites(scope_description: str, parent_paper: dict = None)
             c["entry_count"] = None
             continue
         c["name"] = c.get("source_url", "")
-        if c.get("in_scope"):
-            if _download_and_convert_to_csv(c):
-                fit, explanation = _check_reproducibility_fit(c, parent_paper)
+        if c.get("in_scope") and not _already_rejected(c, ctx):
+            if _download_and_convert_to_csv(c, (ctx or {}).get("target_terms")):
+                fit, explanation = _check_fit(c, parent_paper, ctx)
                 c["reproducibility_fit"] = fit
                 c["reproducibility_notes"] = explanation
                 if not fit:
                     print(f"[Data Agent] '{c['display_name']}' downloaded but rejected: {explanation}")
+                    _remember_rejection(c, ctx)
             else:
                 _resolve_entry_count(c, c.get("display_name", ""))
         c["usability_score"] = _usability_score(c)
@@ -817,7 +885,8 @@ def _usable(candidate: dict | None, min_entries: int) -> bool:
     )
 
 
-def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTRIES) -> dict:
+def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTRIES,
+        search_query: str = "", target_terms: list = None) -> dict:
     """
     Build a dataset pool of >= target_entries total entries for the Parent
     Paper's replication, escalating through the three stages described in
@@ -828,6 +897,13 @@ def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTR
     target -- e.g. relaying a downstream agent's Slack request for more
     data (see master_agent.check_agent_requests) -- without duplicating
     this whole function.
+
+    search_query is the short query used for stage 3's general search
+    (normally the user's project topic) -- see _search_exploration_sites.
+
+    target_terms (the Intake Agent's prediction-target keywords, e.g.
+    ["fraud"]) drive the target-fit check every accepted dataset must pass
+    -- including cache hits -- and the stratified row budget.
     """
     print(f"\n[Data Agent] Building dataset pool (target: {target_entries} entries)...")
 
@@ -839,13 +915,24 @@ def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTR
     datasets_considered = 0
     warnings = []
     search_stage = "parent_paper"
+    ctx = {"target_terms": target_terms or [], "rejected_links": set()}
 
     def try_add(candidate: dict | None) -> bool:
         nonlocal total_entries
         if not _usable(candidate, MIN_ENTRIES_TO_CONSIDER):
             return False
         link_key = dataset_cache.normalize_dataset_link(candidate["name"])
-        if not link_key or link_key in seen_links:
+        if not link_key or link_key in seen_links or link_key in ctx["rejected_links"]:
+            return False
+        # Applies to every candidate, cache hits included: a cached result
+        # predates this check and may predict something else.
+        target_fit, explanation = check_target_fit(candidate["local_csv_path"], ctx["target_terms"],
+                                                   _dataset_text(candidate))
+        if not target_fit:
+            label = candidate.get("display_name") or candidate["name"]
+            print(f"[Data Agent] '{label}' rejected: {explanation}")
+            warnings.append(f"Rejected '{label}': {explanation}")
+            ctx["rejected_links"].add(link_key)
             return False
         selected_datasets.append(candidate)
         seen_links.add(link_key)
@@ -860,7 +947,7 @@ def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTR
     # --- Stage 1: Parent Paper's own dataset ---
     parent_candidate = None
     if parent_paper:
-        parent_candidate = _find_and_verify_dataset_for_paper(parent_paper, scope_description, parent_paper)
+        parent_candidate = _find_and_verify_dataset_for_paper(parent_paper, scope_description, parent_paper, ctx)
         datasets_considered += 1
 
     if parent_candidate is None:
@@ -880,7 +967,7 @@ def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTR
         if len(selected_datasets) >= MAX_DATASETS:
             break
         datasets_considered += 1
-        try_add(_find_and_verify_dataset_for_paper(paper, scope_description, parent_paper))
+        try_add(_find_and_verify_dataset_for_paper(paper, scope_description, parent_paper, ctx))
 
     if selected_datasets:
         search_stage = "paper_traversal"
@@ -897,7 +984,7 @@ def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTR
         print(f"[Data Agent] Candidate papers' own datasets left the entry target unmet "
               f"({total_entries}/{target_entries}); searching generally for datasets "
               "relevant to the project scope to fill the gap...")
-        for candidate in _search_exploration_sites(scope_description, parent_paper):
+        for candidate in _search_exploration_sites(scope_description, parent_paper, search_query, ctx):
             if len(selected_datasets) >= MAX_DATASETS:
                 break
             try_add(candidate)

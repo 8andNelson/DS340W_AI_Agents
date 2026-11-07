@@ -34,7 +34,6 @@ Comparing reproduced metrics against the paper's published results is
 the Evaluation Agent's job, not this one's -- this agent's job ends at
 "did the baseline execute and produce output."
 """
-import json
 import os
 import platform
 import re
@@ -44,9 +43,10 @@ import sys
 import time
 from pathlib import Path
 
-import requests
+import pandas as pd
 
-from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL
+from src import llm
+from src.agents.evaluation_agent import METRIC_LINE_FORMAT, parse_metric_lines
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 REPLICATION_DIR = REPO_ROOT / "replication"
@@ -56,7 +56,13 @@ VENV_TIMEOUT_SECONDS = 120
 INSTALL_TIMEOUT_SECONDS = 600
 REPLICATION_TIMEOUT_SECONDS = 1800
 README_CHAR_LIMIT = 6000
-MAX_REPAIR_ATTEMPTS = 2
+# Free-model scripts often need more than one fix (an import, then a
+# column name, then a dtype), so a reconstruction gets 3 repairs.
+MAX_REPAIR_ATTEMPTS = 4
+GENERATION_TIMEOUT_SECONDS = 600
+PROFILE_SAMPLE_ROWS = 2000
+PROFILE_MAX_COLUMNS = 60
+STDERR_FEEDBACK_CHARS = 3000
 
 ENTRY_POINT_CANDIDATES = ("train.py", "main.py", "run.py", "run_experiment.py")
 README_FILENAMES = ("README.md", "README.rst", "README.txt", "readme.md")
@@ -66,6 +72,22 @@ README_FILENAMES = ("README.md", "README.rst", "README.txt", "readme.md")
 # anything outside this fixed set is dropped rather than installed.
 DEPENDENCY_ALLOWLIST = {
     "scikit-learn", "pandas", "numpy", "xgboost", "lightgbm", "catboost", "torch", "tensorflow", "matplotlib",
+    "imbalanced-learn",
+}
+# Every reconstructed script reads CSVs and computes metrics, so these are
+# installed whether or not the generated script lists them.
+BASE_LIBRARIES = ("numpy", "pandas", "scikit-learn")
+
+# A reconstructed script reads its data paths from these environment
+# variables rather than from hardcoded literals, so the Experiment Agent
+# can point the same script at a re-split dataset deterministically. (A
+# hardcoded Windows path can come back escaped, raw, or with forward
+# slashes, and a text substitution that silently misses would run the
+# "experiment" on the baseline's own split.)
+DATA_ENV_VARS = {
+    "TRAIN_CSV": "train_csv_path",
+    "TEST_CSV": "test_csv_path",
+    "VALIDATION_CSV": "validation_csv_path",
 }
 
 _RESULT_DEFAULTS = {
@@ -108,15 +130,27 @@ def _venv_pip(venv_dir: Path) -> Path:
     return venv_dir / ("Scripts/pip.exe" if os.name == "nt" else "bin/pip")
 
 
-def _run_bounded(cmd: list, cwd: Path = None, timeout: int = REPLICATION_TIMEOUT_SECONDS) -> dict:
+def data_env(split: dict) -> dict:
+    """Environment variables pointing a reconstructed script at a split's
+    CSVs -- see DATA_ENV_VARS."""
+    return {var: str((split or {}).get(key, "")) for var, key in DATA_ENV_VARS.items() if (split or {}).get(key)}
+
+
+def _run_bounded(cmd: list, cwd: Path = None, timeout: int = REPLICATION_TIMEOUT_SECONDS, env: dict = None) -> dict:
     """Run cmd (always an argv list, never a shell string) with a bounded
     timeout, capturing output. Never raises -- every outcome (success,
     non-zero exit, timeout, or a launch failure) comes back as the same
-    dict shape so callers don't need a try/except of their own."""
+    dict shape so callers don't need a try/except of their own.
+
+    The child runs in UTF-8 mode: on Windows a piped child otherwise
+    encodes stdout as cp1252 and crashes on the first non-ASCII character
+    a generated script prints."""
     start = time.monotonic()
+    child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", **(env or {})}
     try:
         proc = subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace", env=child_env,
         )
         return {
             "exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr,
@@ -124,7 +158,7 @@ def _run_bounded(cmd: list, cwd: Path = None, timeout: int = REPLICATION_TIMEOUT
         }
     except subprocess.TimeoutExpired as e:
         return {
-            "exit_code": None, "stdout": e.stdout or "", "stderr": e.stderr or "",
+            "exit_code": None, "stdout": _as_text(e.stdout), "stderr": _as_text(e.stderr),
             "duration_seconds": time.monotonic() - start, "timed_out": True,
         }
     except Exception as e:
@@ -132,6 +166,13 @@ def _run_bounded(cmd: list, cwd: Path = None, timeout: int = REPLICATION_TIMEOUT
             "exit_code": None, "stdout": "", "stderr": str(e),
             "duration_seconds": time.monotonic() - start, "timed_out": False,
         }
+
+
+def _as_text(output) -> str:
+    # TimeoutExpired carries bytes even when text mode was requested.
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output or ""
 
 
 def _clone_repo(repo_url: str, dest: Path) -> dict:
@@ -206,23 +247,11 @@ or, if no run command is documented:
 Return ONLY valid JSON. No explanation or markdown."""
 
     try:
-        response = requests.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}]},
-            timeout=60,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS)
     except Exception:
         return []
 
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", content)
-        data = json.loads(match.group(0)) if match else {}
-
+    data = llm.parse_json(content, default={})
     command = data.get("command") if isinstance(data, dict) else None
     return command if isinstance(command, list) and command else []
 
@@ -254,8 +283,8 @@ def _wire_dataset_into_repo(repo_dir: Path, cleaning_result: dict) -> list:
 def _save_run_output(slug_dir: Path, run_result: dict) -> tuple:
     stdout_path = slug_dir / "run_stdout.txt"
     stderr_path = slug_dir / "run_stderr.txt"
-    stdout_path.write_text(run_result.get("stdout", "") or "")
-    stderr_path.write_text(run_result.get("stderr", "") or "")
+    stdout_path.write_text(run_result.get("stdout", "") or "", encoding="utf-8")
+    stderr_path.write_text(run_result.get("stderr", "") or "", encoding="utf-8")
     return str(stdout_path), str(stderr_path)
 
 
@@ -267,7 +296,7 @@ def _write_environment_doc(slug_dir: Path, details: dict) -> None:
     ]
     for key, value in details.items():
         lines.append(f"{key}: {value}")
-    (slug_dir / "ENVIRONMENT.md").write_text("\n".join(lines))
+    (slug_dir / "ENVIRONMENT.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _write_notes_doc(recon_dir: Path, inferred_assumptions: list) -> None:
@@ -278,7 +307,7 @@ def _write_notes_doc(recon_dir: Path, inferred_assumptions: list) -> None:
         "original implementation. Every detail not explicitly stated by the paper:",
     ]
     lines.extend(f"- {a}" for a in inferred_assumptions)
-    (recon_dir / "RECONSTRUCTION_NOTES.md").write_text("\n".join(lines))
+    (recon_dir / "RECONSTRUCTION_NOTES.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_result: dict) -> dict:
@@ -321,7 +350,7 @@ def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_re
 
     install_result = _pip_install(venv_dir, repo_dir, install_args)
     pip_freeze_path = slug_dir / "pip_freeze.txt"
-    pip_freeze_path.write_text(_pip_freeze(venv_dir))
+    pip_freeze_path.write_text(_pip_freeze(venv_dir), encoding="utf-8")
     if install_result["exit_code"] != 0:
         return _default_result(
             status="BLOCKED", source="cloned_repository", repo_url=repo_url, commit_sha=clone["commit_sha"],
@@ -388,103 +417,186 @@ def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_re
     )
 
 
-def _generate_baseline_script(parent_paper: dict, cleaning_result: dict) -> dict:
+def _dataset_profile(cleaning_result: dict) -> str:
+    """Plain-text description of the training CSV's actual schema (column
+    names, dtypes, example values, split sizes) for the generation and
+    repair prompts. Without it the LLM has to guess column names -- the
+    label column above all -- and the first run fails on a KeyError."""
+    cleaning_result = cleaning_result or {}
+    train_path = cleaning_result.get("train_csv_path", "")
+    if not train_path or not Path(train_path).is_file():
+        return "(The training CSV is not available to describe.)"
+    try:
+        sample = pd.read_csv(train_path, nrows=PROFILE_SAMPLE_ROWS, low_memory=False)
+    except Exception as e:
+        return f"(The training CSV could not be read: {e})"
+
+    split_rows = cleaning_result.get("split_rows") or {}
+    lines = [
+        f"Rows: train={split_rows.get('train', 'unknown')}, test={split_rows.get('test', 'unknown')}, "
+        f"validation={split_rows.get('validation', 'unknown')}",
+        f"Columns ({len(sample.columns)}), profiled from the first {len(sample)} training rows:",
+    ]
+    for column in sample.columns[:PROFILE_MAX_COLUMNS]:
+        series = sample[column]
+        examples = ", ".join(repr(v)[:40] for v in series.dropna().unique()[:3])
+        lines.append(f"  - {column} (dtype {series.dtype}, {series.nunique()} distinct): {examples}")
+    if len(sample.columns) > PROFILE_MAX_COLUMNS:
+        lines.append(f"  ... and {len(sample.columns) - PROFILE_MAX_COLUMNS} more columns")
+
+    binary = [c for c in sample.columns if sample[c].dropna().nunique() == 2]
+    if binary:
+        lines.append(f"Two-valued columns (candidate labels): {', '.join(binary)}")
+    lines.append("'_source_dataset' is a provenance column added by this project's Cleaning Agent -- "
+                 "it must never be used as a feature.")
+    return "\n".join(lines)
+
+
+_SCRIPT_REQUIREMENTS = """Requirements for the script:
+- Read the data ONLY from these environment variables (already cleaned and split -- do not re-split):
+  train = pd.read_csv(os.environ["TRAIN_CSV"]); test = pd.read_csv(os.environ["TEST_CSV"]).
+  os.environ["VALIDATION_CSV"] is also available if the method needs a validation set.
+- Choose the prediction target from the schema above (the column that is the paper's prediction target).
+- Remove from the features: the target, '_source_dataset', and identifier-like columns (row ids,
+  unique per row, names, free text). Encode categorical columns and handle missing values.
+- Fit on train, evaluate on test. Use random_state=42 everywhere randomness exists.
+- It must finish in under 20 minutes on a CPU-only laptop. If the method cannot train on the full
+  training set in that time, train on a stratified subsample and say so with an "# INFERRED:"
+  comment and a printed line starting "NOTE:".
+- Print each final test-set metric on its own line in exactly this form: {metric_format}
+  with the value as a fraction between 0 and 1, e.g. "METRIC accuracy=0.9871".
+  Print at least accuracy, precision, recall and f1 (for the positive class), plus roc_auc when the
+  model gives scores. Use exactly these lower-case names.
+- Mark every detail NOT explicitly stated by the paper (hyperparameters, preprocessing choices, etc.)
+  with an inline comment starting "# INFERRED:", since this is a reconstruction, not the authors' code.
+- Import only these libraries (plus the Python standard library): {libraries}."""
+
+
+def _script_requirements() -> str:
+    return _SCRIPT_REQUIREMENTS.format(
+        metric_format=METRIC_LINE_FORMAT, libraries=", ".join(sorted(DEPENDENCY_ALLOWLIST)),
+    )
+
+
+def _generate_baseline_script(parent_paper: dict, cleaning_result: dict, dataset_profile: str = "") -> dict:
     """One LLM call asking for a self-contained baseline script
     reconstructed purely from the paper's own stored text, since no
     implementation could be located. Returns {} on any failure."""
     prompt = f"""You are reconstructing a baseline machine learning implementation purely from an academic paper's own text, because no public code implementation could be found.
 
 Paper title: "{parent_paper.get('title', '')}"
-Abstract: "{parent_paper.get('abstract', '') or ''}"
+Abstract: "{parent_paper.get('official_abstract') or parent_paper.get('abstract', '') or ''}"
 Methodology: "{parent_paper.get('methodology', '') or ''}"
 Results summary: "{parent_paper.get('results_summary', '') or ''}"
 Dataset the paper describes: "{parent_paper.get('dataset', '') or ''}"
 
-Write a single, self-contained Python training script that:
-- Reads the training data from "{cleaning_result.get('train_csv_path', 'train.csv')}" and the test data from "{cleaning_result.get('test_csv_path', 'test.csv')}" (both already split -- do not re-split).
-- Implements the method described above as closely as the paper's own text allows.
-- Prints its evaluation metrics (accuracy, precision, recall, F1 at minimum) to stdout in a clearly labeled format.
-- Marks every detail NOT explicitly stated by the paper (hyperparameters, preprocessing choices, etc.) with an inline comment starting "# INFERRED:", since this is a reconstruction, not the authors' own code.
-- Uses only well-established libraries (e.g. scikit-learn, pandas, numpy, xgboost, lightgbm, catboost, torch, tensorflow).
+The data this reconstruction runs on:
+{dataset_profile or _dataset_profile(cleaning_result)}
 
-Return ONLY a JSON object of this exact shape, no markdown:
-{{
-  "code": "<the full Python script as a single string, with \\n for newlines>",
-  "inferred_assumptions": ["<one sentence per inferred detail>"],
-  "libraries_required": ["<pip package name>"]
-}}"""
+Write a single, self-contained Python training script that implements the method described above as closely as the paper's own text allows.
+
+{_script_requirements()}
+
+Respond with exactly two fenced blocks and nothing else. First, a JSON block:
+```json
+{{"inferred_assumptions": ["<one sentence per inferred detail>"], "libraries_required": ["<pip package name>"]}}
+```
+Then the full script:
+```python
+<the script>
+```"""
 
     try:
-        response = requests.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}]},
-            timeout=90,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-    except Exception:
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high")
+    except Exception as e:
+        print(f"[Replication Agent] Script generation call failed: {e}")
         return {}
 
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", content)
-        data = json.loads(match.group(0)) if match else {}
+    code = llm.parse_code(content)
+    if not code:
+        return {}
+    meta = llm.parse_json(content, default={})
+    meta = meta if isinstance(meta, dict) else {}
+    assumptions = meta.get("inferred_assumptions") or []
+    libraries = meta.get("libraries_required") or []
+    return {
+        "code": code,
+        "inferred_assumptions": [str(a) for a in assumptions] if isinstance(assumptions, list) else [],
+        "libraries_required": [str(l) for l in libraries] if isinstance(libraries, list) else [],
+    }
 
-    return data if isinstance(data, dict) and data.get("code") else {}
 
-
-def _repair_generated_script(code: str, stderr: str, parent_paper: dict) -> str:
+def _repair_generated_script(code: str, stderr: str, parent_paper: dict, stdout: str = "",
+                             dataset_profile: str = "", installed_libraries: list = None) -> str:
     """One LLM call feeding back the failure, asking for a fixed script.
     Returns "" if no fix could be parsed out."""
-    prompt = f"""The following Python script failed when executed.
+    prompt = f"""The following Python script, a reconstruction of an academic paper's method, did not complete successfully.
 
 Paper title: "{parent_paper.get('title', '')}"
 
+The data it runs on:
+{dataset_profile or "(not available)"}
+
+Libraries installed in its environment: {", ".join(installed_libraries or []) or "unknown"}
+
 Script:
+```python
 {code}
+```
 
-Error output:
-{stderr[-3000:]}
+Error output (stderr, last part):
+{(stderr or "(empty)")[-STDERR_FEEDBACK_CHARS:]}
 
-Fix the script so it runs successfully, keeping the same approach and inline "# INFERRED:" comments. Return ONLY a JSON object:
-{{"code": "<the full fixed Python script as a single string, with \\n for newlines>"}}"""
+Standard output (last part):
+{(stdout or "(empty)")[-1500:]}
+
+Fix the script so it runs successfully and meets every requirement below, keeping the same method and the inline "# INFERRED:" comments.
+
+{_script_requirements()}
+
+Respond with the full fixed script in one fenced block and nothing else:
+```python
+<the fixed script>
+```"""
 
     try:
-        response = requests.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}]},
-            timeout=90,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-    except Exception:
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high")
+    except Exception as e:
+        print(f"[Replication Agent] Repair call failed: {e}")
         return ""
+    return llm.parse_code(content)
 
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", content)
-        data = json.loads(match.group(0)) if match else {}
 
-    fixed = data.get("code") if isinstance(data, dict) else None
-    return fixed if isinstance(fixed, str) and fixed.strip() else ""
+def _install_libraries(venv_dir: Path, cwd: Path, libraries: list) -> tuple:
+    """Install libraries into the venv: all at once, and on failure one at
+    a time so one unavailable package (e.g. no wheel for this Python
+    version) doesn't leave the environment empty. Returns
+    (installed, failed)."""
+    if not libraries:
+        return [], []
+    if _pip_install(venv_dir, cwd, ["install", *libraries])["exit_code"] == 0:
+        return list(libraries), []
+    installed, failed = [], []
+    for library in libraries:
+        ok = _pip_install(venv_dir, cwd, ["install", library])["exit_code"] == 0
+        (installed if ok else failed).append(library)
+    return installed, failed
 
 
 def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> dict:
     paper_title = (parent_paper or {}).get("title", "")
     slug_dir = REPLICATION_DIR / _slugify(paper_title or "reconstructed")
     recon_dir = slug_dir / "reconstructed"
+    attempts_dir = recon_dir / "attempts"
     venv_dir = slug_dir / "venv"
-    recon_dir.mkdir(parents=True, exist_ok=True)
+    attempts_dir.mkdir(parents=True, exist_ok=True)
     warnings = []
 
     print(f"\n[Replication Agent] No implementation found; reconstructing a baseline from the paper "
           f"for '{paper_title}'...")
 
-    generated = _generate_baseline_script(parent_paper, cleaning_result)
+    dataset_profile = _dataset_profile(cleaning_result)
+    generated = _generate_baseline_script(parent_paper, cleaning_result, dataset_profile)
     if not generated:
         return _default_result(
             status="BLOCKED", source="reconstructed", replication_dir=str(slug_dir),
@@ -493,10 +605,10 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
         )
 
     requested_libs = set(generated.get("libraries_required") or [])
-    allowed_libs = sorted(requested_libs & DEPENDENCY_ALLOWLIST)
     rejected_libs = sorted(requested_libs - DEPENDENCY_ALLOWLIST)
     if rejected_libs:
         warnings.append(f"Dropped non-allowlisted libraries requested by the generated script: {', '.join(rejected_libs)}.")
+    libraries = sorted((requested_libs & DEPENDENCY_ALLOWLIST) | set(BASE_LIBRARIES))
 
     venv_result = _create_venv(venv_dir)
     if venv_result["exit_code"] != 0:
@@ -507,30 +619,48 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
             notes="Could not create an isolated environment for the reconstructed script.",
         )
 
-    if allowed_libs:
-        install_result = _pip_install(venv_dir, recon_dir, ["install", *allowed_libs])
-        if install_result["exit_code"] != 0:
-            warnings.append(f"Dependency installation reported errors: {(install_result['stderr'] or '')[-2000:]}")
+    print(f"[Replication Agent] Installing {', '.join(libraries)} into {venv_dir}...")
+    installed_libs, failed_libs = _install_libraries(venv_dir, recon_dir, libraries)
+    if failed_libs:
+        warnings.append(f"Could not install: {', '.join(failed_libs)}.")
 
     pip_freeze_path = slug_dir / "pip_freeze.txt"
-    pip_freeze_path.write_text(_pip_freeze(venv_dir))
+    pip_freeze_path.write_text(_pip_freeze(venv_dir), encoding="utf-8")
 
     script_path = recon_dir / "train.py"
     command = [str(_venv_python(venv_dir)), str(script_path)]
+    env = data_env(cleaning_result)
     code = generated["code"]
     attempts = 0
     run_result = None
+    metrics = {}
 
     for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
-        script_path.write_text(code)
         attempts = attempt
+        script_path.write_text(code, encoding="utf-8")
+        # Every attempt is kept, so the changes needed to make the
+        # reconstruction run are on record (CLAUDE.md: record changes
+        # required to make the implementation run).
+        (attempts_dir / f"attempt_{attempt}.py").write_text(code, encoding="utf-8")
         print(f"[Replication Agent] Running reconstructed script (attempt {attempt}/{MAX_REPAIR_ATTEMPTS})...")
-        run_result = _run_bounded(command, cwd=recon_dir, timeout=REPLICATION_TIMEOUT_SECONDS)
-        if run_result["timed_out"] or run_result["exit_code"] == 0:
+        run_result = _run_bounded(command, cwd=recon_dir, timeout=REPLICATION_TIMEOUT_SECONDS, env=env)
+        (attempts_dir / f"attempt_{attempt}_stderr.txt").write_text(run_result.get("stderr") or "", encoding="utf-8")
+        metrics = parse_metric_lines(run_result.get("stdout", ""))
+        if run_result["timed_out"] or (run_result["exit_code"] == 0 and metrics):
             break
+        if run_result["exit_code"] == 0:
+            stderr_feedback = (f"The script exited successfully but printed no lines in the required "
+                               f"'{METRIC_LINE_FORMAT}' form.\n{run_result.get('stderr') or ''}")
+        else:
+            stderr_feedback = run_result.get("stderr") or ""
+        print(f"[Replication Agent] Attempt {attempt} failed: {stderr_feedback.strip().splitlines()[-1:] or ['(no output)']}")
         if attempt < MAX_REPAIR_ATTEMPTS:
-            repaired = _repair_generated_script(code, run_result["stderr"] or "", parent_paper)
+            repaired = _repair_generated_script(
+                code, stderr_feedback, parent_paper, stdout=run_result.get("stdout", ""),
+                dataset_profile=dataset_profile, installed_libraries=installed_libs,
+            )
             if not repaired:
+                warnings.append(f"Repair call after attempt {attempt} returned no script.")
                 break
             code = repaired
 
@@ -538,18 +668,24 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
     stdout_path, stderr_path = _save_run_output(slug_dir, run_result)
     _write_environment_doc(slug_dir, {
         "Source": "reconstructed", "Entry point": "train.py", "Command": " ".join(command),
-        "Libraries installed": ", ".join(allowed_libs) or "none",
+        "Data environment": ", ".join(f"{k}={v}" for k, v in env.items()) or "none",
+        "Libraries installed": ", ".join(installed_libs) or "none",
     })
 
     if run_result["timed_out"]:
         status = "TIMEOUT"
-    elif run_result["exit_code"] == 0:
+    elif run_result["exit_code"] == 0 and metrics:
         status = "OK"
     else:
         status = "BLOCKED"
-        warnings.append(f"Reconstructed script still failing after {attempts} attempt(s).")
+        if run_result["exit_code"] == 0:
+            warnings.append(f"Reconstructed script ran but printed no '{METRIC_LINE_FORMAT}' lines "
+                            f"after {attempts} attempt(s).")
+        else:
+            warnings.append(f"Reconstructed script still failing after {attempts} attempt(s).")
 
-    print(f"[Replication Agent] Done. status={status}, exit_code={run_result['exit_code']}.")
+    print(f"[Replication Agent] Done. status={status}, exit_code={run_result['exit_code']}, "
+          f"metrics={metrics or 'none'}.")
 
     return _default_result(
         status=status, source="reconstructed", replication_dir=str(slug_dir),
@@ -568,6 +704,13 @@ def run(parent_paper: dict, code_discovery_result: dict, cleaning_result: dict) 
     text. Every branch returns the same fully-populated result shape.
     """
     code_discovery_result = code_discovery_result or {}
+    cleaning_result = cleaning_result or {}
     if code_discovery_result.get("status") == "FOUND" and code_discovery_result.get("repository"):
-        return _replicate_from_repository(parent_paper, code_discovery_result["repository"], cleaning_result or {})
-    return _replicate_by_reconstruction(parent_paper, cleaning_result or {})
+        result = _replicate_from_repository(parent_paper, code_discovery_result["repository"], cleaning_result)
+    else:
+        result = _replicate_by_reconstruction(parent_paper, cleaning_result)
+    result["dataset_sampled"] = bool(cleaning_result.get("sampled"))
+    result["dataset_semantic_mappings"] = sum(
+        1 for m in cleaning_result.get("column_mappings", []) for c in m.get("columns", []) if c.get("accepted")
+    )
+    return result
