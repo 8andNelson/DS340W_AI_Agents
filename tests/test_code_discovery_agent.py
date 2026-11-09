@@ -3,7 +3,7 @@ from unittest.mock import patch, MagicMock
 
 from src.agents import code_discovery_agent
 from src.orchestration import code_discovery_cache
-from src.search import brave_search
+from src.search import web_search
 
 
 def make_paper(**overrides) -> dict:
@@ -54,7 +54,7 @@ class TestPaperStatedCodeUrl(CodeDiscoveryAgentTestCase):
         with patch("requests.post", return_value=response), \
              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(True, 200)), \
              patch.object(code_discovery_agent, "_enrich_github_repo") as enrich_mock, \
-             patch.object(brave_search, "search_code_sites") as search_mock:
+             patch.object(web_search, "search_code_sites") as search_mock:
             result = code_discovery_agent.run(paper)
 
         search_mock.assert_not_called()  # a verified, reachable stated URL short-circuits the search stages
@@ -74,7 +74,7 @@ class TestPaperStatedCodeUrl(CodeDiscoveryAgentTestCase):
 
         with patch("requests.post", side_effect=[stated_response, search_response]), \
              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(True, 200)), \
-             patch.object(brave_search, "search_code_sites", return_value=[]) as search_mock:
+             patch.object(web_search, "search_code_sites", return_value=[]) as search_mock:
             result = code_discovery_agent.run(paper)
 
         search_mock.assert_called_once()
@@ -86,7 +86,7 @@ class TestPaperStatedCodeUrl(CodeDiscoveryAgentTestCase):
         search_response = llm_response("[]")
 
         with patch("requests.post", return_value=search_response), \
-             patch.object(brave_search, "search_code_sites", return_value=[]) as search_mock:
+             patch.object(web_search, "search_code_sites", return_value=[]) as search_mock:
             result = code_discovery_agent.run(paper)
 
         search_mock.assert_called_once()
@@ -113,7 +113,7 @@ class TestGithubSearchAndVerification(CodeDiscoveryAgentTestCase):
         ])
 
         with patch("requests.post", return_value=response), \
-             patch.object(brave_search, "search_code_sites", return_value=search_results), \
+             patch.object(web_search, "search_code_sites", return_value=search_results), \
              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(True, 200)), \
              patch("requests.get", side_effect=[repo_info, contents]):
             result = code_discovery_agent.run(paper)
@@ -137,7 +137,7 @@ class TestGithubSearchAndVerification(CodeDiscoveryAgentTestCase):
         )
 
         with patch("requests.post", return_value=response), \
-             patch.object(brave_search, "search_code_sites", return_value=search_results), \
+             patch.object(web_search, "search_code_sites", return_value=search_results), \
              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(False, 0)):
             result = code_discovery_agent.run(paper)
 
@@ -162,7 +162,7 @@ class TestGithubSearchAndVerification(CodeDiscoveryAgentTestCase):
             return {"license": "", "stars": stars, "default_branch": "main"}
 
         with patch("requests.post", return_value=response), \
-             patch.object(brave_search, "search_code_sites", return_value=search_results), \
+             patch.object(web_search, "search_code_sites", return_value=search_results), \
              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(True, 200)), \
              patch.object(code_discovery_agent, "_fetch_github_metadata", side_effect=fake_metadata), \
              patch.object(code_discovery_agent, "_fetch_github_contents_listing", return_value=[]):
@@ -182,7 +182,7 @@ class TestGithubSearchAndVerification(CodeDiscoveryAgentTestCase):
         )
 
         with patch("requests.post", return_value=response), \
-             patch.object(brave_search, "search_code_sites", return_value=search_results), \
+             patch.object(web_search, "search_code_sites", return_value=search_results), \
              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(True, 200)), \
              patch.object(code_discovery_agent, "_fetch_github_metadata", return_value={}), \
              patch.object(code_discovery_agent, "_fetch_github_contents_listing", return_value=[]):
@@ -200,7 +200,7 @@ class TestGithubSearchAndVerification(CodeDiscoveryAgentTestCase):
         )
 
         with patch("requests.post", return_value=response), \
-             patch.object(brave_search, "search_code_sites", return_value=search_results), \
+             patch.object(web_search, "search_code_sites", return_value=search_results), \
              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(True, 200)):
             result = code_discovery_agent.run(paper)
 
@@ -285,7 +285,7 @@ class TestCaching(CodeDiscoveryAgentTestCase):
             matches_parent_paper=True, reachable=True,
         )
         with patch.object(code_discovery_cache, "get_cached_repo", return_value=cached_repo), \
-             patch.object(brave_search, "search_code_sites") as search_mock, \
+             patch.object(web_search, "search_code_sites") as search_mock, \
              patch("requests.post") as post_mock:
             result = code_discovery_agent.run(make_paper())
 
@@ -304,7 +304,7 @@ class TestCaching(CodeDiscoveryAgentTestCase):
         )
 
         with patch("requests.post", return_value=response), \
-             patch.object(brave_search, "search_code_sites", return_value=search_results), \
+             patch.object(web_search, "search_code_sites", return_value=search_results), \
              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(True, 200)), \
              patch.object(code_discovery_agent, "_fetch_github_metadata", return_value={}), \
              patch.object(code_discovery_agent, "_fetch_github_contents_listing", return_value=[]), \
@@ -319,7 +319,7 @@ class TestCaching(CodeDiscoveryAgentTestCase):
         response = llm_response("[]")
 
         with patch("requests.post", return_value=response), \
-             patch.object(brave_search, "search_code_sites", return_value=[]), \
+             patch.object(web_search, "search_code_sites", return_value=[]), \
              patch.object(code_discovery_cache, "cache_repo") as cache_mock:
             code_discovery_agent.run(paper)
 
@@ -330,7 +330,7 @@ class TestNotFoundNeverBlocks(CodeDiscoveryAgentTestCase):
     def test_not_found_returns_clean_fully_populated_dict(self):
         paper = make_paper(code_url="")
 
-        with patch.object(brave_search, "search_code_sites", return_value=[]):
+        with patch.object(web_search, "search_code_sites", return_value=[]):
             result = code_discovery_agent.run(paper)
 
         self.assertEqual(result["status"], "NOT_FOUND")
@@ -343,7 +343,7 @@ class TestNotFoundNeverBlocks(CodeDiscoveryAgentTestCase):
     def test_search_exception_does_not_raise(self):
         paper = make_paper(code_url="")
 
-        with patch.object(brave_search, "search_code_sites", side_effect=RuntimeError("search provider down")):
+        with patch.object(web_search, "search_code_sites", side_effect=RuntimeError("search provider down")):
             result = code_discovery_agent.run(paper)
 
         self.assertEqual(result["status"], "NOT_FOUND")

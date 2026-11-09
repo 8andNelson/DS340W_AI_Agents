@@ -1,456 +1,135 @@
-import tempfile
-import unittest
+"""The Experiment Agent as an expert data scientist: it reads the gap and
+the Evaluation Agent's findings and returns ONE checked rerun request (or
+"stop") for Master Agent. It never runs code itself."""
+import json
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-
-import pandas as pd
+from unittest.mock import patch
 
 from src.agents import experiment_agent
 
+PAPER = {"title": "Fraud Detection With XGBoost", "official_abstract": "XGBoost reached an accuracy of 99.2%.",
+         "results_summary": "accuracy 99.2%"}
 
-def make_paper(**overrides) -> dict:
-    paper = {
-        "title": "Big Data-Driven Distributed ML for Fraud Detection",
-        "methodology": "Uses Logistic Regression, Decision Trees, Random Forests, XGBoost, and CatBoost.",
-    }
-    paper.update(overrides)
-    return paper
-
-
-def make_replication_result(**overrides) -> dict:
-    result = {
-        "status": "OK", "source": "cloned_repository", "entry_point": "train.py",
-        "command": ["C:/venv/Scripts/python.exe", "train.py"], "inferred_assumptions": [],
-    }
-    result.update(overrides)
-    return result
-
-
-def make_evaluation_result(**overrides) -> dict:
-    result = {
-        "metrics": [
-            {"metric": "accuracy", "published_value": 94.2, "reproduced_value": 92.0, "classification": "APPROXIMATE"},
-        ],
-    }
-    result.update(overrides)
-    return result
-
-
-def make_cleaning_result(**overrides) -> dict:
-    result = {
-        "master_csv_path": "data/processed/master_dataset.csv",
-        "train_csv_path": "data/processed/train.csv",
-        "test_csv_path": "data/processed/test.csv",
-        "validation_csv_path": "data/processed/validation.csv",
-    }
-    result.update(overrides)
-    return result
-
-
-def run_result(exit_code=0, stdout="", stderr="", timed_out=False, duration_seconds=1.0) -> dict:
-    return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr,
-            "duration_seconds": duration_seconds, "timed_out": timed_out}
-
-
-def llm_response(content: str) -> MagicMock:
-    response = MagicMock()
-    response.json.return_value = {"choices": [{"message": {"content": content}}]}
-    response.raise_for_status = lambda: None
-    return response
-
-
-class ExperimentAgentTestCase(unittest.TestCase):
-    def setUp(self):
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self._replication_dir_patch = patch.object(experiment_agent, "REPLICATION_DIR", Path(self._tmpdir.name) / "replication")
-        self._experiments_dir_patch = patch.object(experiment_agent, "EXPERIMENTS_DIR", Path(self._tmpdir.name) / "experiments")
-        self._replication_dir_patch.start()
-        self._experiments_dir_patch.start()
-
-    def tearDown(self):
-        self._replication_dir_patch.stop()
-        self._experiments_dir_patch.stop()
-        self._tmpdir.cleanup()
-
-
-class TestNextCategory(unittest.TestCase):
-    def test_reconstructed_picks_first_untried_code_level_category(self):
-        category = experiment_agent._next_category("reconstructed", [])
-        self.assertEqual(category, experiment_agent.CODE_LEVEL_CATEGORIES[0])
-
-    def test_reconstructed_skips_already_tried_categories_in_order(self):
-        previous = [{"category": experiment_agent.CODE_LEVEL_CATEGORIES[0]}]
-        category = experiment_agent._next_category("reconstructed", previous)
-        self.assertEqual(category, experiment_agent.CODE_LEVEL_CATEGORIES[1])
-
-    def test_reconstructed_falls_back_to_dataset_split_after_all_code_level_tried(self):
-        previous = [{"category": c} for c in experiment_agent.CODE_LEVEL_CATEGORIES]
-        category = experiment_agent._next_category("reconstructed", previous)
-        self.assertEqual(category, experiment_agent.DATASET_SPLIT_CATEGORY)
-
-    def test_reconstructed_returns_empty_when_everything_exhausted(self):
-        previous = [{"category": c} for c in experiment_agent.CODE_LEVEL_CATEGORIES]
-        previous.append({"category": experiment_agent.DATASET_SPLIT_CATEGORY})
-        category = experiment_agent._next_category("reconstructed", previous)
-        self.assertEqual(category, "")
-
-    def test_cloned_repository_only_ever_offers_dataset_split(self):
-        category = experiment_agent._next_category("cloned_repository", [])
-        self.assertEqual(category, experiment_agent.DATASET_SPLIT_CATEGORY)
-
-    def test_cloned_repository_returns_empty_once_dataset_split_tried(self):
-        previous = [{"category": experiment_agent.DATASET_SPLIT_CATEGORY}]
-        category = experiment_agent._next_category("cloned_repository", previous)
-        self.assertEqual(category, "")
-
-
-class TestBaselineMetricsFromEvaluation(unittest.TestCase):
-    def test_extracts_reproduced_values_only(self):
-        evaluation_result = {
-            "metrics": [
-                {"metric": "accuracy", "reproduced_value": 92.0},
-                {"metric": "f1", "reproduced_value": None, "notes": "not printed"},
-            ],
-        }
-        self.assertEqual(experiment_agent._baseline_metrics_from_evaluation(evaluation_result), {"accuracy": 92.0})
-
-    def test_none_input_returns_empty(self):
-        self.assertEqual(experiment_agent._baseline_metrics_from_evaluation(None), {})
-
-
-class TestClassifyChange(unittest.TestCase):
-    def test_improved_above_threshold(self):
-        classification, diff = experiment_agent._classify_change(90.0, 93.0)
-        self.assertEqual(classification, "IMPROVED")
-
-    def test_regressed_below_threshold(self):
-        classification, diff = experiment_agent._classify_change(90.0, 85.0)
-        self.assertEqual(classification, "REGRESSED")
-
-    def test_neutral_within_threshold(self):
-        classification, diff = experiment_agent._classify_change(90.0, 90.5)
-        self.assertEqual(classification, "NEUTRAL")
-
-    def test_fraction_scale_is_normalized(self):
-        classification, diff = experiment_agent._classify_change(0.90, 0.95)
-        self.assertEqual(classification, "IMPROVED")
-        self.assertAlmostEqual(diff, 5.0)
-
-
-class TestCompareToBaseline(unittest.TestCase):
-    def test_matched_metric_classified(self):
-        comparison = experiment_agent._compare_to_baseline({"accuracy": 90.0}, {"accuracy": 93.0})
-        self.assertEqual(len(comparison), 1)
-        self.assertEqual(comparison[0]["classification"], "IMPROVED")
-
-    def test_baseline_only_metric_is_inconclusive(self):
-        comparison = experiment_agent._compare_to_baseline({"accuracy": 90.0}, {})
-        self.assertEqual(comparison[0]["classification"], "INCONCLUSIVE")
-        self.assertIsNone(comparison[0]["experiment_value"])
-
-    def test_experiment_only_metric_is_inconclusive(self):
-        comparison = experiment_agent._compare_to_baseline({}, {"accuracy": 90.0})
-        self.assertEqual(comparison[0]["classification"], "INCONCLUSIVE")
-        self.assertIsNone(comparison[0]["baseline_value"])
-
-
-class TestOverallFromComparison(unittest.TestCase):
-    def test_empty_comparison_is_inconclusive(self):
-        self.assertEqual(experiment_agent._overall_from_comparison([]), "INCONCLUSIVE")
-
-    def test_regressed_wins_over_improved(self):
-        comparison = [{"classification": "IMPROVED"}, {"classification": "REGRESSED"}]
-        self.assertEqual(experiment_agent._overall_from_comparison(comparison), "REGRESSED")
-
-    def test_neutral_wins_over_improved_alone(self):
-        comparison = [{"classification": "IMPROVED"}, {"classification": "NEUTRAL"}]
-        self.assertEqual(experiment_agent._overall_from_comparison(comparison), "NEUTRAL")
-
-
-class TestResplitDataset(ExperimentAgentTestCase):
-    def test_writes_new_split_csvs(self):
-        with tempfile.TemporaryDirectory() as data_tmp:
-            master_path = Path(data_tmp) / "master.csv"
-            pd.DataFrame({"id": range(100), "label": [0, 1] * 50}).to_csv(master_path, index=False)
-            experiment_dir = Path(self._tmpdir.name) / "exp_001"
-            experiment_dir.mkdir(parents=True)
-
-            new_split = experiment_agent._resplit_dataset({"master_csv_path": str(master_path)}, experiment_dir)
-
-        self.assertTrue(Path(new_split["train_csv_path"]).exists())
-        self.assertTrue(Path(new_split["test_csv_path"]).exists())
-        self.assertTrue(Path(new_split["validation_csv_path"]).exists())
-
-
-class TestRewriteHardcodedCsvPaths(unittest.TestCase):
-    def test_replaces_original_paths_with_new_ones(self):
-        script = 'df = pd.read_csv("data/processed/train.csv")\ntest = pd.read_csv("data/processed/test.csv")'
-        cleaning_result = {"train_csv_path": "data/processed/train.csv", "test_csv_path": "data/processed/test.csv"}
-        new_split = {"train_csv_path": "experiments/x/data/train.csv", "test_csv_path": "experiments/x/data/test.csv",
-                     "validation_csv_path": ""}
-
-        result = experiment_agent._rewrite_hardcoded_csv_paths(script, cleaning_result, new_split)
-
-        self.assertIn("experiments/x/data/train.csv", result)
-        self.assertIn("experiments/x/data/test.csv", result)
-        self.assertNotIn("data/processed/train.csv", result)
-
-
-class TestProposeCodeChange(unittest.TestCase):
-    def test_parses_valid_json_response(self):
-        response = llm_response(
-            '{"hypothesis": "XGBoost should outperform RF.", "what_changed": "Swapped model.", '
-            '"code": "print(1)"}'
-        )
-        with patch("requests.post", return_value=response):
-            result = experiment_agent._propose_code_change("alternative_model", make_paper(), "print(0)", [])
-        self.assertEqual(result["what_changed"], "Swapped model.")
-
-    def test_malformed_json_falls_back_to_regex_extraction(self):
-        response = llm_response('Sure:\n{"hypothesis": "h", "what_changed": "c", "code": "print(1)"}\nDone.')
-        with patch("requests.post", return_value=response):
-            result = experiment_agent._propose_code_change("alternative_model", make_paper(), "print(0)", [])
-        self.assertEqual(result["code"], "print(1)")
-
-    def test_request_failure_returns_empty(self):
-        with patch("requests.post", side_effect=RuntimeError("down")):
-            result = experiment_agent._propose_code_change("alternative_model", make_paper(), "print(0)", [])
-        self.assertEqual(result, {})
-
-    def test_missing_code_field_returns_empty(self):
-        response = llm_response('{"hypothesis": "h", "what_changed": "c"}')
-        with patch("requests.post", return_value=response):
-            result = experiment_agent._propose_code_change("alternative_model", make_paper(), "print(0)", [])
-        self.assertEqual(result, {})
-
-
-class TestRun(ExperimentAgentTestCase):
-    def test_no_category_available_returns_skipped(self):
-        previous = [{"category": c} for c in experiment_agent.CODE_LEVEL_CATEGORIES]
-        previous.append({"category": experiment_agent.DATASET_SPLIT_CATEGORY})
-
-        result = experiment_agent.run(
-            make_paper(), make_replication_result(source="reconstructed"), make_evaluation_result(),
-            make_cleaning_result(), previous,
-        )
-
-        self.assertEqual(result["status"], "SKIPPED")
-
-    def test_cloned_repo_dataset_split_runs_against_a_fresh_copy(self):
-        slug = experiment_agent._slugify(make_paper()["title"])
-        baseline_dir = experiment_agent.REPLICATION_DIR / slug
-        (baseline_dir / "repo").mkdir(parents=True)
-        (baseline_dir / "repo" / "train.py").write_text("print('baseline')")
-        (baseline_dir / "venv").mkdir(parents=True)
-
-        with tempfile.TemporaryDirectory() as data_tmp:
-            master_path = Path(data_tmp) / "master.csv"
-            pd.DataFrame({"id": range(100), "label": [0, 1] * 50}).to_csv(master_path, index=False)
-            cleaning_result = make_cleaning_result(master_csv_path=str(master_path))
-
-            with patch.object(experiment_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="accuracy: 93.0")):
-                result = experiment_agent.run(
-                    make_paper(), make_replication_result(source="cloned_repository", command=["python", "train.py"]),
-                    make_evaluation_result(), cleaning_result, [],
-                )
-
-        self.assertEqual(result["status"], "OK")
-        self.assertEqual(result["category"], experiment_agent.DATASET_SPLIT_CATEGORY)
-        # The baseline repo directory must be untouched -- a fresh copy was made.
-        self.assertTrue((baseline_dir / "repo" / "train.py").is_file())
-        self.assertTrue(Path(result["experiment_dir"], "repo", "train.py").is_file())
-
-    def test_reconstructed_dataset_split_rewrites_hardcoded_paths(self):
-        """previous_experiments must already exhaust every code-level
-        category so _next_category falls through to dataset_split --
-        otherwise run() takes the LLM-proposal branch instead, which this
-        test doesn't mock."""
-        slug = experiment_agent._slugify(make_paper()["title"])
-        baseline_dir = experiment_agent.REPLICATION_DIR / slug
-        (baseline_dir / "reconstructed").mkdir(parents=True)
-        (baseline_dir / "venv").mkdir(parents=True)
-        previous = [{"category": c} for c in experiment_agent.CODE_LEVEL_CATEGORIES]
-
-        with tempfile.TemporaryDirectory() as data_tmp:
-            master_path = Path(data_tmp) / "master.csv"
-            train_path = Path(data_tmp) / "train.csv"
-            pd.DataFrame({"id": range(100), "label": [0, 1] * 50}).to_csv(master_path, index=False)
-            cleaning_result = make_cleaning_result(master_csv_path=str(master_path), train_csv_path=str(train_path))
-            (baseline_dir / "reconstructed" / "train.py").write_text(f'pd.read_csv("{train_path}")')
-
-            with patch.object(experiment_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="accuracy: 93.0")):
-                result = experiment_agent.run(
-                    make_paper(), make_replication_result(source="reconstructed"),
-                    make_evaluation_result(), cleaning_result, previous,
-                )
-
-        self.assertEqual(result["status"], "OK")
-        self.assertEqual(result["category"], experiment_agent.DATASET_SPLIT_CATEGORY)
-        experiment_script = Path(result["experiment_dir"]) / "train.py"
-        self.assertNotIn(str(train_path), experiment_script.read_text())
-
-    def test_code_level_experiment_generation_failure_returns_blocked(self):
-        slug = experiment_agent._slugify(make_paper()["title"])
-        baseline_dir = experiment_agent.REPLICATION_DIR / slug
-        (baseline_dir / "reconstructed").mkdir(parents=True)
-        (baseline_dir / "reconstructed" / "train.py").write_text("print('baseline')")
-        (baseline_dir / "venv").mkdir(parents=True)
-
-        with patch.object(experiment_agent, "_propose_code_change", return_value={}):
-            result = experiment_agent.run(
-                make_paper(), make_replication_result(source="reconstructed"),
-                make_evaluation_result(), make_cleaning_result(), [],
-            )
-
-        self.assertEqual(result["status"], "BLOCKED")
-        self.assertEqual(result["category"], experiment_agent.CODE_LEVEL_CATEGORIES[0])
-
-    def test_code_level_experiment_success_computes_comparison(self):
-        slug = experiment_agent._slugify(make_paper()["title"])
-        baseline_dir = experiment_agent.REPLICATION_DIR / slug
-        (baseline_dir / "reconstructed").mkdir(parents=True)
-        (baseline_dir / "reconstructed" / "train.py").write_text("print('baseline')")
-        (baseline_dir / "venv").mkdir(parents=True)
-
-        proposal = {"hypothesis": "XGBoost should do better.", "what_changed": "Swapped RF for XGBoost.", "code": "print(1)"}
-
-        with patch.object(experiment_agent, "_propose_code_change", return_value=proposal), \
-             patch.object(experiment_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="accuracy: 95.0")), \
-             patch.object(experiment_agent, "_extract_metrics", return_value={"accuracy": 95.0}):
-            result = experiment_agent.run(
-                make_paper(), make_replication_result(source="reconstructed"),
-                make_evaluation_result(), make_cleaning_result(), [],
-            )
-
-        self.assertEqual(result["status"], "OK")
-        self.assertEqual(result["overall"], "IMPROVED")
-        self.assertEqual(result["baseline_metrics"], {"accuracy": 92.0})
-        self.assertEqual(result["experiment_metrics"], {"accuracy": 95.0})
-
-    def test_experiment_script_failure_is_blocked_without_metric_extraction(self):
-        slug = experiment_agent._slugify(make_paper()["title"])
-        baseline_dir = experiment_agent.REPLICATION_DIR / slug
-        (baseline_dir / "reconstructed").mkdir(parents=True)
-        (baseline_dir / "reconstructed" / "train.py").write_text("print('baseline')")
-        (baseline_dir / "venv").mkdir(parents=True)
-
-        proposal = {"hypothesis": "h", "what_changed": "c", "code": "raise ValueError()"}
-
-        with patch.object(experiment_agent, "_propose_code_change", return_value=proposal), \
-             patch.object(experiment_agent, "_run_bounded", return_value=run_result(exit_code=1, stderr="ValueError")), \
-             patch.object(experiment_agent, "_extract_metrics") as extract_mock:
-            result = experiment_agent.run(
-                make_paper(), make_replication_result(source="reconstructed"),
-                make_evaluation_result(), make_cleaning_result(), [],
-            )
-
-        self.assertEqual(result["status"], "BLOCKED")
-        self.assertEqual(result["overall"], "INCONCLUSIVE")
-        extract_mock.assert_not_called()
-
-    def test_timeout_is_reported(self):
-        slug = experiment_agent._slugify(make_paper()["title"])
-        baseline_dir = experiment_agent.REPLICATION_DIR / slug
-        (baseline_dir / "reconstructed").mkdir(parents=True)
-        (baseline_dir / "reconstructed" / "train.py").write_text("print('baseline')")
-        (baseline_dir / "venv").mkdir(parents=True)
-
-        proposal = {"hypothesis": "h", "what_changed": "c", "code": "import time; time.sleep(999)"}
-
-        with patch.object(experiment_agent, "_propose_code_change", return_value=proposal), \
-             patch.object(experiment_agent, "_run_bounded", return_value=run_result(timed_out=True)):
-            result = experiment_agent.run(
-                make_paper(), make_replication_result(source="reconstructed"),
-                make_evaluation_result(), make_cleaning_result(), [],
-            )
-
-        self.assertEqual(result["status"], "TIMEOUT")
-
-    def test_experiment_numbering_follows_previous_experiments_count(self):
-        slug = experiment_agent._slugify(make_paper()["title"])
-        baseline_dir = experiment_agent.REPLICATION_DIR / slug
-        (baseline_dir / "reconstructed").mkdir(parents=True)
-        (baseline_dir / "reconstructed" / "train.py").write_text("print('baseline')")
-        (baseline_dir / "venv").mkdir(parents=True)
-
-        previous = [{"category": experiment_agent.CODE_LEVEL_CATEGORIES[0]}]
-        proposal = {"hypothesis": "h", "what_changed": "c", "code": "print(1)"}
-
-        with patch.object(experiment_agent, "_propose_code_change", return_value=proposal), \
-             patch.object(experiment_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="ok")):
-            result = experiment_agent.run(
-                make_paper(), make_replication_result(source="reconstructed"),
-                make_evaluation_result(), make_cleaning_result(), previous,
-            )
-
-        self.assertIn("exp_002", result["experiment_dir"])
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-class TestDataEnvAndRepair(ExperimentAgentTestCase):
-    def _baseline(self, script="print('baseline')"):
-        slug = experiment_agent._slugify(make_paper()["title"])
-        baseline_dir = experiment_agent.REPLICATION_DIR / slug
-        (baseline_dir / "reconstructed").mkdir(parents=True)
-        (baseline_dir / "reconstructed" / "train.py").write_text(script)
-        (baseline_dir / "venv").mkdir(parents=True)
-
-    def test_dataset_split_points_data_env_at_the_new_split(self):
-        self._baseline()
-        previous = [{"category": c} for c in experiment_agent.CODE_LEVEL_CATEGORIES]
-        with tempfile.TemporaryDirectory() as data_tmp:
-            master_path = Path(data_tmp) / "master.csv"
-            pd.DataFrame({"id": range(100), "label": [0, 1] * 50}).to_csv(master_path, index=False)
-            with patch.object(experiment_agent, "_run_bounded",
-                              return_value=run_result(exit_code=0, stdout="METRIC accuracy=0.93")) as run_mock:
-                result = experiment_agent.run(
-                    make_paper(), make_replication_result(source="reconstructed"), make_evaluation_result(),
-                    make_cleaning_result(master_csv_path=str(master_path)), previous,
-                )
-
-        env = run_mock.call_args.kwargs["env"]
-        self.assertTrue(env["TRAIN_CSV"].startswith(result["experiment_dir"]))
-        self.assertTrue(env["TEST_CSV"].startswith(result["experiment_dir"]))
-        self.assertEqual(result["experiment_metrics"], {"accuracy": 0.93})
-
-    def test_code_level_experiment_repairs_a_failing_script(self):
-        self._baseline()
-        proposal = {"hypothesis": "h", "what_changed": "Swapped the model.", "code": "broken"}
-        runs = [run_result(exit_code=1, stderr="NameError"), run_result(exit_code=0, stdout="METRIC accuracy=0.9")]
-        with patch.object(experiment_agent, "_propose_code_change", return_value=proposal), \
-             patch.object(experiment_agent, "_run_bounded", side_effect=runs), \
-             patch.object(experiment_agent, "_repair_generated_script", return_value="fixed") as repair_mock:
-            result = experiment_agent.run(
-                make_paper(), make_replication_result(source="reconstructed"), make_evaluation_result(),
-                make_cleaning_result(), [],
-            )
-        self.assertEqual(result["status"], "OK")
-        self.assertIn("Swapped the model.", repair_mock.call_args.args[1])
-        self.assertEqual((Path(result["experiment_dir"]) / "train.py").read_text(), "fixed")
-
-
-class TestEvaluationRecommendation(unittest.TestCase):
-    """The Evaluation Agent's recommended experiment is used when it is
-    usable; otherwise the exhaustion order applies."""
-
-    def test_recommended_category_is_used_for_a_reconstructed_baseline(self):
-        self.assertEqual(experiment_agent._next_category("reconstructed", [], "alternative_sampling_technique"),
-                         "alternative_sampling_technique")
-
-    def test_recommended_category_is_not_repeated(self):
-        tried = [{"category": "alternative_sampling_technique"}]
-        self.assertEqual(experiment_agent._next_category("reconstructed", tried, "alternative_sampling_technique"),
-                         experiment_agent.CODE_LEVEL_CATEGORIES[0])
-
-    def test_cloned_baseline_ignores_a_code_level_recommendation(self):
-        self.assertEqual(experiment_agent._next_category("cloned_repository", [], "alternative_model"),
-                         experiment_agent.DATASET_SPLIT_CATEGORY)
-
-    def test_guidance_reaches_the_proposal_prompt(self):
-        with patch.object(experiment_agent.llm, "chat", return_value="") as chat:
-            experiment_agent._propose_code_change("alternative_sampling_technique", {"title": "P"}, "code()", [],
-                                                  ["Try ADASYN inside an imblearn Pipeline."])
-        self.assertIn("Try ADASYN inside an imblearn Pipeline.", chat.call_args.args[0])
+
+def metric(published=99.2, reproduced=95.0, diff=4.2, classification="APPROXIMATE", name="accuracy"):
+    return {"metric": name, "published_value": published, "reproduced_value": reproduced,
+            "difference_points": diff, "classification": classification, "notes": ""}
+
+
+def evaluation(metrics=None, findings=None):
+    return {"status": "APPROXIMATE", "metrics": [metric()] if metrics is None else metrics,
+            "review": {"assessment": "The script trains on 10% of the rows.", "static_findings": [],
+                       "findings": findings or [], "data_facts": {"master_rows": 28000}},
+            "decision": {"action": "run_experiment", "reason": "valid baseline"}}
+
+
+def replication(tmp_path: Path, source="reconstructed"):
+    slug = tmp_path / "replication" / "paper"
+    (slug / "reconstructed").mkdir(parents=True)
+    (slug / "reconstructed" / "train.py").write_text("model = XGBClassifier(n_estimators=50)\n")
+    (slug / "run_stdout.txt").write_text("METRIC accuracy=0.95\n")
+    return {"status": "OK", "source": source, "replication_dir": str(slug),
+            "stdout_path": str(slug / "run_stdout.txt"), "inferred_assumptions": ["n_estimators=50 was guessed"]}
+
+
+def answer(action="rerun_agent", target="Replication Agent", instructions=("Use n_estimators=500 as the paper "
+           "states.",), evidence=("n_estimators=50",), target_entries=None):
+    return json.dumps({
+        "analysis": "The model is undertrained.",
+        "hypotheses": [{"cause": "Too few trees", "evidence": "n_estimators=50", "fix": "Replication Agent"}],
+        "decision": {"action": action, "target_agent": target, "instructions": list(instructions),
+                     "target_entries": target_entries, "reason": "Match the paper's model size.",
+                     "expected_effect": "accuracy closer to 99.2", "evidence": list(evidence)},
+    })
+
+
+def run(tmp_path, content, evaluation_result=None, **kwargs):
+    with patch("src.llm.chat", return_value=content) as chat:
+        result = experiment_agent.run(PAPER, replication(tmp_path, kwargs.pop("source", "reconstructed")),
+                                      evaluation_result or evaluation(), **kwargs)
+    return result, chat
+
+
+def test_a_supported_request_goes_to_master_agent(tmp_path):
+    result, chat = run(tmp_path, answer())
+    assert result["status"] == "REQUEST"
+    assert result["gap_points"] == 4.2
+    request = result["requests"][0]
+    assert request["sender"] == "experiment_agent" and request["recipient"] == "master_agent"
+    assert request["target_agent"] == "Replication Agent"
+    assert request["instructions"] == ["Use n_estimators=500 as the paper states."]
+    assert request["evidence"] == [{"issue": "quoted by the Experiment Agent", "evidence": "n_estimators=50"}]
+    assert result["hypotheses"][0]["verified"] is True
+    assert chat.call_args.kwargs["agent"] == "experiment_agent"
+
+
+def test_the_prompt_has_the_gap_findings_history_and_master_feedback(tmp_path):
+    history = [{"rerun": 1, "requested_by": "Experiment Agent", "target_agent": "Data Agent",
+                "instructions": ["collect more"], "goal": {"target_entries": 50000},
+                "outcome": "gap 4.5 -> 4.2 points"}]
+    feedback = ["Master Agent declined the request to rerun the Data Agent: redundant"]
+    findings = [{"severity": "major", "category": "hyperparameters", "issue": "Too few trees",
+                 "evidence": "n_estimators=50", "verified": True}]
+    _result, chat = run(tmp_path, answer(), evaluation(findings=findings), history=history, feedback=feedback)
+    prompt = chat.call_args.args[0]
+    assert "mean gap: 4.2" in prompt and "Too few trees" in prompt
+    assert "gap 4.5 -> 4.2 points" in prompt
+    assert "redundant" in prompt
+    assert "Closest, not highest" in prompt and "leakage" in prompt
+
+
+def test_invented_evidence_is_marked_unverified_and_not_sent(tmp_path):
+    result, _chat = run(tmp_path, answer(evidence=("the paper used 1,000 trees",)))
+    assert result["evidence"] == [{"quote": "the paper used 1,000 trees", "verified": False}]
+    assert result["requests"][0]["evidence"] == []  # Master Agent declines a request with no verified evidence
+
+
+def test_agent_names_are_normalized():
+    assert experiment_agent.canonical_agent("data_agent") == "Data Agent"
+    assert experiment_agent.canonical_agent("code discovery") == "Code Discovery Agent"
+    assert experiment_agent.canonical_agent("Research Agent") == "Research Agent"
+    assert experiment_agent.canonical_agent("Modeling Agent") == ""
+
+
+def test_an_unknown_target_becomes_stop(tmp_path):
+    result, _chat = run(tmp_path, answer(target="Modeling Agent"))
+    assert result["status"] == "STOP" and result["requests"] == []
+    assert any("Unknown target" in n for n in result["decision_notes"])
+
+
+def test_a_closed_gap_stops(tmp_path):
+    result, _chat = run(tmp_path, answer(), evaluation([metric(reproduced=98.8, diff=0.4, classification="EXACT")]))
+    assert result["status"] == "STOP"
+    assert any("already within" in n for n in result["decision_notes"])
+
+
+def test_no_published_number_means_no_gap_to_close(tmp_path):
+    no_published = [metric(published=None, diff=None, classification="INCONCLUSIVE")]
+    result, _chat = run(tmp_path, answer(), evaluation(no_published))
+    assert result["status"] == "STOP" and result["gap_points"] is None
+
+
+def test_a_missing_reproduced_metric_can_still_be_requested(tmp_path):
+    not_printed = [metric(reproduced=None, diff=None, classification="INCONCLUSIVE")]
+    result, _chat = run(tmp_path, answer(instructions=("Print METRIC accuracy=<value>.",)), evaluation(not_printed))
+    assert result["status"] == "REQUEST"
+
+
+def test_a_data_goal_is_capped_and_only_kept_for_the_data_agent(tmp_path):
+    result, _chat = run(tmp_path, answer(target="data agent", target_entries=10_000_000))
+    assert result["requests"][0]["goal"] == {"target_entries": experiment_agent.MAX_MASTER_ROWS}
+    result, _chat = run(Path(tmp_path) / "b", answer(target_entries=90000))
+    assert result["requests"][0]["goal"] == {}
+
+
+def test_a_failed_analysis_call_stops_without_raising(tmp_path):
+    with patch("src.llm.chat", side_effect=RuntimeError("router down")):
+        result = experiment_agent.run(PAPER, replication(tmp_path), evaluation())
+    assert result["status"] == "STOP"
+    assert any("router down" in n for n in result["decision_notes"])
+
+
+def test_score_gap_is_the_mean_over_metrics_on_both_sides():
+    assert experiment_agent.score_gap({"metrics": [metric(diff=4.0), metric(diff=2.0, name="f1"),
+                                                   metric(published=None, diff=None, name="auc")]}) == 3.0
+    assert experiment_agent.score_gap({"metrics": []}) is None

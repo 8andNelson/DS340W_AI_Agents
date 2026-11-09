@@ -3,7 +3,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 
 from src import llm
-from src.search import brave_search, openalex, semantic_scholar
+from src.search import openalex, semantic_scholar, web_search
+from src.orchestration.handoff import request as handoff_request
 
 MIN_YEAR = 2022
 RESULTS_PER_QUERY = 10
@@ -218,7 +219,7 @@ def _fill_missing_year(paper: dict) -> None:
 
 
 def run(structured_request: dict) -> list:
-    """Search academic literature via Brave and return scored paper candidates."""
+    """Search academic literature via web search and return scored paper candidates."""
 
     topic = structured_request.get("domain", "")
     project_topic = structured_request.get("project_topic", topic)
@@ -228,7 +229,7 @@ def run(structured_request: dict) -> list:
         search_queries = structured_request.get("keywords", [])[:3]
 
     print(f"\n[Research Agent] Searching for papers on: {project_topic}")
-    print(f"[Research Agent] Running {len(search_queries)} queries via Brave Search...")
+    print(f"[Research Agent] Running {len(search_queries)} queries via web search...")
 
     # Brave searches stay sequential (fast, and Brave's plan is rate-limited
     # per second); each query's LLM extraction starts as soon as its search
@@ -238,7 +239,7 @@ def run(structured_request: dict) -> list:
         for query in search_queries:
             print(f"  > '{query}'")
             try:
-                results = brave_search.search_academic_papers(query, count=RESULTS_PER_QUERY)
+                results = web_search.search_academic_papers(query, count=RESULTS_PER_QUERY)
             except Exception as e:
                 print(f"  WARNING: Search failed for '{query}' - {e}")
                 continue
@@ -297,3 +298,11 @@ def run(structured_request: dict) -> list:
     all_papers.sort(key=lambda p: p.get("parent_paper_score", 0), reverse=True)
 
     return all_papers
+
+
+def handoff(result: list, context: dict) -> list:
+    """The Research Agent's request to Master Agent when it finishes: run
+    the Validation Agent on the candidate papers it found."""
+    return [handoff_request("research_agent", "Validation Agent", {"papers": result},
+                            f"{len(result or [])} candidate papers found; they need independent validation "
+                            "and a Parent Paper recommendation.")]

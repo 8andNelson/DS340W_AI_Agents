@@ -1,6 +1,7 @@
 import json
 import re
 from src import llm
+from src.orchestration.handoff import request as handoff_request
 
 
 SYSTEM_PROMPT = """You are a research intake assistant for an academic AI research system.
@@ -55,3 +56,12 @@ def run(topic: str) -> dict:
     structured["target_terms"] = [str(t).strip().lower() for t in terms if str(t).strip()][:3]
 
     return structured
+
+
+def handoff(result: dict, context: dict) -> list:
+    """The Intake Agent's request to Master Agent when it finishes: run the
+    Research Agent with the structured research request."""
+    queries = len((result or {}).get("search_queries") or [])
+    return [handoff_request("intake_agent", "Research Agent", {"structured": result},
+                            f"Topic analyzed (domain: {(result or {}).get('domain', '')}); {queries} search "
+                            "queries ready for the literature search.")]

@@ -116,7 +116,7 @@ class TestRun:
                      "abstract": "", "year": years[r["url"]], "parent_paper_score": 5}
                     for r in results]
 
-        with patch("src.search.brave_search.search_academic_papers", side_effect=lambda q, count: per_query[q]), \
+        with patch("src.search.web_search.search_academic_papers", side_effect=lambda q, count: per_query[q]), \
              patch.object(research_agent, "_extract_papers_from_results", side_effect=fake_extract):
             papers = research_agent.run({"project_topic": "fraud", "search_queries": ["q1", "q2"]})
 
@@ -128,7 +128,7 @@ class TestRun:
                 raise RuntimeError("boom")
             return [brave_result("Paper A", "https://a.org")]
 
-        with patch("src.search.brave_search.search_academic_papers", side_effect=fake_search), \
+        with patch("src.search.web_search.search_academic_papers", side_effect=fake_search), \
              patch.object(research_agent, "_extract_papers_from_results",
                           return_value=[{"title": "Paper A", "paper_url": "https://a.org",
                                          "abstract": "", "year": 2024}]):

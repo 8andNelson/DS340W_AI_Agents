@@ -64,6 +64,7 @@ from src.orchestration import column_mapping
 from src.orchestration.dataset_budget import (
     MAX_MASTER_ROWS, MAX_ROWS_PER_DATASET, binary_label_map, find_label_column, read_csv_capped, stratified_cap,
 )
+from src.orchestration.handoff import request as handoff_request
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 PROCESSED_DATA_DIR = REPO_ROOT / "data" / "processed"
@@ -405,3 +406,17 @@ def run(selected_datasets: list, target_terms: list = None, target_rows: int | N
         "notes": notes,
         **split_info,
     }
+
+
+def handoff(result: dict, context: dict) -> list:
+    """The Cleaning Agent's request to Master Agent when it finishes. Before
+    the implementation search has run: run the Code Discovery Agent. After
+    it (a rerun with new data): run the Replication Agent again, with the
+    SAME baseline script on the new data, so only the data changes."""
+    rows = (result or {}).get("rows_total", 0)
+    if not context.get("code_discovery_result"):
+        return [handoff_request("cleaning_agent", "Code Discovery Agent", {},
+                                f"Master CSV ready ({rows} rows); the Parent Paper's implementation is needed next.")]
+    revision = {"reuse_script": True} if context.get("replication_result") else None
+    return [handoff_request("cleaning_agent", "Replication Agent", {"revision": revision},
+                            f"New master CSV ready ({rows} rows); the baseline must run again on it.")]

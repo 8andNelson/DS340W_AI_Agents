@@ -183,29 +183,29 @@ def _print_evaluation_summary(result: dict) -> None:
               + (f" -> {decision['target_agent']}" if decision.get("target_agent") else ""))
 
 
-def _print_improvement_rounds(rounds: list) -> None:
-    if not rounds:
-        return
-    print("\n--- Improvement rounds (Evaluation Agent requests run by Master Agent) ---")
-    for r in rounds:
-        print(f"  Round {r['round']}: {r['action']} -> {r['target_agent']}: {r.get('outcome', '')}")
+def _print_reruns(reruns: list, end_reason: str) -> None:
+    print("\n--- Reruns (requested by agents, run by Master Agent) ---")
+    for r in reruns:
+        kept = "kept" if r.get("applied") else "not kept"
+        print(f"  Rerun {r['rerun']}: {r['requested_by']} -> {r['target_agent']} ({kept}): {r.get('outcome', '')}")
+    if not reruns:
+        print("  None.")
+    if end_reason:
+        print(f"  Master Agent ended the loop: {end_reason}.")
 
 
 def _print_experiment_summary(result: dict) -> None:
-    print(f"\n--- Experiment ({result['status']}) ---")
-    print(f"  Category: {result.get('category', '')}")
-    if result.get("hypothesis"):
-        print(f"  Hypothesis: {result['hypothesis']}")
-    if result.get("what_changed"):
-        print(f"  What changed: {result['what_changed']}")
-    print(f"  Overall: {result.get('overall', '')}")
-    for c in result.get("comparison", []):
-        print(f"    - {c['metric']}: baseline={c['baseline_value']}, experiment={c['experiment_value']} "
-              f"-> {c['classification']}")
-    if result.get("warnings"):
-        print("  Warnings:")
-        for w in result["warnings"]:
-            print(f"    - {w}")
+    gap = result.get("gap_points")
+    print(f"\n--- Experiment Agent's last analysis ({result.get('status', '')}) ---")
+    print(f"  Mean gap to the paper: {gap if gap is not None else 'not measurable'} percentage points")
+    if result.get("analysis"):
+        print(f"  Analysis: {result['analysis']}")
+    decision = result.get("decision") or {}
+    if decision:
+        print(f"  Decision: {decision.get('action', '')}"
+              + (f" -> {decision['target_agent']}" if decision.get("target_agent") else ""))
+    for note in result.get("decision_notes") or []:
+        print(f"    - {note}")
 
 
 def main():
@@ -230,7 +230,8 @@ def main():
     print(f"\nTopic: {topic}")
     print("\n[Master Agent] Starting supervised pipeline "
           "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent -> "
-          "Code Discovery Agent -> Replication Agent -> Evaluation Agent -> Experiment Agent)...")
+          "Code Discovery Agent -> Replication Agent -> Evaluation Agent, then reruns requested by the "
+          "Evaluation and Experiment Agents)...")
 
     result = master_agent.run_pipeline(topic)
 
@@ -267,7 +268,7 @@ def main():
 
     if result["evaluation_result"]:
         _print_evaluation_summary(result["evaluation_result"])
-        _print_improvement_rounds(result.get("improvement_rounds") or [])
+        _print_reruns(result.get("reruns") or [], result.get("rerun_end_reason", ""))
 
     if result["experiment_result"]:
         _print_experiment_summary(result["experiment_result"])
@@ -278,10 +279,10 @@ def main():
     if result.get("run_id"):
         print(f"[Run Store] Run {result['run_id']} recorded -- view it with: "
               f"python -m src.orchestration.run_store show {result['run_id']}")
-    print("\nParent Paper approved, dataset pool built, master CSV cleaned, code discovery "
-          "attempted, a baseline reproduction established, results evaluated against the "
-          "paper, and one controlled experiment run against the preserved baseline. Next "
-          "pipeline stage: Report Agent (Milestone 13).")
+    print("\nParent Paper approved, dataset built, master CSV cleaned, code discovery attempted, "
+          "a baseline reproduction established and evaluated against the paper, and earlier agents "
+          "rerun on the Evaluation and Experiment Agents' requests to bring the score closer to the "
+          "paper. Next pipeline stage: Report Agent (Milestone 13).")
 
 
 if __name__ == "__main__":

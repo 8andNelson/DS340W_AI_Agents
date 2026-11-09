@@ -59,12 +59,13 @@ from bs4 import BeautifulSoup
 
 from src import llm
 from src.config import KAGGLE_USERNAME, KAGGLE_KEY
-from src.search import brave_search, paper_fulltext
+from src.search import page_fetch, paper_fulltext, web_search
 from src.orchestration import dataset_cache
 from src.orchestration.dataset_budget import (
     MAX_MASTER_ROWS, MAX_ROWS_PER_DATASET, check_target_fit, find_label_column, read_csv_capped, stratified_cap,
 )
 from src.agents.validation_agent import _check_url_reachable
+from src.orchestration.handoff import request as handoff_request
 
 MIN_ENTRIES_TO_CONSIDER = 1  # any real, non-empty download counts
 # The agent's own entry target (plan_data_needs) is capped at the local row
@@ -72,7 +73,7 @@ MIN_ENTRIES_TO_CONSIDER = 1  # any real, non-empty download counts
 # so a larger target could never be met.
 MAX_TARGET_ENTRIES = MAX_MASTER_ROWS
 MAX_DATASETS = 5
-RESULTS_PER_QUERY = 20  # Brave's maximum (brave_search.BRAVE_MAX_COUNT)
+RESULTS_PER_QUERY = 20  # the search maximum (web_search.MAX_COUNT, Brave's limit)
 PAGE_FETCH_TIMEOUT = 15
 PAGE_TEXT_CHAR_LIMIT = 6000
 DOWNLOAD_TIMEOUT = 30
@@ -360,7 +361,7 @@ def _fetch_page_text(url: str) -> str:
     if not url:
         return ""
     try:
-        resp = requests.get(url, timeout=PAGE_FETCH_TIMEOUT, headers={"User-Agent": BROWSER_USER_AGENT})
+        resp = page_fetch.get(url, timeout=PAGE_FETCH_TIMEOUT, headers={"User-Agent": BROWSER_USER_AGENT})
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup(["script", "style"]):
@@ -679,7 +680,7 @@ def _download_and_convert_to_csv(candidate: dict, target_terms: list = None) -> 
             candidate["download_status"] = "failed: no source URL"
             return False
         try:
-            resp = requests.get(url, timeout=DOWNLOAD_TIMEOUT, headers={"User-Agent": BROWSER_USER_AGENT})
+            resp = page_fetch.get(url, timeout=DOWNLOAD_TIMEOUT, headers={"User-Agent": BROWSER_USER_AGENT})
             resp.raise_for_status()
         except Exception as e:
             candidate["download_status"] = f"failed: could not fetch URL ({e})"
@@ -777,7 +778,7 @@ def _remember_rejection(candidate: dict, ctx: dict = None) -> None:
 
 _VERIFICATION_METHOD_DESCRIPTIONS = {
     "cache_hit": "reused from an earlier search",
-    "brave_search": "found via Brave search for the paper's stated dataset name",
+    "brave_search": "found via a web search (Brave or SerpAPI) for the paper's stated dataset name",
     "exploration_site": "found via a curated dataset-directory search",
     "parent_paper_text": "linked in the Parent Paper's own text",
 }
@@ -829,7 +830,7 @@ def _resolve_dataset(dataset_name: str, dataset_source: str, paper_title: str,
 
     query = query_builder(dataset_name, dataset_source)
     try:
-        results = brave_search.search(query, count=RESULTS_PER_QUERY)
+        results = web_search.search(query, count=RESULTS_PER_QUERY)
     except Exception:
         results = []
     results = results + _search_kaggle_datasets(query)
@@ -947,7 +948,7 @@ def _search_exploration_sites(scope_description: str, parent_paper: dict = None,
         return []
     query = search_query.strip() or scope_description
     try:
-        results = brave_search.search_dataset_sites(query, count=RESULTS_PER_QUERY)
+        results = web_search.search_dataset_sites(query, count=RESULTS_PER_QUERY)
     except Exception:
         results = []
     results = results + _search_kaggle_datasets(query)
@@ -1217,3 +1218,13 @@ def run(parent_paper: dict, ranked_pool: list, target_entries: int | None = None
         "warnings": warnings,
         "notes": "",
     }
+
+
+def handoff(result: dict, context: dict) -> list:
+    """The Data Agent's request to Master Agent when it finishes: run the
+    Cleaning Agent on the datasets it downloaded."""
+    datasets = (result or {}).get("selected_datasets") or []
+    return [handoff_request("data_agent", "Cleaning Agent",
+                            {"selected_datasets": datasets, "target_rows": (result or {}).get("target_entries")},
+                            f"{len(datasets)} dataset(s) downloaded ({(result or {}).get('total_entries', 0)} "
+                            "entries); they need merging into the master CSV.")]

@@ -41,7 +41,7 @@ def test_title_search_must_match_the_exact_title():
 
 
 def test_full_text_is_downloaded_once_and_cached():
-    text = "Methods. " * 400
+    text = PAPER["title"] + "\n" + "Methods. " * 400
     with patch.object(paper_fulltext, "candidate_pdf_urls", return_value=["https://x/p.pdf"]), \
          patch.object(paper_fulltext, "_download_pdf", return_value=b"%PDF-1.7 fake") as download, \
          patch.object(paper_fulltext, "extract_text", return_value=(text, 9)):

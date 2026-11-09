@@ -295,28 +295,20 @@ def make_evaluation_result(**overrides) -> dict:
 
 
 def make_experiment_result(**overrides) -> dict:
-    status = overrides.pop("status", "OK")
+    """An Experiment Agent analysis that requests no rerun ("stop")."""
     result = {
-        "status": status,
-        "source": "cloned_repository",
-        "category": "different_dataset_split",
-        "hypothesis": "A different split should perform similarly if the model generalizes.",
-        "what_changed": "Train/test/validation split reseeded from 42 to 7.",
-        "experiment_dir": "experiments/fraud-detection/exp_001/",
-        "command": ["python", "train.py"],
-        "exit_code": 0 if status == "OK" else 1,
-        "stdout_path": "experiments/fraud-detection/exp_001/run_stdout.txt",
-        "stderr_path": "experiments/fraud-detection/exp_001/run_stderr.txt",
-        "duration_seconds": 8.0,
-        "baseline_metrics": {"accuracy": 92.0},
-        "experiment_metrics": {"accuracy": 91.5} if status == "OK" else {},
-        "comparison": [{
-            "metric": "accuracy", "baseline_value": 92.0, "experiment_value": 91.5,
-            "difference_points": -0.5, "classification": "NEUTRAL",
-        }] if status == "OK" else [],
-        "overall": "NEUTRAL" if status == "OK" else "INCONCLUSIVE",
-        "warnings": [] if status == "OK" else ["Experiment script exited with code 1."],
-        "notes": "",
+        "status": "STOP",
+        "gap_points": 0.5,
+        "analysis": "The reproduction is within a point of the paper.",
+        "hypotheses": [],
+        "decision": {"action": "stop", "target_agent": "", "instructions": [], "target_entries": None,
+                     "reason": "The gap is closed.", "expected_effect": ""},
+        "evidence": [],
+        "decision_notes": [],
+        "requests": [],
+        "feedback_received": [],
+        "paper_text_status": "ABSTRACT_ONLY",
+        "proposed_by": "model-x",
     }
     result.update(overrides)
     return result
@@ -865,93 +857,45 @@ class TestEvaluationAgentPipelineWiring(MasterAgentTestCase):
 
 
 class TestExperimentChecks(MasterAgentTestCase):
-    """_check_experiment never blocks, regardless of status -- a
-    REGRESSED, BLOCKED, or SKIPPED experiment is itself useful research
-    information per CLAUDE.md's Results Integrity policy, not an agent
-    defect."""
+    """_check_experiment never blocks: the Experiment Agent's output is a
+    request, which Master Agent checks in _review_rerun_request."""
 
-    def test_approves_ok_result(self):
-        blockers = master_agent._check_experiment(make_experiment_result(status="OK"))
-        self.assertEqual(blockers, [])
+    def test_approves_a_stop(self):
+        self.assertEqual(master_agent._check_experiment(make_experiment_result()), [])
 
-    def test_approves_blocked_result(self):
-        blockers = master_agent._check_experiment(make_experiment_result(status="BLOCKED"))
-        self.assertEqual(blockers, [])
-
-    def test_approves_skipped_result(self):
-        blockers = master_agent._check_experiment(make_experiment_result(status="SKIPPED"))
-        self.assertEqual(blockers, [])
+    def test_approves_a_request(self):
+        self.assertEqual(master_agent._check_experiment(make_experiment_result(status="REQUEST")), [])
 
 
 class TestExperimentAgentPipelineWiring(MasterAgentTestCase):
-    """run_pipeline's Stage 9: Experiment Agent runs right after
-    Evaluation succeeds, is handed the recommended Parent Paper plus the
-    Replication/Evaluation/Cleaning results and the prior experiments
-    list from state, and never blocks the pipeline regardless of status."""
+    """run_pipeline's Stage 9: after the first evaluation the rerun loop asks
+    the Experiment Agent for its next request; a "stop" ends the loop and
+    the pipeline succeeds."""
 
     _run = TestDataAgentPipelineWiring._run
 
-    def test_advances_to_experimentation_on_success(self):
+    def test_advances_to_experimentation_when_no_rerun_is_requested(self):
         data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
-        experiment_result = make_experiment_result(status="OK")
+        experiment_result = make_experiment_result()
         result, *_ = self._run(data_result, experiment_result=experiment_result)
 
         self.assertTrue(result["success"])
         self.assertEqual(result["phase"], "EXPERIMENTATION")
         self.assertEqual(result["experiment_result"], experiment_result)
+        self.assertEqual(result["experiment_results"], [experiment_result])
+        self.assertEqual(result["reruns"], [])
+        self.assertIn("requested no further rerun", result["rerun_end_reason"])
 
-    def test_still_succeeds_on_skipped_or_blocked_experiment(self):
-        data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
-        experiment_result = make_experiment_result(status="SKIPPED")
-        result, *_ = self._run(data_result, experiment_result=experiment_result)
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["experiment_result"]["status"], "SKIPPED")
-
-    def test_appends_to_previous_experiments_from_state(self):
-        data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
-        experiment_result = make_experiment_result(status="OK")
-        prior = [make_experiment_result(category="alternative_model")]
-
-        ranked_pool = [
-            {"title": "Parent Paper", "dataset": "DS1"},
-            {"title": "Runner Up", "dataset": "DS2"},
-        ]
-        validation_result = make_validation_result(ranked_pool)
-
-        with patch.object(master_agent, "_check_intake", return_value=[]), \
-             patch.object(master_agent, "_check_research", return_value=[]), \
-             patch.object(master_agent, "_check_validation_and_selection", return_value=[]), \
-             patch("src.agents.intake_agent.run", return_value={
-                 "domain": "fraud", "keywords": ["fraud"], "search_queries": ["fraud ML"],
-             }), \
-             patch("src.agents.research_agent.run", return_value=[
-                 {"title": "Parent Paper", "peer_reviewed": True, "year": 2023}
-             ]), \
-             patch("src.agents.validation_agent.run", return_value=validation_result), \
-             patch("src.agents.data_agent.run", return_value=data_result), \
-             patch("src.agents.cleaning_agent.run", return_value=make_cleaning_result()), \
-             patch("src.agents.code_discovery_agent.run", return_value=make_code_discovery_result()), \
-             patch("src.agents.replication_agent.run", return_value=make_replication_result()), \
-             patch("src.agents.evaluation_agent.run", return_value=make_evaluation_result()), \
-             patch("src.agents.experiment_agent.run", return_value=experiment_result), \
-             patch("src.orchestration.state_manager.update_state") as update_state, \
-             patch("src.orchestration.state_manager.load_state", return_value={"experiments": prior}):
-            master_agent.run_pipeline("credit card fraud detection")
-
-        experiments_updates = [c.args[0]["experiments"] for c in update_state.call_args_list if "experiments" in c.args[0]]
-        self.assertEqual(experiments_updates[-1], prior + [experiment_result])
-
-    def test_called_with_parent_paper_replication_evaluation_cleaning_and_previous_experiments(self):
+    def test_called_with_the_current_results_history_and_feedback(self):
         ranked_pool = [
             {"title": "Parent Paper", "dataset": "DS1"},
             {"title": "Runner Up", "dataset": "DS2"},
         ]
         data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
         cleaning_result = make_cleaning_result(datasets_merged=1)
+        code_discovery_result = make_code_discovery_result()
         replication_result = make_replication_result()
         evaluation_result = make_evaluation_result()
-        prior = [make_experiment_result(category="alternative_model")]
 
         with patch.object(master_agent, "_check_intake", return_value=[]), \
              patch.object(master_agent, "_check_research", return_value=[]), \
@@ -965,17 +909,21 @@ class TestExperimentAgentPipelineWiring(MasterAgentTestCase):
              patch("src.agents.validation_agent.run", return_value=make_validation_result(ranked_pool)), \
              patch("src.agents.data_agent.run", return_value=data_result), \
              patch("src.agents.cleaning_agent.run", return_value=cleaning_result), \
-             patch("src.agents.code_discovery_agent.run", return_value=make_code_discovery_result()), \
+             patch("src.agents.code_discovery_agent.run", return_value=code_discovery_result), \
              patch("src.agents.replication_agent.run", return_value=replication_result), \
              patch("src.agents.evaluation_agent.run", return_value=evaluation_result), \
              patch("src.agents.experiment_agent.run", return_value=make_experiment_result()) as experiment_run, \
-             patch("src.orchestration.state_manager.update_state"), \
-             patch("src.orchestration.state_manager.load_state", return_value={"experiments": prior}):
+             patch("src.orchestration.state_manager.update_state") as update_state, \
+             patch("src.orchestration.state_manager.load_state", return_value={}):
             master_agent.run_pipeline("credit card fraud detection")
 
         experiment_run.assert_called_once_with(
-            ranked_pool[0], replication_result, evaluation_result, cleaning_result, prior,
+            ranked_pool[0], replication_result, evaluation_result, cleaning_result, data_result,
+            code_discovery_result, [], [],
         )
+        experiments_updates = [c.args[0]["experiments"] for c in update_state.call_args_list
+                               if "experiments" in c.args[0]]
+        self.assertEqual(experiments_updates[-1], [make_experiment_result()])
 
 
 class TestWriteReport(MasterAgentTestCase):
@@ -1244,9 +1192,9 @@ class TestRunPipelineSlackBanner(MasterAgentTestCase):
              patch.object(master_agent.slack_client, "fetch_new_messages", return_value=[]) as fetch:
             self._run_minimal_success()
 
-        # Validation, Data, Cleaning, Code Discovery, Replication, Evaluation, and Experiment
-        # stages all trigger a relay check.
-        self.assertEqual(fetch.call_count, 7)
+        # Validation, Data, Cleaning, Code Discovery and Replication stages and the
+        # rerun loop (Evaluation + Experiment Agent requests) all trigger a relay check.
+        self.assertEqual(fetch.call_count, 6)
         for call in fetch.call_args_list:
             self.assertEqual(call.kwargs["oldest_ts"], "1234.5678")
 

@@ -33,9 +33,10 @@ import re
 import requests
 
 from src import llm
-from src.search import brave_search
+from src.search import web_search
 from src.orchestration import code_discovery_cache
 from src.agents.validation_agent import _check_url_reachable
+from src.orchestration.handoff import request as handoff_request
 
 RESULTS_PER_QUERY = 10
 GITHUB_API_TIMEOUT = 15
@@ -217,7 +218,7 @@ def _verify_single_match(repo_url: str, paper_title: str, scope_description: str
     return candidates[0] if candidates else None
 
 
-def run(parent_paper: dict) -> dict:
+def run(parent_paper: dict, use_cache: bool = True) -> dict:
     """
     Locate the Parent Paper's implementation, in CLAUDE.md's preferred
     order (author-stated code -> GitHub/code-index search -> Kaggle/other),
@@ -225,11 +226,14 @@ def run(parent_paper: dict) -> dict:
     trusting a name match. Finding nothing is a valid, non-blocking
     outcome -- Replication Agent falls back to reconstructing from the
     paper itself.
+
+    use_cache=False skips the cached repository: Master Agent's rerun on
+    another agent's request must search again, not return the same hit.
     """
     paper_title = (parent_paper or {}).get("title", "")
     print(f"\n[Code Discovery Agent] Locating implementation for '{paper_title}'...")
 
-    cached = code_discovery_cache.get_cached_repo(paper_title)
+    cached = code_discovery_cache.get_cached_repo(paper_title) if use_cache else None
     if cached:
         print(f"[Code Discovery Agent] Using cached repository: {cached.get('repo_url', '')}.")
         return {
@@ -266,10 +270,10 @@ def run(parent_paper: dict) -> dict:
         warnings.append("Parent Paper does not state a code_url.")
 
     # --- Stage 2 & 3: GitHub / code-index search (includes Kaggle code,
-    # GitLab, Papers with Code via brave_search.search_code_sites) ---
+    # GitLab, Papers with Code via web_search.search_code_sites) ---
     if not chosen:
         try:
-            results = brave_search.search_code_sites(_build_query(paper_title), count=RESULTS_PER_QUERY)
+            results = web_search.search_code_sites(_build_query(paper_title), count=RESULTS_PER_QUERY)
         except Exception as e:
             results = []
             warnings.append(f"Code search failed: {e}")
@@ -320,3 +324,13 @@ def run(parent_paper: dict) -> dict:
         "warnings": warnings,
         "notes": "",
     }
+
+
+def handoff(result: dict, context: dict) -> list:
+    """The Code Discovery Agent's request to Master Agent when it finishes:
+    run the Replication Agent with what it found (the authors' code, or
+    nothing -- then the baseline is reconstructed from the paper)."""
+    repo = ((result or {}).get("repository") or {}).get("repo_url", "")
+    return [handoff_request("code_discovery_agent", "Replication Agent", {"revision": None},
+                            f"Implementation found: {repo}." if repo else
+                            "No verified implementation found; the baseline must be reconstructed from the paper.")]

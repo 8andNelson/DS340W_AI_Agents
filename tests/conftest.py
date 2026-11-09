@@ -12,10 +12,10 @@ import requests
 from src import llm
 
 from src.agents import (
-    cleaning_agent, data_agent, experiment_agent, master_agent, replication_agent,
+    cleaning_agent, data_agent, master_agent, replication_agent,
 )
 from src.orchestration import code_discovery_cache, column_mapping, dataset_cache, run_store, state_manager
-from src.search import paper_fulltext
+from src.search import camoufox_fetch, page_fetch, paper_fulltext, serpapi_search, web_search
 
 
 @pytest.fixture(autouse=True)
@@ -31,8 +31,6 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     monkeypatch.setattr(cleaning_agent, "PROCESSED_DATA_DIR", tmp_path / "data" / "processed")
     monkeypatch.setattr(data_agent, "RAW_DATA_DIR", tmp_path / "data" / "raw")
     monkeypatch.setattr(replication_agent, "REPLICATION_DIR", tmp_path / "replication")
-    monkeypatch.setattr(experiment_agent, "REPLICATION_DIR", tmp_path / "replication")
-    monkeypatch.setattr(experiment_agent, "EXPERIMENTS_DIR", tmp_path / "experiments")
     monkeypatch.setattr(llm, "OPENROUTER_API_KEY", "test-key")
 
     # A test that forgets to mock an LLM call must fail loudly, never reach
@@ -57,3 +55,10 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     # lookup with mocked HTTP.
     monkeypatch.setattr(paper_fulltext, "PARENT_PAPER_DIR", tmp_path / "papers" / "parent")
     monkeypatch.setattr(paper_fulltext, "candidate_pdf_urls", lambda parent_paper: [])
+    # Search API calls are mocked; isolate provider counters and fetch logs.
+    monkeypatch.setattr(serpapi_search, "SERPENT_API_KEY", "")
+    # Browser tests opt in explicitly with a mocked launcher; no live browser in unit tests.
+    monkeypatch.setattr(camoufox_fetch, "CAMOUFOX_ENABLED", False)
+    monkeypatch.setattr(web_search, "_failures", {name: 0 for name, _m in web_search.PROVIDERS})
+    monkeypatch.setattr(web_search, "SEARCH_LOG", logs / "search_calls.jsonl")
+    monkeypatch.setattr(page_fetch, "FETCH_LOG", logs / "page_fetch_calls.jsonl")

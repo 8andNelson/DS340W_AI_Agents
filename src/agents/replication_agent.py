@@ -58,6 +58,7 @@ import pandas as pd
 from src import llm
 from src.agents.evaluation_agent import METRIC_LINE_FORMAT, parse_metric_lines
 from src.search import paper_fulltext
+from src.orchestration.handoff import request as handoff_request
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 REPLICATION_DIR = REPO_ROOT / "replication"
@@ -863,3 +864,11 @@ def run(parent_paper: dict, code_discovery_result: dict, cleaning_result: dict, 
         1 for m in cleaning_result.get("column_mappings", []) for c in m.get("columns", []) if c.get("accepted")
     )
     return result
+
+
+def handoff(result: dict, context: dict) -> list:
+    """The Replication Agent's request to Master Agent when it finishes: run
+    the Evaluation Agent on the new baseline."""
+    return [handoff_request("replication_agent", "Evaluation Agent", {},
+                            f"Baseline ran (status {(result or {}).get('status', '')}, source "
+                            f"{(result or {}).get('source', '')}); it must be compared with the paper.")]

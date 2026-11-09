@@ -36,7 +36,7 @@ runs deterministic leakage checks over the script
 (src/orchestration/code_checks.py -- e.g. SMOTE before the split), and
 asks one LLM call for findings and the ONE next action most likely to
 raise a valid score: collect more data (Data Agent), fix the baseline
-(Replication Agent), run one experiment (Experiment Agent), or accept.
+(Replication Agent), hand over to the Experiment Agent, or accept.
 Every LLM finding must quote evidence that really occurs in the script,
 output, paper or data facts, else it is UNVERIFIED and cannot drive a
 decision; fixed rules then check the decision itself (_decide). The agent
@@ -58,6 +58,7 @@ from src import llm
 from src.orchestration.code_checks import find_leakage
 from src.orchestration.dataset_budget import MAX_MASTER_ROWS
 from src.search import paper_fulltext
+from src.orchestration.handoff import request as handoff_request
 
 STDOUT_CHAR_LIMIT = 4000
 EXACT_THRESHOLD_POINTS = 1.0        # percentage points
@@ -233,8 +234,8 @@ ACTION_TARGET = {"rerun_data_agent": "Data Agent", "revise_replication": "Replic
 FINDING_CATEGORIES = ("data_leakage", "insufficient_data", "preprocessing", "method_mismatch", "hyperparameters",
                       "evaluation", "model_choice", "other")
 SEVERITIES = ("critical", "major", "minor")
-# Same catalog as experiment_agent.CODE_LEVEL_CATEGORIES (not imported:
-# experiment_agent imports this module).
+# Kinds of change the review may suggest with "run_experiment" -- a hint for
+# the Experiment Agent, which decides the actual rerun request itself.
 EXPERIMENT_CATEGORIES = ("alternative_model", "hyperparameter_change", "different_preprocessing",
                          "different_feature_selection", "alternative_loss_function",
                          "alternative_sampling_technique", "additional_evaluation_metric")
@@ -337,7 +338,9 @@ def _review_prompt(parent_paper: dict, paper: dict, replication_result: dict, sc
     static_lines = "\n".join(f"- line {f['line']}: {f['issue']} Evidence: `{f['evidence']}`" for f in static) \
         or "- none found"
     history_lines = "\n".join(
-        f"- round {h.get('round')}: {h.get('action')} -> {h.get('outcome', '')}" for h in history or []) or "- none"
+        f"- rerun {h.get('rerun', h.get('round'))}: {h.get('target_agent') or h.get('action')}"
+        + (f" ({'; '.join(h['instructions'])})" if h.get("instructions") else "")
+        + f" -> {h.get('outcome', '')}" for h in history or []) or "- none"
     source = replication_result.get("source", "")
     revisable = ("yes (reconstructed by this project)" if source == "reconstructed"
                  else "no (the authors' cloned repository is preserved as the baseline)")
@@ -380,7 +383,7 @@ Data actually used (from the Data and Cleaning Agents' records):
 Automated leakage checks over the script (deterministic):
 {static_lines}
 
-Earlier improvement rounds in this run (do not repeat an action that did not help):
+Earlier reruns in this run (do not repeat an action that did not help):
 {history_lines}
 
 Possible next actions:
@@ -389,8 +392,9 @@ Possible next actions:
 - "revise_replication": ask Master Agent to have the Replication Agent fix specific defects in the baseline script
   (leakage, wrong preprocessing order, deviations from the paper). Give precise "instructions". Only if the baseline
   can be revised (see above).
-- "run_experiment": the baseline is sound; ask for one controlled experiment. Give "experiment_category" (one of
-  {', '.join(EXPERIMENT_CATEGORIES)}) and "instructions".
+- "run_experiment": the baseline is valid; hand over to the Experiment Agent, which works on closing the gap to the
+  paper's score. Give a suggested "experiment_category" (one of {', '.join(EXPERIMENT_CATEGORIES)}) and
+  "instructions" as hints.
 - "accept": the baseline is valid and faithful; nothing would clearly improve it.
 
 Every finding must quote its evidence EXACTLY as it appears in the script, the run output, the paper text or the
@@ -467,7 +471,7 @@ def _decide(raw: dict, findings: list, static: list, facts: dict, source: str) -
         else:
             raw = dict(raw, target_entries=goal)
     if action == "run_experiment" and category not in EXPERIMENT_CATEGORIES:
-        notes.append(f"Experiment category '{category}' is not one the Experiment Agent supports; it chooses one.")
+        notes.append(f"Experiment category '{category}' is not a known category; the Experiment Agent decides.")
         category = ""
 
     return {
@@ -554,9 +558,9 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
     analyst and return the next-action request for Master Agent.
 
     cleaning_result/dataset_result describe the data actually used;
-    history lists earlier improvement rounds in this run
-    ([{"round", "action", "outcome"}]) so the review does not repeat an
-    action that did not help.
+    history lists earlier reruns in this run (Master Agent's rerun records:
+    "rerun", "target_agent", "instructions", "outcome") so the review does
+    not repeat an action that did not help.
     """
     parent_paper = parent_paper or {}
     replication_result = replication_result or {}
@@ -643,3 +647,16 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
         "requests": _request_for(decision, review_result),
         "notes": "",
     }
+
+
+def handoff(result: dict, context: dict) -> list:
+    """The Evaluation Agent's request to Master Agent when it finishes: its
+    validity request (a rerun of the Data or Replication Agent) when its
+    review made one, else run the Experiment Agent on the gap to the paper."""
+    reruns = [r for r in (result or {}).get("requests") or []
+              if r.get("action") in ("rerun_data_agent", "revise_replication")]
+    if reruns:
+        return reruns[:1]
+    return [handoff_request("evaluation_agent", "Experiment Agent", {},
+                            f"Evaluation done (overall {(result or {}).get('status', '')}); the gap to the paper's "
+                            "score needs a data scientist's analysis.")]

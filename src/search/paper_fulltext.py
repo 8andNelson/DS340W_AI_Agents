@@ -4,8 +4,11 @@ directly (Data Agent: which dataset, where, how large; Replication Agent:
 the methodology; Evaluation Agent: the published results and procedure).
 
 Only a legal open-access copy is ever fetched: OpenAlex's open-access PDF
-links for the paper (by DOI, else by exact title), and the paper's own URL
-when it is itself a PDF or an arXiv page. Content is sniffed (%PDF), never
+links for the paper (by DOI, else by exact title), and the paper's own URL.
+Article pages are inspected for individual View PDF links or citation PDF
+metadata; full-issue and bulk downloads are excluded. Blocked links are
+retried through the local Camoufox browser by src/search/page_fetch.py.
+Content is sniffed (%PDF), never
 trusted, and the text is extracted with pypdf. The PDF and its text are
 kept in papers/parent/ (gitignored), so each agent reads the same copy and
 the paper is downloaded once per Parent Paper.
@@ -25,6 +28,9 @@ from pathlib import Path
 
 import requests
 
+from src.search import page_fetch, content_validator
+from src.search.pdf_links import article_pdf_links, is_bulk_download
+
 REPO_ROOT = Path(__file__).parent.parent.parent
 PARENT_PAPER_DIR = REPO_ROOT / "papers" / "parent"
 
@@ -32,8 +38,7 @@ OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 TIMEOUT_SECONDS = 30
 MAX_PDF_BYTES = 50 * 1024 * 1024
 MIN_FULL_TEXT_CHARS = 2000  # less than this is a cover page or a failed extraction
-# Identify honestly (CLAUDE.md); publishers that refuse non-browser clients
-# are skipped, not tricked.
+# Identify direct requests honestly; Camoufox is used only when blocked.
 USER_AGENT = "DS340W-AI-Agents-Pipeline/1.0 (open-access paper fetch)"
 
 # OpenAlex sometimes lists a publisher's reference-list PDF as a work's
@@ -71,43 +76,70 @@ def _openalex_work(doi: str, title: str) -> dict | None:
 
 
 def candidate_pdf_urls(parent_paper: dict) -> list:
-    """Every legal open-access PDF link known for the paper, best first."""
+    """PDF links and article pages from which an individual PDF can be found."""
     urls = []
     work = _openalex_work(parent_paper.get("doi", ""), parent_paper.get("title", ""))
     if work:
         locations = [work.get("best_oa_location"), work.get("primary_location"), *(work.get("locations") or [])]
         urls += [(loc or {}).get("pdf_url") or "" for loc in locations]
         urls.append((work.get("open_access") or {}).get("oa_url") or "")
+    access = parent_paper.get("reachability") or {}
+    if access.get("reachable") and access.get("access_level") == "FULL_TEXT":
+        urls.append(access.get("source_url", ""))
     paper_url = parent_paper.get("paper_url", "") or ""
     arxiv = _ARXIV_ABS.search(paper_url)
     if arxiv:
         urls.append(f"https://arxiv.org/pdf/{arxiv.group(1)}")
-    elif paper_url.lower().endswith(".pdf"):
+    elif paper_url:
         urls.append(paper_url)
 
     unique = []
     for url in urls:
-        if url and not url.lower().endswith(_NOT_THE_PAPER) and url not in unique:
+        if url and not is_bulk_download(url) and not url.lower().endswith(_NOT_THE_PAPER) and url not in unique:
             unique.append(url)
     return unique
 
 
-def _download_pdf(url: str) -> bytes | None:
+def _download_pdf(url: str, _seen: set | None = None, _depth: int = 0) -> bytes | None:
+    """The PDF at url, or None. Blocked responses can use local Camoufox.
+    Accessible HTML is inspected for individual article PDF controls, with
+    bounded recursion and no bulk downloads."""
+    if is_bulk_download(url) or _depth > 2:
+        return None
+    seen = _seen if _seen is not None else set()
+    if url in seen:
+        return None
+    seen.add(url)
+    response = None
+    links = []
     try:
-        response = requests.get(url, timeout=TIMEOUT_SECONDS, stream=True, headers={"User-Agent": USER_AGENT})
-        if response.status_code != 200:
-            return None
+        response = page_fetch.get(url, timeout=TIMEOUT_SECONDS, stream=True, expect_pdf=True,
+                                  headers={"User-Agent": USER_AGENT})
         chunks, size = [], 0
         for chunk in response.iter_content(64 * 1024):
             size += len(chunk)
             if size > MAX_PDF_BYTES:
                 return None
             chunks.append(chunk)
+        content = b"".join(chunks)
+        result = content_validator.classify(response.status_code, response.headers, content, expected="pdf")
+        if result["verdict"] == "ACCESSIBLE":
+            return content
+        page = content_validator.classify(response.status_code, response.headers, content)
+        if page["verdict"] == "ACCESSIBLE" and content_validator._is_html(
+                response.headers.get("Content-Type", ""), content):
+            resolved = getattr(response, "url", url)
+            links = article_pdf_links(content, resolved if isinstance(resolved, str) else url)
     except requests.RequestException:
         return None
-    content = b"".join(chunks)
-    # Sniff, don't trust: an "open-access PDF" link can serve an HTML page.
-    return content if content.startswith(b"%PDF") else None
+    finally:
+        if response is not None:
+            response.close()
+    for link in links[:3]:
+        content = _download_pdf(link, seen, _depth + 1)
+        if content:
+            return content
+    return None
 
 
 def extract_text(pdf_bytes: bytes) -> tuple[str, int]:
@@ -180,6 +212,8 @@ def get_parent_paper_text(parent_paper: dict, use_cache: bool = True) -> dict:
             continue
         text, pages = extract_text(content)
         if len(text) < MIN_FULL_TEXT_CHARS:
+            continue
+        if parent_paper.get("title") and not content_validator.expected_text_found(text[:6000], parent_paper["title"]):
             continue
         PARENT_PAPER_DIR.mkdir(parents=True, exist_ok=True)
         pdf_path.write_bytes(content)

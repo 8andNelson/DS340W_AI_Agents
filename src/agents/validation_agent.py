@@ -15,11 +15,10 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-import requests
-
 from src import llm
 from src.agents.research_agent import _title_key, is_retracted
 from src.search import openalex
+from src.orchestration.handoff import request as handoff_request
 
 # Domains that are prohibited as academic paper sources
 PROHIBITED_DOMAINS = [
@@ -111,39 +110,16 @@ def _check_prohibited_source(url: str) -> str:
     return ""
 
 
-# A realistic browser UA -- some hosts (e.g. Kaggle) return 403s to an
-# identifying bot User-Agent even for pages that are genuinely public,
-# producing false "unreachable" verdicts.
-_REACHABILITY_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-)
-
-
-def _check_url_reachable(url: str) -> tuple[bool, int]:
-    """Return (reachable, status_code) for a URL. Falls back to GET whenever
-    HEAD fails to confirm reachability -- either by raising, or by coming
-    back >= 400 -- since some hosts (e.g. Kaggle) don't implement HEAD
-    correctly on dataset pages and return a 404 for it even though the page
-    is genuinely live."""
-    if not url:
-        return False, 0
-    try:
-        resp = requests.head(url, timeout=URL_TIMEOUT, allow_redirects=True,
-                             headers={"User-Agent": _REACHABILITY_USER_AGENT})
-        if resp.status_code < 400:
-            return True, resp.status_code
-    except Exception:
-        pass
-
-    try:
-        resp = requests.get(url, timeout=URL_TIMEOUT, allow_redirects=True,
-                            headers={"User-Agent": _REACHABILITY_USER_AGENT},
-                            stream=True)
-        resp.close()
-        return resp.status_code < 400, resp.status_code
-    except Exception:
-        return False, 0
+def _check_url_reachable(url: str, title: str = "", doi: str = "",
+                         evidence: dict = None) -> tuple[bool, int]:
+    """Require fetched, unblocked content; optionally verify paper identity."""
+    from src.search import paper_access
+    result = paper_access.check(url, title=title, doi=doi, timeout=URL_TIMEOUT,
+                                source_check=(lambda candidate: not _check_prohibited_source(candidate))
+                                if title or doi else None)
+    if evidence is not None:
+        evidence.update(result)
+    return result["reachable"], result["status_code"]
 
 
 def _is_credible_domain(url: str) -> bool:
@@ -681,7 +657,13 @@ def run(papers: list) -> dict:
     # Layer 2 — URL reachability check
     print(f"[Validation Agent] Layer 2: Checking URL reachability for {len(pending)} papers...")
     with ThreadPoolExecutor(max_workers=URL_CHECK_WORKERS) as pool:
-        reachability = list(pool.map(lambda p: _check_url_reachable(p.get("paper_url", "")), pending))
+        def check_paper(p):
+            evidence = {}
+            result = _check_url_reachable(p.get("paper_url", ""), title=p.get("title", ""),
+                                          doi=p.get("doi", ""), evidence=evidence)
+            p["reachability"] = evidence
+            return result
+        reachability = list(pool.map(check_paper, pending))
     for p, (reachable, status) in zip(pending, reachability):
         p["url_reachable"] = reachable
         credible = _is_credible_domain(p.get("paper_url", ""))
@@ -712,6 +694,13 @@ def run(papers: list) -> dict:
                 p.setdefault("validated_reproducibility", 0)
                 p.setdefault("validation_notes", "LLM assessment unavailable")
 
+    # Metadata validation cannot turn an inaccessible page into access evidence.
+    for p in pending:
+        if not p.get("url_reachable") and p.get("validation_status") != "REJECTED":
+            p["validation_status"] = "UNVERIFIED"
+            p["validation_notes"] = (p.get("validation_notes", "") +
+                                     " Paper content could not be verified as accessible.").strip()
+
     # A paper the LLM's response skipped would otherwise stay PENDING and
     # fall out of every tally below without a trace.
     for p in pending:
@@ -740,3 +729,12 @@ def run(papers: list) -> dict:
     selection = rank_and_recommend(tally)
     _attach_official_record(selection.get("recommended_parent_paper"))
     return {**tally, **selection}
+
+
+def handoff(result: dict, context: dict) -> list:
+    """The Validation Agent's request to Master Agent when it finishes: run
+    the Data Agent for the recommended Parent Paper."""
+    parent = (result or {}).get("recommended_parent_paper") or {}
+    return [handoff_request("validation_agent", "Data Agent",
+                            {"parent_paper": parent, "ranked_pool": (result or {}).get("ranked_pool") or []},
+                            f"Parent Paper recommended: '{parent.get('title', '')}'. Its dataset is needed next.")]

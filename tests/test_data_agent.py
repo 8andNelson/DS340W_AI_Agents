@@ -293,7 +293,7 @@ class TestKaggleSearchIntegration(unittest.TestCase):
 
     def test_kaggle_results_merged_into_exploration_extraction(self):
         kaggle_hit = {"title": "Kaggle Hit", "url": "https://www.kaggle.com/datasets/a/b", "description": ""}
-        with patch("src.search.brave_search.search_dataset_sites", return_value=[]), \
+        with patch("src.search.web_search.search_dataset_sites", return_value=[]), \
              patch.object(data_agent, "_search_kaggle_datasets", return_value=[kaggle_hit]) as kaggle_mock, \
              patch.object(data_agent, "_extract_dataset_candidates_from_results", return_value=[]) as extract_mock:
             data_agent._search_exploration_sites("fraud detection scope")
@@ -306,7 +306,7 @@ class TestKaggleSearchIntegration(unittest.TestCase):
         """Verified live: the long scope description returns zero Kaggle
         results, so the short search_query is what gets sent -- while the
         extraction/scope check still sees the full description."""
-        with patch("src.search.brave_search.search_dataset_sites", return_value=[]) as brave_mock, \
+        with patch("src.search.web_search.search_dataset_sites", return_value=[]) as brave_mock, \
              patch.object(data_agent, "_search_kaggle_datasets", return_value=[{"title": "t", "url": "u"}]) as kaggle_mock, \
              patch.object(data_agent, "_extract_dataset_candidates_from_results", return_value=[]) as extract_mock:
             data_agent._search_exploration_sites(
@@ -324,13 +324,13 @@ class TestKaggleSearchIntegration(unittest.TestCase):
         self.assertEqual(explore_mock.call_args.args[2], "credit card fraud")
 
     def test_results_per_query_within_brave_limit(self):
-        from src.search import brave_search
-        self.assertLessEqual(data_agent.RESULTS_PER_QUERY, brave_search.BRAVE_MAX_COUNT)
+        from src.search import web_search
+        self.assertLessEqual(data_agent.RESULTS_PER_QUERY, web_search.MAX_COUNT)
 
     def test_kaggle_results_merged_into_resolve_dataset_extraction(self):
         kaggle_hit = {"title": "Kaggle Hit", "url": "https://www.kaggle.com/datasets/a/b", "description": ""}
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
-             patch("src.search.brave_search.search", return_value=[]), \
+             patch("src.search.web_search.search", return_value=[]), \
              patch.object(data_agent, "_search_kaggle_datasets", return_value=[kaggle_hit]) as kaggle_mock, \
              patch.object(data_agent, "_extract_dataset_candidates_from_results", return_value=[]) as extract_mock:
             data_agent._resolve_dataset(
@@ -361,7 +361,7 @@ class TestResolveDataset(unittest.TestCase):
     def test_cache_hit_skips_search_entirely(self):
         cached = make_link_candidate("https://kaggle.com/cached", entry_count=9000)
         with patch.object(dataset_cache, "get_cached_dataset", return_value=cached) as get_cached, \
-             patch("src.search.brave_search.search") as search_mock:
+             patch("src.search.web_search.search") as search_mock:
             candidate = data_agent._resolve_dataset(
                 "Cached Dataset", "", "", "", query_builder=data_agent._build_query,
             )
@@ -389,7 +389,7 @@ class TestResolveDataset(unittest.TestCase):
 
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
-             patch("src.search.brave_search.search", return_value=[
+             patch("src.search.web_search.search", return_value=[
                  {"title": "Unsized Dataset", "url": "https://github.com/example/unsized", "description": ""}
              ]), \
              patch("requests.post", return_value=llm_response), \
@@ -423,7 +423,7 @@ class TestResolveDataset(unittest.TestCase):
 
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
-             patch("src.search.brave_search.search", return_value=[
+             patch("src.search.web_search.search", return_value=[
                  {"title": "Big Dataset", "url": "https://github.com/example/big", "description": ""}
              ]), \
              patch("requests.post", return_value=llm_response), \
@@ -448,7 +448,7 @@ class TestResolveDataset(unittest.TestCase):
 
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
-             patch("src.search.brave_search.search", return_value=[
+             patch("src.search.web_search.search", return_value=[
                  {"title": "Undownloadable Dataset", "url": "https://kaggle.com/gated", "description": ""}
              ]), \
              patch("requests.post", return_value=llm_response), \
@@ -479,7 +479,7 @@ class TestResolveDataset(unittest.TestCase):
 
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
-             patch("src.search.brave_search.search", return_value=[
+             patch("src.search.web_search.search", return_value=[
                  {"title": "Anonymized Dataset", "url": "https://kaggle.com/anon", "description": ""}
              ]), \
              patch("requests.post", return_value=llm_response), \
@@ -516,7 +516,7 @@ class TestResolveDataset(unittest.TestCase):
 
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset"), \
-             patch("src.search.brave_search.search", return_value=[
+             patch("src.search.web_search.search", return_value=[
                  {"title": "First", "url": "https://example.com/first", "description": ""},
                  {"title": "Second", "url": "https://example.com/second", "description": ""},
              ]), \
@@ -539,7 +539,7 @@ class TestResolveDataset(unittest.TestCase):
 
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
-             patch("src.search.brave_search.search", return_value=[
+             patch("src.search.web_search.search", return_value=[
                  {"title": "Broken Dataset", "url": "https://example.com/broken", "description": ""}
              ]), \
              patch("requests.post", return_value=llm_response), \
@@ -561,7 +561,7 @@ class TestResolveDataset(unittest.TestCase):
 
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
-             patch("src.search.brave_search.search", return_value=[
+             patch("src.search.web_search.search", return_value=[
                  {"title": "Unrelated Dataset", "url": "https://kaggle.com/unrelated", "description": ""}
              ]), \
              patch("requests.post", return_value=llm_response), \
@@ -576,7 +576,7 @@ class TestResolveDataset(unittest.TestCase):
     def test_failed_search_is_never_cached_allowing_a_later_retry(self):
         with patch.object(dataset_cache, "get_cached_dataset", return_value=None), \
              patch.object(dataset_cache, "cache_dataset") as cache_dataset, \
-             patch("src.search.brave_search.search", side_effect=RuntimeError("network down")):
+             patch("src.search.web_search.search", side_effect=RuntimeError("network down")):
             candidate = data_agent._resolve_dataset(
                 "Some Dataset", "", "", "", query_builder=data_agent._build_query,
             )
@@ -686,7 +686,7 @@ class TestDescribeProvenance(unittest.TestCase):
     def test_describes_fresh_search_and_stated_count(self):
         candidate = make_candidate(verification_method="brave_search", entry_count_source="search result")
         desc = data_agent._describe_provenance(candidate)
-        self.assertIn("Brave search", desc)
+        self.assertIn("web search (Brave or SerpAPI)", desc)
         self.assertIn("stated in the search result", desc)
 
     def test_describes_exploration_search_and_huggingface_count(self):
@@ -758,7 +758,7 @@ class TestHuggingFaceLookup(unittest.TestCase):
 
 
 def make_response(content: bytes, content_type: str = "") -> MagicMock:
-    resp = MagicMock()
+    resp = MagicMock(status_code=200)
     resp.headers = {"Content-Type": content_type}
     resp.content = content
     resp.raise_for_status = lambda: None
@@ -1229,6 +1229,9 @@ class TestFetchPageText(unittest.TestCase):
         response = MagicMock()
         response.raise_for_status = lambda: None
         response.text = "<html><head><script>bad()</script></head><body><p>Hello world</p></body></html>"
+        response.status_code = 200
+        response.headers = {"Content-Type": "text/html"}
+        response.content = response.text.encode("utf-8")
         with patch("requests.get", return_value=response):
             text = data_agent._fetch_page_text("https://example.com/data")
         self.assertIn("Hello world", text)
