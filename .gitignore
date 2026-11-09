@@ -15,6 +15,7 @@ reports/
 presentations/
 logs/
 database/
+dashboard_files/
 
 # Keep directory structure
 !**/.gitkeep

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Research Agents Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="20" height="20"><circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M12 7.5v4M12 11.5l-5.5 5M12 11.5l5.5 5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+      </div>
+      <div>
+        <div class="brand-title">Research Agents</div>
+        <div class="brand-sub">Multi-agent replication</div>
+      </div>
+    </div>
+
+    <section class="run-card" id="run-card" aria-live="polite">
+      <div class="run-card-label" id="run-card-label">Current run</div>
+      <div class="run-card-topic" id="run-card-topic">No runs yet</div>
+      <div class="run-card-meta">
+        <span class="badge" id="run-card-status"></span>
+        <span class="muted small" id="run-card-time"></span>
+      </div>
+      <a class="btn sm" id="run-card-back" href="#overview" hidden>Back to the current run</a>
+    </section>
+
+    <nav class="nav" id="nav">
+      <a href="#overview" data-view="overview">Overview</a>
+      <a href="#agents" data-view="agents">Agent outputs</a>
+      <a href="#papers" data-view="papers">Papers</a>
+      <a href="#datasets" data-view="datasets">Datasets</a>
+      <a href="#scripts" data-view="scripts">Scripts</a>
+      <a href="#documents" data-view="documents">Documents</a>
+      <a href="#activity" data-view="activity">Master Agent log</a>
+      <a href="#runs" data-view="runs" class="nav-runs">Run history</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="phase" id="phase-label"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="past-banner" id="past-banner" hidden>
+      <span>You are looking at a past run. Everything on this page is that run's own record.</span>
+      <a class="btn sm" href="#overview" id="past-banner-back">Back to the current run</a>
+    </div>
+
+    <!-- Overview -->
+    <section class="view" id="view-overview">
+      <header class="view-head">
+        <h1>Overview</h1>
+        <p class="muted">Enter a machine learning or data topic. The Master Agent runs each agent in order, checks its work, and when an agent fails, diagnoses the failure and runs the agent again (at most 5 tries).</p>
+      </header>
+
+      <form class="card prompt" id="prompt-form">
+        <label for="topic" class="label">Research topic</label>
+        <textarea id="topic" rows="2" maxlength="500" placeholder="e.g. machine learning for detecting credit card fraud"></textarea>
+        <div class="prompt-row">
+          <label class="check"><input type="checkbox" id="reset"> Reset project state first</label>
+          <div class="spacer"></div>
+          <span class="form-msg" id="form-msg" role="status"></span>
+          <button type="button" class="btn ghost danger" id="stop-btn" hidden>Stop run</button>
+          <button type="submit" class="btn primary" id="start-btn">Start run</button>
+        </div>
+      </form>
+
+      <div class="card router" id="router" hidden>
+        <div class="router-row">
+          <span class="router-dot" id="router-dot" aria-hidden="true"></span>
+          <div class="router-text">
+            <strong>Model router (FreeLLMAPI)</strong>
+            <span class="muted small" id="router-msg"></span>
+          </div>
+          <div class="spacer"></div>
+          <a class="btn sm ghost" id="router-open" target="_blank" rel="noopener">Open router dashboard</a>
+          <button class="btn sm" id="router-start">Start router</button>
+          <button class="btn sm ghost danger" id="router-stop">Stop router</button>
+        </div>
+        <details class="router-log"><summary>Startup log</summary><pre id="router-log"></pre></details>
+      </div>
+
+      <p class="muted small run-note" id="run-note"></p>
+      <div class="summary-row" id="summary-row"></div>
+
+      <div class="section-head">
+        <h2>Pipeline</h2>
+      </div>
+      <div class="pipeline" id="pipeline"></div>
+
+      <div class="section-head">
+        <h2>Console</h2>
+        <label class="check small"><input type="checkbox" id="autoscroll" checked> Follow output</label>
+      </div>
+      <pre class="console" id="console"></pre>
+    </section>
+
+    <!-- Agent outputs -->
+    <section class="view" id="view-agents" hidden>
+      <header class="view-head">
+        <h1>Agent outputs</h1>
+        <p class="muted">Each agent's attempts in this run: the report it wrote and the structured output the Master Agent checked.</p>
+      </header>
+      <div class="split">
+        <div class="list" id="agent-list"></div>
+        <div class="detail" id="agent-detail"><div class="empty">Select an agent.</div></div>
+      </div>
+    </section>
+
+    <!-- Papers -->
+    <section class="view" id="view-papers" hidden>
+      <header class="view-head">
+        <h1>Papers</h1>
+        <p class="muted">The papers this run's Research Agent found, with the Validation Agent's verdicts. Open-access PDFs can be fetched and viewed here.</p>
+      </header>
+      <div id="papers"></div>
+    </section>
+
+    <!-- Datasets -->
+    <section class="view" id="view-datasets" hidden>
+      <header class="view-head">
+        <h1>Datasets</h1>
+        <p class="muted">The datasets this run downloaded, and the master CSV and splits it built from them.</p>
+      </header>
+      <div class="card table-card"><div class="table-wrap"><table class="table" id="dataset-table"></table></div></div>
+      <div class="card preview" id="dataset-preview" hidden>
+        <div class="preview-head">
+          <div>
+            <div class="preview-title" id="preview-title"></div>
+            <div class="muted small" id="preview-meta"></div>
+          </div>
+          <div class="btn-group">
+            <button class="btn ghost" id="preview-prev">Previous</button>
+            <button class="btn ghost" id="preview-next">Next</button>
+            <a class="btn" id="preview-download">Download CSV</a>
+            <button class="btn ghost" id="preview-close">Close</button>
+          </div>
+        </div>
+        <div class="table-wrap tall"><table class="table data" id="preview-table"></table></div>
+      </div>
+    </section>
+
+    <!-- Scripts -->
+    <section class="view" id="view-scripts" hidden>
+      <header class="view-head">
+        <h1>Scripts</h1>
+        <p class="muted">Code the Replication and Experiment Agents wrote or ran in this run, exactly as the run recorded it.</p>
+      </header>
+      <div class="split">
+        <div class="list" id="script-list"></div>
+        <div class="detail" id="script-detail"><div class="empty">Select a script.</div></div>
+      </div>
+    </section>
+
+    <!-- Documents -->
+    <section class="view" id="view-documents" hidden>
+      <header class="view-head">
+        <h1>Documents</h1>
+        <p class="muted">PDFs that belong to this run: documents its agents produced, and open-access copies of its papers.</p>
+      </header>
+      <div class="split">
+        <div class="list" id="pdf-list"></div>
+        <div class="detail pdf-detail" id="pdf-detail"></div>
+      </div>
+    </section>
+
+    <!-- Activity -->
+    <section class="view" id="view-activity" hidden>
+      <header class="view-head">
+        <h1>Master Agent log</h1>
+        <p class="muted">Every approval and correction the Master Agent made during this run, newest first.</p>
+      </header>
+      <div class="filters" id="activity-filters">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="Approval">Approvals</button>
+        <button class="chip" data-filter="Correction">Corrections</button>
+      </div>
+      <div class="timeline" id="activity"></div>
+    </section>
+
+    <!-- Runs -->
+    <section class="view" id="view-runs" hidden>
+      <header class="view-head">
+        <h1>Run history</h1>
+        <p class="muted">Every pipeline run. Open one to see its papers, datasets, scripts, documents and decisions on every page.</p>
+      </header>
+      <div class="run-list" id="run-list"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
