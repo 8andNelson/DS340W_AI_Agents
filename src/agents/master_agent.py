@@ -4,8 +4,7 @@ Master Agent (Milestone 5+).
 Orchestrates and supervises the pipeline. Master Agent is the only module
 that invokes intake_agent, research_agent, validation_agent (which now also
 performs Parent Paper selection -- see validation_agent.rank_and_recommend),
-and data_agent (which builds a >=10k-entry dataset pool for the Parent
-Paper). It does not re-score, re-select, or re-search anything itself; that
+data_agent and every later agent. It does not re-score, re-select, or re-search anything itself; that
 logic stays inside the specialized agents. Master Agent's job is to act as
 the boss: run each agent, independently check its output against the hard
 academic requirements in CLAUDE.md, and hold it accountable when it fails.
@@ -15,15 +14,22 @@ For every stage:
   2. Write a saveable, human-readable report of what it produced
      (logs/agent_reports/<agent>_attempt<N>.txt).
   3. Check the output. No issues -> log an Approval entry, advance.
-  4. Issues found and a retry remains -> log a Correction entry describing
-     exactly what failed, log that it is retrying, and re-run the agent once.
-  5. Issues found and no retries remain -> log a final Correction/rejection
-     and halt the pipeline.
+  4. Issues found (or an exception) -> diagnose the failure (one LLM call,
+     _diagnose), log the diagnosis as a Correction, and re-run the agent
+     with every diagnosis so far in its LLM prompts (llm.supervisor_notes).
+  5. After MAX_ATTEMPTS (5) errors -> log a final Correction/rejection and
+     halt the pipeline.
 
 Per CLAUDE.md's "Autonomous Operation" policy, Master Agent never blocks on
-a human prompt -- retry-once-then-halt is itself the final decision, and
+a human prompt -- diagnose-and-retry-then-halt is itself the final decision, and
 every step is logged (both the structured JSON log and the saveable text
 reports) so a person can review the full trail after the fact.
+
+Agents never run other agents. After the first evaluation, the Evaluation
+Agent may request one next action (more data, or a fix to the baseline);
+Master Agent checks that request, runs the requested agent and the stages
+downstream of it, and has the new baseline reviewed again -- at most
+MAX_IMPROVEMENT_ROUNDS times (see _improvement_rounds).
 
 Slack is the human-observable layer on top of that same trail (Milestone
 7): every agent invocation posts its own start/finish message (via
@@ -37,6 +43,8 @@ unreachable Slack channel never changes pipeline behavior, only its
 visibility.
 """
 import json
+import shutil
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,12 +52,21 @@ from src.orchestration import run_store
 from src.slack import slack_client, message_formatter
 
 MIN_QUALIFYING = 5
-MAX_ATTEMPTS = 2  # first attempt + one retry
+# A stage halts after this many errors (failed attempts). Between attempts
+# Master Agent diagnoses the failure and re-runs the agent with that
+# diagnosis (see _supervise and _diagnose).
+MAX_ATTEMPTS = 5
+DIAGNOSIS_TEXT_CHARS = 4000  # of the failure and of the agent's report, per diagnosis prompt
+FAILURE_NOTE_CHARS = 600     # of the raw failure, in each note passed to the retried agent
 DATA_REQUEST_TARGET_INCREMENT = 5000  # fallback bump when a Slack request
                                        # doesn't state an explicit target=<int>
+# How many times Master Agent acts on an Evaluation Agent request (more data,
+# or a fix to the baseline) before moving on to the Experiment Agent.
+MAX_IMPROVEMENT_ROUNDS = 2
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 LOG_FILE = REPO_ROOT / "logs" / "master_agent_log.json"
+ROUND_BACKUP_DIR = REPO_ROOT / "logs" / "round_backups"
 REPORT_DIR = REPO_ROOT / "logs" / "agent_reports"
 SLACK_SUMMARY_MAX_CHARS = 600
 
@@ -170,15 +187,34 @@ def _format_data_report(result: dict) -> str:
     lines = [
         "[Data Agent] Dataset pool for Parent Paper replication",
         f"Status:        {result.get('status', '')}",
+        f"Mode:          {result.get('mode', 'parent_only')}"
+        + ("" if result.get("parent_dataset_found", True) else "  (Parent Paper's own dataset NOT found; substitute)"),
+        f"Paper read:    {result.get('paper_text_notes') or result.get('paper_text_status') or 'unknown'}",
         f"Search stage:  {result.get('search_stage', '')}",
-        f"Total entries: {result.get('total_entries', 0)} / {result.get('target_entries', 10000)} "
-        f"(target met: {result.get('target_met', False)})",
+        f"Total entries: {result.get('total_entries', 0)} / {result.get('target_entries') or 'no target'} "
+        f"(target met: {result.get('target_met')})",
         f"Datasets used: {len(result.get('selected_datasets', []))} "
         f"(considered {result.get('datasets_considered', 0)} papers)",
     ]
+    plan = result.get("data_plan") or {}
+    if plan:
+        lines.append("Data plan (read from the Parent Paper; the suggested size is advice for the Evaluation Agent):")
+        if plan.get("target_entries"):
+            lines.append(f"  Suggested rows:       {plan['target_entries']}")
+        if plan.get("paper_model"):
+            lines.append(f"  Paper's model:        {plan['paper_model']}")
+        if plan.get("dataset_urls"):
+            lines.append(f"  Links in the paper:   {', '.join(plan['dataset_urls'])}")
+        if plan.get("paper_dataset"):
+            size = plan.get("paper_dataset_size")
+            lines.append(f"  Paper's dataset:      {plan['paper_dataset']}"
+                         + (f" ({size} rows, as stated in the paper)" if size else ""))
+        lines.append(f"  Reasoning:            {plan.get('reasoning') or 'none given'}")
     for d in result.get("selected_datasets", []):
         label = d.get("display_name") or d.get("name", "")
         lines.append(f"  - {label} ({d.get('source', '')}): {d.get('entry_count', '?')} entries -> {d.get('name', '')}")
+        if d.get("column_notes"):
+            lines.append(f"      note: {d['column_notes']}")
     if result.get("warnings"):
         lines.append("Warnings:")
         lines.extend(f"  - {w}" for w in result["warnings"])
@@ -191,7 +227,7 @@ def _format_cleaning_report(result: dict) -> str:
         f"Status:            {result.get('status', '')}",
         f"Datasets merged:   {result.get('datasets_merged', 0)} / {result.get('datasets_attempted', 0)}",
         f"Rows / columns:    {result.get('rows_total', 0)} / {result.get('columns_total', 0)} "
-        f"(target: {result.get('target_rows', 10000)}, target met: {result.get('target_met', False)})",
+        f"(target: {result.get('target_rows') or 'none'}, target met: {result.get('target_met')})",
         f"Master CSV:        {result.get('master_csv_path', '')}",
     ]
     split_rows = result.get("split_rows") or {}
@@ -267,6 +303,31 @@ def _format_evaluation_report(result: dict) -> str:
     if result.get("likely_causes"):
         lines.append("Likely causes:")
         lines.extend(f"  - {c}" for c in result["likely_causes"])
+    review = result.get("review") or {}
+    if review:
+        lines.append(f"Senior analyst review (paper read: {review.get('paper_text_status') or 'unknown'}; "
+                     f"reviewed by {review.get('reviewed_by') or 'unknown model'}):")
+        if review.get("assessment"):
+            lines.append(f"  {review['assessment']}")
+        for f in review.get("static_findings", []):
+            lines.append(f"  - [{f['severity']}] {f['issue']} (automated check, line {f['line']}: {f['evidence']})")
+        for f in review.get("findings", []):
+            mark = "" if f.get("verified") else " UNVERIFIED (evidence not found; not used for the decision)"
+            lines.append(f"  - [{f['severity']}, {f['category']}] {f['issue']} Evidence: \"{f['evidence']}\"{mark}")
+            if f.get("fix"):
+                lines.append(f"      fix: {f['fix']}")
+    decision = result.get("decision") or {}
+    if decision:
+        lines.append(f"Decision: {decision.get('action', '')}"
+                     + (f" -> {decision['target_agent']}" if decision.get("target_agent") else ""))
+        if decision.get("reason"):
+            lines.append(f"  Reason: {decision['reason']}")
+        if decision.get("target_entries"):
+            lines.append(f"  Data goal: {decision['target_entries']} entries")
+        for instruction in decision.get("instructions") or []:
+            lines.append(f"  - {instruction}")
+        for note in review.get("decision_notes") or []:
+            lines.append(f"  Check: {note}")
     return "\n".join(lines)
 
 
@@ -302,7 +363,7 @@ def _check_intake(structured: dict) -> list:
             "Correction", "Intake Agent",
             "Intake Agent produced no usable domain, keywords, or search queries from the topic.",
             "Rejected",
-            "Re-run Intake Agent; if it fails again, escalate for manual topic clarification.",
+            "Diagnose the failure and re-run Intake Agent with the diagnosis.",
         )]
     return []
 
@@ -443,10 +504,10 @@ def _check_data(result: dict) -> list:
         return [_log_entry(
             "Correction", "Data Agent",
             "Data Agent found zero usable datasets (verified, in-scope, downloaded, and passing "
-            "the reproducibility-fit check) across the Parent Paper and its ranked alternates. "
+            "the target-fit check) across the Parent Paper and its ranked alternates. "
             f"Warnings: {'; '.join(result.get('warnings', [])) or 'none reported'}.",
             "Rejected",
-            "Re-run Data Agent; if it fails again, halt for manual dataset review.",
+            "Diagnose the failure and re-run Data Agent with the diagnosis.",
         )]
     return []
 
@@ -465,7 +526,7 @@ def _check_cleaning(result: dict) -> list:
             "Correction", "Cleaning Agent",
             f"Cleaning Agent could not merge any dataset into a master CSV. Conflicts: {conflict_reasons}.",
             "Rejected",
-            "Re-run Cleaning Agent; if it fails again, halt for manual dataset review.",
+            "Diagnose the failure and re-run Cleaning Agent with the diagnosis.",
         )]
     return []
 
@@ -491,8 +552,9 @@ def _check_replication(result: dict) -> list:
     pipeline genuinely needs a working, executed baseline before
     advancing to evaluation/experimentation. BLOCKED (install/entry-point/
     execution failure) and TIMEOUT both trigger Master Agent's normal
-    retry-once-then-halt, which matters especially for the reconstruction
-    path, where a fresh retry re-generates via a non-deterministic LLM call.
+    diagnose-and-retry, which matters especially for the reconstruction
+    path, where a retry re-generates the script with the diagnosis (the
+    earlier traceback and what to change) in its prompt.
     """
     if result.get("status") != "OK":
         return [_log_entry(
@@ -500,7 +562,7 @@ def _check_replication(result: dict) -> list:
             f"Replication Agent did not produce a working baseline (status={result.get('status', '')}, "
             f"source={result.get('source', '')}). Warnings: {'; '.join(result.get('warnings', [])) or 'none reported'}.",
             "Rejected",
-            "Re-run Replication Agent; if it fails again, halt for manual environment/code review.",
+            "Diagnose the failure and re-run Replication Agent with the diagnosis.",
         )]
     return []
 
@@ -531,91 +593,161 @@ def _check_experiment(result: dict) -> list:
     return []
 
 
-def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int = MAX_ATTEMPTS):
-    """
-    Invoke run_fn() up to max_attempts times, independently checking its
-    output with checker_fn after each attempt. Writes a saveable report after
-    every attempt and logs Correction/Approval entries to LOG_FILE.
+# --- Diagnosing a failed attempt ---
 
-    Returns (output, blockers). blockers is empty when the stage passed
-    (on the first attempt or after a retry); non-empty means the stage is
-    rejected and the pipeline should halt.
+# What each agent is for, so the diagnosis call knows the agent's job.
+AGENT_ROLES = {
+    "Intake Agent": "turns the user's topic into a structured research request (domain, ML task, keywords, "
+                    "search queries, target terms).",
+    "Research Agent": "searches academic sources for at least 5 peer-reviewed papers from 2022 to now on the topic.",
+    "Validation Agent": "verifies each paper (real, peer reviewed, 2022+, credible venue), ranks the qualifying "
+                        "papers and recommends one Parent Paper.",
+    "Data Agent": "reads the Parent Paper, finds its dataset, downloads it and converts it to a local CSV.",
+    "Cleaning Agent": "merges the downloaded CSVs into one labelled master CSV and splits it into train/test/validation.",
+    "Code Discovery Agent": "searches for the Parent Paper's own implementation code.",
+    "Replication Agent": "runs the authors' code, or reconstructs a baseline script from the paper, in an isolated "
+                         "virtualenv on the master CSV.",
+    "Evaluation Agent": "compares the reproduced metrics with the paper's published results and reviews the "
+                        "baseline as a senior data analyst.",
+    "Experiment Agent": "runs one controlled, single-variable experiment against the preserved baseline.",
+}
+
+
+def _diagnose(agent_name: str, attempt: int, failure: str, report_text: str, earlier: list) -> dict:
     """
+    One LLM call: why did this attempt fail, and what should the agent do
+    differently next time? Returns {"cause", "guidance": [...], "note"}.
+    "note" is what the retried agent sees (llm.supervisor_notes): the raw
+    failure itself plus the diagnosis, so the agent gets the facts even
+    when the diagnosis call fails (then only the failure is passed on).
+    """
+    from src import llm
+
+    prompt = (
+        f"You are the Master Agent supervising a multi-agent research pipeline. The {agent_name} "
+        f"({AGENT_ROLES.get(agent_name, 'a pipeline agent')}) failed attempt {attempt}.\n\n"
+        f"FAILURE (exception or failed checks):\n{failure[-DIAGNOSIS_TEXT_CHARS:]}\n\n"
+        f"THE AGENT'S REPORT OF WHAT IT PRODUCED:\n{(report_text or 'none')[:DIAGNOSIS_TEXT_CHARS]}\n\n"
+        "EARLIER DIAGNOSES FOR THIS STAGE (did not fix it):\n"
+        + ("\n".join(f"- {e}" for e in earlier) or "none") + "\n\n"
+        "Find the most likely cause, using only the text above -- do not invent facts. Then give the agent "
+        "concrete instructions for its next attempt that are different from what already failed. The agent "
+        "receives your instructions in its own prompts. Never tell it to relax a hard requirement: at least 5 "
+        "peer-reviewed papers published 2022 or later, no invented papers, datasets, URLs, results or metrics, "
+        "and no blogs, Medium or social media as academic sources. Master Agent's checks still apply.\n\n"
+        'Return only JSON: {"cause": "one or two sentences", "guidance": ["instruction", "..."]} '
+        "with at most 5 short instructions."
+    )
+    failure_line = " ".join(failure.split())[-FAILURE_NOTE_CHARS:]
+    try:
+        answer = llm.parse_json(llm.chat(prompt, timeout=120, agent="master_agent"), default={}) or {}
+    except Exception as e:  # a failed diagnosis must not stop the retry
+        answer = {"cause": f"Master Agent could not diagnose this failure ({type(e).__name__}: {e})."}
+    cause = str(answer.get("cause") or "").strip() or "No cause identified."
+    guidance = [str(g).strip() for g in answer.get("guidance") or [] if str(g).strip()][:5]
+    note = f"Attempt {attempt} failed: {failure_line} Diagnosis: {cause}"
+    if guidance:
+        note += " Do this next time: " + " ".join(f"({i}) {g}" for i, g in enumerate(guidance, 1))
+    return {"cause": cause, "guidance": guidance, "note": note}
+
+
+def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int = MAX_ATTEMPTS,
+               attempt_offset: int = 0):
+    """
+    Invoke run_fn() until its output passes checker_fn, at most
+    max_attempts times. After each failed attempt (failed checks, or an
+    exception) Master Agent diagnoses the failure (_diagnose) and re-runs
+    the agent with every diagnosis so far added to the agent's LLM prompts
+    (llm.supervisor_notes) -- so each retry knows what failed and what to
+    change. Writes a saveable report after every attempt (with the
+    diagnosis appended) and logs Correction/Approval entries to LOG_FILE.
+
+    Returns (output, blockers). blockers is empty when the stage passed;
+    non-empty means it failed max_attempts times and the pipeline should
+    halt.
+
+    attempt_offset numbers the attempts of a later re-run of the same agent
+    (an improvement round) after its earlier ones, so its reports and run
+    database rows do not overwrite or duplicate them.
+    """
+    from src import llm
+
     output = None
     blockers = []
+    notes = []  # one per failed attempt: the failure and Master Agent's diagnosis
+    last = attempt_offset + max_attempts
 
-    for attempt in range(1, max_attempts + 1):
-        print(f"\n[Master Agent] Running {agent_name} (attempt {attempt}/{max_attempts})...")
+    for attempt in range(attempt_offset + 1, last + 1):
+        print(f"\n[Master Agent] Running {agent_name} (attempt {attempt}/{last})...")
         slack_client.post_message(message_formatter.format_started(
-            agent_name, f"Stage starting (attempt {attempt}/{max_attempts})."
+            agent_name, f"Stage starting (attempt {attempt}/{last})."
+            + (f" Master Agent passed {len(notes)} diagnosis note(s) from earlier attempts." if notes else "")
         ))
 
         try:
-            output = run_fn()
+            with llm.supervisor_notes(notes):
+                output = run_fn()
         except Exception as e:
             slack_client.post_error_message(message_formatter.format_finished(
                 agent_name, "Failed", f"Raised an exception: {e}",
             ))
-            report_path = _write_report(agent_name, attempt, f"{agent_name} raised an exception:\n{e}")
-            decision = "Retrying" if attempt < max_attempts else "Rejected"
-            next_step = (
-                f"Re-running {agent_name} (attempt {attempt + 1}/{max_attempts})."
-                if attempt < max_attempts
-                else "Halting pipeline; manual review required."
-            )
-            entry = _log_entry(
+            output = None
+            failure = f"{agent_name} raised an exception: {e}\n{traceback.format_exc()}"
+            report_text = f"{agent_name} raised an exception:\n{traceback.format_exc()}"
+            blockers = [_log_entry(
                 "Correction", agent_name,
-                f"{agent_name} raised an exception on attempt {attempt}: {e}. Report saved to {report_path}.",
-                decision, next_step,
-            )
-            _print_entry(entry)
-            _append_log([entry])
-            run_store.record_stage(_current_run_id, agent_name, attempt, decision, None,
-                                   f"{agent_name} raised an exception:\n{e}")
-            blockers = [entry]
-            if attempt < max_attempts:
-                continue
-            return None, blockers
-
-        report_text = report_fn(output)
-        report_path = _write_report(agent_name, attempt, report_text)
-        slack_client.post_message(message_formatter.format_finished(
-            agent_name, "Completed", _summarize_for_slack(report_text),
-        ))
-
-        blockers = checker_fn(output)
-
-        if not blockers:
-            approval = _log_entry(
-                "Approval", agent_name,
-                f"{agent_name} output passed all checks on attempt {attempt}. Report saved to {report_path}.",
-                "Approved",
-                "Advance to next stage.",
-            )
-            _print_entry(approval)
-            _append_log([approval])
-            run_store.record_stage(_current_run_id, agent_name, attempt, "Approved", output, report_text)
-            return output, []
+                f"{agent_name} raised an exception on attempt {attempt}: {e}.",
+                "Retrying" if attempt < last else "Rejected",
+                "Diagnose the failure and re-run the agent." if attempt < last else "Halting pipeline.",
+            )]
+        else:
+            report_text = report_fn(output)
+            slack_client.post_message(message_formatter.format_finished(
+                agent_name, "Completed", _summarize_for_slack(report_text),
+            ))
+            blockers = checker_fn(output)
+            if not blockers:
+                report_path = _write_report(agent_name, attempt, report_text)
+                approval = _log_entry(
+                    "Approval", agent_name,
+                    f"{agent_name} output passed all checks on attempt {attempt}. Report saved to {report_path}.",
+                    "Approved",
+                    "Advance to next stage.",
+                )
+                _print_entry(approval)
+                _append_log([approval])
+                run_store.record_stage(_current_run_id, agent_name, attempt, "Approved", output, report_text)
+                return output, []
+            failure = "\n".join(b["issue"] for b in blockers)
 
         for b in blockers:
             _print_entry(b)
         _append_log(blockers)
-        run_store.record_stage(_current_run_id, agent_name, attempt,
-                               "Retrying" if attempt < max_attempts else "Rejected", output, report_text)
 
-        if attempt < max_attempts:
+        if attempt < last:
+            diagnosis = _diagnose(agent_name, attempt, failure, report_text, notes)
+            notes.append(diagnosis["note"])
+            report_text += (f"\n\n--- Master Agent diagnosis ---\nCause: {diagnosis['cause']}\n"
+                            + "\n".join(f"- {g}" for g in diagnosis["guidance"]))
+            report_path = _write_report(agent_name, attempt, report_text)
+            run_store.record_stage(_current_run_id, agent_name, attempt, "Retrying", output, report_text)
             retry_note = _log_entry(
                 "Correction", agent_name,
-                f"{agent_name} failed {len(blockers)} check(s) on attempt {attempt}; see above. Report saved to {report_path}.",
+                f"{agent_name} failed attempt {attempt}. Diagnosis: {diagnosis['cause']} "
+                f"Report saved to {report_path}.",
                 "Retrying",
-                f"Re-running {agent_name} (attempt {attempt + 1}/{max_attempts}).",
+                f"Re-running {agent_name} (attempt {attempt + 1}/{last}) with these instructions: "
+                + ("; ".join(diagnosis["guidance"]) or "the failure details only (no diagnosis available)."),
             )
             _print_entry(retry_note)
             _append_log([retry_note])
         else:
+            report_path = _write_report(agent_name, attempt, report_text)
+            run_store.record_stage(_current_run_id, agent_name, attempt, "Rejected", output, report_text)
             final = _log_entry(
                 "Correction", agent_name,
-                f"{agent_name} still failing after {max_attempts} attempt(s). See issues above.",
+                f"{agent_name} still failing after {max_attempts} error(s), each diagnosed and retried. "
+                f"See the issues above and the reports in {REPORT_DIR}.",
                 "Rejected",
                 "Halting pipeline; manual review required.",
             )
@@ -704,9 +836,11 @@ def check_agent_requests(parent_paper: dict = None, ranked_pool: list = None,
             ))
             continue
 
+        previous = load_state().get("dataset") or {}
         new_target = (
             message_formatter.parse_target_from_detail(request["detail"])
-            or data_agent.TARGET_ENTRIES + DATA_REQUEST_TARGET_INCREMENT
+            or max(previous.get("target_entries") or 0, previous.get("total_entries") or 0)
+            + DATA_REQUEST_TARGET_INCREMENT
         )
 
         slack_client.post_message(message_formatter.format_started(
@@ -721,6 +855,7 @@ def check_agent_requests(parent_paper: dict = None, ranked_pool: list = None,
                 parent_paper, ranked_pool, target_entries=new_target,
                 search_query=load_state().get("project_topic", ""),
                 target_terms=load_state().get("target_terms", []),
+                mode="expand", existing_datasets=previous.get("selected_datasets") or [],
             ),
             _check_data,
             _format_data_report,
@@ -732,13 +867,16 @@ def check_agent_requests(parent_paper: dict = None, ranked_pool: list = None,
         new_cleaning_result, blockers = _supervise(
             "Cleaning Agent",
             lambda: cleaning_agent.run(new_dataset_result["selected_datasets"],
-                                       target_terms=load_state().get("target_terms", [])),
+                                       target_terms=load_state().get("target_terms", []),
+                                       target_rows=new_dataset_result["target_entries"]),
             _check_cleaning,
             _format_cleaning_report,
         )
         update_state({
             "dataset": {
                 "selected_datasets": new_dataset_result["selected_datasets"],
+                "target_entries": new_dataset_result["target_entries"],
+                "data_plan": new_dataset_result["data_plan"],
                 "total_entries": new_dataset_result["total_entries"],
                 "target_met": new_dataset_result["target_met"],
                 "is_combined": new_dataset_result["is_combined"],
@@ -775,6 +913,211 @@ def _relay_and_apply(result: dict, ranked_pool: list, floor_ts: str) -> None:
         result["cleaning_result"] = relay["cleaning_result"]
 
 
+# --- Improvement rounds: acting on the Evaluation Agent's requests ---
+#
+# The Evaluation Agent reviews the baseline as a senior data analyst and may
+# request ONE next action: more data (Data Agent) or a fix to the baseline
+# (Replication Agent). It never runs an agent itself. Master Agent checks
+# the request (_review_evaluation_request), runs the requested agent and
+# every stage downstream of it, and has the Evaluation Agent review the new
+# baseline -- at most MAX_IMPROVEMENT_ROUNDS times per run. A re-run that
+# fails is undone: the files it overwrote are restored from a snapshot, so
+# a working baseline is never lost (CLAUDE.md: Baseline Preservation).
+
+def _snapshot_files(round_no: int, paths: list) -> dict:
+    """Copy the files a re-run overwrites; {original: copy}."""
+    backup = ROUND_BACKUP_DIR / f"round_{round_no}"
+    saved = {}
+    for index, path in enumerate(p for p in paths if p):
+        path = Path(path)
+        if path.is_file():
+            backup.mkdir(parents=True, exist_ok=True)
+            copy = backup / f"{index}_{path.name}"
+            shutil.copy2(path, copy)
+            saved[str(path)] = str(copy)
+    return saved
+
+
+def _restore_files(saved: dict) -> None:
+    for original, copy in saved.items():
+        try:
+            shutil.copy2(copy, original)
+        except OSError as e:
+            print(f"[Master Agent] Could not restore {original}: {e}")
+
+
+def _baseline_files(cleaning_result: dict, replication_result: dict) -> list:
+    paths = [cleaning_result.get(k) for k in ("master_csv_path", "train_csv_path", "test_csv_path",
+                                              "validation_csv_path")]
+    paths += [replication_result.get("stdout_path"), replication_result.get("stderr_path")]
+    replication_dir = replication_result.get("replication_dir")
+    if replication_dir:
+        recon = Path(replication_dir) / "reconstructed"
+        paths += [str(recon / "train.py"), str(recon / "RECONSTRUCTION_NOTES.md"),
+                  str(Path(replication_dir) / "ENVIRONMENT.md")]
+    return paths
+
+
+def _review_evaluation_request(request: dict, history: list, replication_result: dict,
+                               cleaning_result: dict) -> str:
+    """Master Agent's own check of an Evaluation Agent request. Returns ""
+    when it is approved, else the reason it is declined. Master Agent does
+    not re-do the analyst's review; it checks that the request is
+    actionable, supported by evidence, and not a repeat."""
+    action = request.get("action", "")
+    goal = request.get("goal") or {}
+    if action not in ("rerun_data_agent", "revise_replication"):
+        return f"'{action}' is not an action Master Agent runs between evaluations."
+    for previous in history:
+        if previous.get("action") == action and previous.get("goal") == goal \
+                and previous.get("instructions") == request.get("instructions"):
+            return f"the same request was already acted on in round {previous['round']}."
+        if action == "rerun_data_agent" and previous.get("action") == action and not previous.get("applied"):
+            return f"an earlier data request (round {previous['round']}) found no usable new data."
+    if action == "rerun_data_agent":
+        goal_rows = goal.get("target_entries")
+        if not isinstance(goal_rows, int) or goal_rows <= (cleaning_result.get("rows_total") or 0):
+            return f"the data goal ({goal_rows}) is not above the {cleaning_result.get('rows_total')} rows used."
+    if action == "revise_replication":
+        if replication_result.get("source") != "reconstructed":
+            return "the baseline is the authors' cloned code, which is preserved, not revised."
+        if not request.get("instructions"):
+            return "the request gives no instructions for the fix."
+        if not request.get("evidence"):
+            return "the request gives no verified evidence."
+    return ""
+
+
+def _metrics_summary(evaluation_result: dict) -> str:
+    return ", ".join(f"{m['metric']}={m['reproduced_value']}" for m in evaluation_result.get("metrics", [])
+                     if m.get("reproduced_value") is not None) or "no metrics"
+
+
+def _improvement_rounds(ctx: dict) -> list:
+    """
+    Act on the Evaluation Agent's requests (see the section comment above).
+    ctx holds the run's current parent_paper, ranked_pool, topic,
+    target_terms, dataset_result, cleaning_result, code_discovery_result,
+    replication_result and evaluation_result; it is updated in place with
+    the results of every round that succeeds. Returns the round history.
+    """
+    from src.agents import data_agent, cleaning_agent, replication_agent, evaluation_agent
+    from src.orchestration.state_manager import update_state
+
+    history = []
+    for round_no in range(1, MAX_IMPROVEMENT_ROUNDS + 1):
+        evaluation_result = ctx["evaluation_result"]
+        request = next(iter(evaluation_result.get("requests") or []), None)
+        if not request or request.get("action") == "run_experiment":
+            break
+
+        target = request.get("target_agent", "")
+        declined = _review_evaluation_request(request, history, ctx["replication_result"], ctx["cleaning_result"])
+        if declined:
+            entry = _log_entry("Correction", "Evaluation Agent",
+                               f"Request '{request.get('action')}' for {target} declined: {declined}",
+                               "Rejected", "Continue to the Experiment Agent with the current baseline.")
+            _print_entry(entry)
+            _append_log([entry])
+            break
+
+        evidence = "; ".join(e.get("issue", "") for e in request.get("evidence") or []) or "none listed"
+        goal = request.get("goal") or {}
+        if request["action"] == "rerun_data_agent":
+            next_step = (f"Re-running Data Agent to collect up to {goal['target_entries']} entries from sources away "
+                         "from the Parent Paper, then Cleaning, Replication (same script) and Evaluation Agents.")
+        else:
+            next_step = ("Re-running Replication Agent to fix: " + "; ".join(request.get("instructions") or [])
+                         + ". Then the Evaluation Agent reviews the revised baseline.")
+        entry = _log_entry("Correction", target,
+                           f"Evaluation Agent review (round {round_no}): {request.get('summary', '')} "
+                           f"Evidence: {evidence}.", "Approved request", next_step)
+        _print_entry(entry)
+        _append_log([entry])
+
+        saved = _snapshot_files(round_no, _baseline_files(ctx["cleaning_result"], ctx["replication_result"]))
+        offset = round_no * MAX_ATTEMPTS
+        record = {"round": round_no, "action": request["action"], "target_agent": target, "goal": goal,
+                  "instructions": request.get("instructions") or [], "reason": request.get("summary", ""),
+                  "status_before": evaluation_result.get("status"),
+                  "metrics_before": _metrics_summary(evaluation_result), "applied": False}
+        previous = ctx["replication_result"]
+        dataset_result, cleaning_result = ctx["dataset_result"], ctx["cleaning_result"]
+
+        def undo(reason: str) -> None:
+            _restore_files(saved)
+            record["outcome"] = f"{reason}; the previous baseline was kept."
+            history.append(record)
+            failed = _log_entry("Correction", target, f"Improvement round {round_no}: {reason}.", "Rejected",
+                                "Previous baseline restored; continue to the Experiment Agent.")
+            _print_entry(failed)
+            _append_log([failed])
+
+        if request["action"] == "rerun_data_agent":
+            dataset_result, blockers = _supervise(
+                "Data Agent",
+                lambda: data_agent.run(
+                    ctx["parent_paper"], ctx["ranked_pool"], target_entries=goal["target_entries"],
+                    search_query=ctx["topic"], target_terms=ctx["target_terms"], mode="expand",
+                    existing_datasets=ctx["dataset_result"]["selected_datasets"],
+                ),
+                _check_data, _format_data_report, attempt_offset=offset,
+            )
+            if blockers or dataset_result["total_entries"] <= ctx["dataset_result"]["total_entries"]:
+                undo("the Data Agent found no usable new data")
+                break
+            cleaning_result, blockers = _supervise(
+                "Cleaning Agent",
+                lambda: cleaning_agent.run(dataset_result["selected_datasets"], target_terms=ctx["target_terms"],
+                                           target_rows=goal["target_entries"]),
+                _check_cleaning, _format_cleaning_report, attempt_offset=offset,
+            )
+            if blockers:
+                undo("the Cleaning Agent could not merge the new data")
+                break
+            revision = {"round": round_no, "reuse_script": True,
+                        "previous_inferred_assumptions": previous.get("inferred_assumptions") or [],
+                        "previous_generated_by": previous.get("generated_by") or []}
+        else:
+            revision = {"round": round_no, "instructions": request.get("instructions") or [],
+                        "previous_inferred_assumptions": previous.get("inferred_assumptions") or []}
+
+        replication_result, blockers = _supervise(
+            "Replication Agent",
+            lambda: replication_agent.run(ctx["parent_paper"], ctx["code_discovery_result"], cleaning_result,
+                                          revision=revision),
+            _check_replication, _format_replication_report, attempt_offset=offset,
+        )
+        if blockers:
+            undo("the re-run baseline did not execute")
+            break
+
+        record_preview = dict(record, outcome="(being evaluated)")
+        evaluation_result, blockers = _supervise(
+            "Evaluation Agent",
+            lambda: evaluation_agent.run(ctx["parent_paper"], replication_result, cleaning_result, dataset_result,
+                                         history + [record_preview]),
+            _check_evaluation, _format_evaluation_report, attempt_offset=offset,
+        )
+        if blockers:
+            undo("the new baseline could not be evaluated")
+            break
+
+        record.update(applied=True, status_after=evaluation_result.get("status"),
+                      metrics_after=_metrics_summary(evaluation_result),
+                      outcome=(f"overall {record['status_before']} -> {evaluation_result.get('status')}; "
+                               f"metrics {record['metrics_before']} -> {_metrics_summary(evaluation_result)}"))
+        history.append(record)
+        ctx.update(dataset_result=dataset_result, cleaning_result=cleaning_result,
+                   replication_result=replication_result, evaluation_result=evaluation_result)
+        done = _log_entry("Approval", target, f"Improvement round {round_no} applied: {record['outcome']}.",
+                          "Approved", "The Evaluation Agent's new review decides the next step.")
+        _print_entry(done)
+        _append_log([done])
+        update_state({"improvement_rounds": history})
+    return history
+
+
 def run_pipeline(topic: str) -> dict:
     """
     Run the pipeline (see _run_stages) inside one run database record
@@ -807,11 +1150,12 @@ def run_pipeline(topic: str) -> dict:
 def _run_stages(topic: str) -> dict:
     """
     Drive the full pipeline (Intake -> Research -> Validation & Selection ->
-    Data Agent -> Cleaning Agent -> Code Discovery Agent -> Replication
-    Agent -> Evaluation Agent -> Experiment Agent), supervising every
-    stage. Master Agent invokes each agent itself, checks its output,
-    retries once on failure, and halts (with a logged rejection) if the
-    retry also fails.
+    Data Agent (Parent Paper's own dataset only) -> Cleaning Agent -> Code
+    Discovery Agent -> Replication Agent -> Evaluation Agent -> improvement
+    rounds on the Evaluation Agent's requests -> Experiment Agent),
+    supervising every stage. Master Agent invokes each agent itself, checks its output,
+    diagnoses each failure and retries with the diagnosis, and halts (with a
+    logged rejection) after MAX_ATTEMPTS errors.
 
     Returns:
         {
@@ -825,7 +1169,8 @@ def _run_stages(topic: str) -> dict:
           "cleaning_result": dict | None,
           "code_discovery_result": dict | None,
           "replication_result": dict | None,
-          "evaluation_result": dict | None,
+          "evaluation_result": dict | None,     # the latest review, after any improvement rounds
+          "improvement_rounds": list,           # Evaluation Agent requests Master Agent acted on
           "experiment_result": dict | None,
           "blockers": [...],   # non-empty only when success is False
         }
@@ -856,6 +1201,7 @@ def _run_stages(topic: str) -> dict:
         "code_discovery_result": None,
         "replication_result": None,
         "evaluation_result": None,
+        "improvement_rounds": [],
         "experiment_result": None,
         "blockers": [],
     }
@@ -947,6 +1293,8 @@ def _run_stages(topic: str) -> dict:
     update_state({
         "dataset": {
             "selected_datasets": dataset_result["selected_datasets"],
+            "target_entries": dataset_result["target_entries"],
+            "data_plan": dataset_result["data_plan"],
             "total_entries": dataset_result["total_entries"],
             "target_met": dataset_result["target_met"],
             "is_combined": dataset_result["is_combined"],
@@ -961,7 +1309,8 @@ def _run_stages(topic: str) -> dict:
     cleaning_result, blockers = _supervise(
         "Cleaning Agent",
         lambda: cleaning_agent.run(dataset_result["selected_datasets"],
-                                   target_terms=structured.get("target_terms", [])),
+                                   target_terms=structured.get("target_terms", []),
+                                   target_rows=dataset_result["target_entries"]),
         _check_cleaning,
         _format_cleaning_report,
     )
@@ -999,7 +1348,7 @@ def _run_stages(topic: str) -> dict:
     )
     # _check_code_discovery never returns blockers (see its docstring), so
     # this branch only fires on a raw exception _supervise couldn't resolve
-    # after a retry -- handled identically to every other stage regardless.
+    # after MAX_ATTEMPTS attempts -- handled identically to every other stage.
     if blockers:
         update_state({"phase": "CODE_DISCOVERY"})
         result.update(phase="CODE_DISCOVERY", blockers=blockers)
@@ -1052,14 +1401,15 @@ def _run_stages(topic: str) -> dict:
     # --- Stage 8: Evaluation Agent (compare reproduced vs. published results) ---
     evaluation_result, blockers = _supervise(
         "Evaluation Agent",
-        lambda: evaluation_agent.run(validation_result["recommended_parent_paper"], replication_result),
+        lambda: evaluation_agent.run(validation_result["recommended_parent_paper"], replication_result,
+                                     cleaning_result, dataset_result),
         _check_evaluation,
         _format_evaluation_report,
     )
     # _check_evaluation never returns blockers (see its docstring): a
     # FAILED/INCONCLUSIVE comparison is itself useful research information,
     # not an agent defect. This branch only fires on a raw exception
-    # _supervise couldn't resolve after a retry.
+    # _supervise couldn't resolve after MAX_ATTEMPTS attempts.
     if blockers:
         update_state({"phase": "BASELINE_EVALUATION"})
         result.update(phase="BASELINE_EVALUATION", blockers=blockers)
@@ -1075,6 +1425,67 @@ def _run_stages(topic: str) -> dict:
     })
 
     result["evaluation_result"] = evaluation_result
+
+    # --- Stage 8b: improvement rounds -- Master Agent acts on the Evaluation
+    # Agent's request (more data, or a fix to the baseline), re-runs the
+    # affected stages and has the new baseline reviewed again. ---
+    ctx = {
+        "parent_paper": validation_result["recommended_parent_paper"],
+        "ranked_pool": validation_result["ranked_pool"],
+        "topic": topic,
+        "target_terms": structured.get("target_terms", []),
+        "dataset_result": dataset_result,
+        "cleaning_result": cleaning_result,
+        "code_discovery_result": code_discovery_result,
+        "replication_result": replication_result,
+        "evaluation_result": evaluation_result,
+    }
+    improvement_rounds = _improvement_rounds(ctx)
+    dataset_result, cleaning_result = ctx["dataset_result"], ctx["cleaning_result"]
+    replication_result, evaluation_result = ctx["replication_result"], ctx["evaluation_result"]
+    result.update(dataset_result=dataset_result, cleaning_result=cleaning_result,
+                  replication_result=replication_result, evaluation_result=evaluation_result,
+                  improvement_rounds=improvement_rounds)
+    if any(r.get("applied") for r in improvement_rounds):
+        update_state({
+            "dataset": {
+                "selected_datasets": dataset_result["selected_datasets"],
+                "target_entries": dataset_result["target_entries"],
+                "data_plan": dataset_result["data_plan"],
+                "total_entries": dataset_result["total_entries"],
+                "target_met": dataset_result["target_met"],
+                "is_combined": dataset_result["is_combined"],
+            },
+            "cleaning": {
+                "master_csv_path": cleaning_result["master_csv_path"],
+                "datasets_merged": cleaning_result["datasets_merged"],
+                "rows_total": cleaning_result["rows_total"],
+                "target_met": cleaning_result["target_met"],
+                "conflicts": cleaning_result["conflicts"],
+                "train_csv_path": cleaning_result["train_csv_path"],
+                "test_csv_path": cleaning_result["test_csv_path"],
+                "validation_csv_path": cleaning_result["validation_csv_path"],
+                "split_rows": cleaning_result["split_rows"],
+                "split_seed": cleaning_result["split_seed"],
+            },
+            "baseline_status": replication_result["status"],
+            "baseline_results": {
+                "source": replication_result["source"],
+                "repo_url": replication_result["repo_url"],
+                "commit_sha": replication_result["commit_sha"],
+                "entry_point": replication_result["entry_point"],
+                "exit_code": replication_result["exit_code"],
+                "duration_seconds": replication_result["duration_seconds"],
+                "inferred_assumptions": replication_result["inferred_assumptions"],
+            },
+            "evaluation_result": {
+                "status": evaluation_result["status"],
+                "metrics": evaluation_result["metrics"],
+                "likely_causes": evaluation_result["likely_causes"],
+            },
+        })
+    update_state({"evaluation_decision": evaluation_result.get("decision"),
+                  "improvement_rounds": improvement_rounds})
 
     _relay_and_apply(result, validation_result["ranked_pool"], run_floor_ts)
 
@@ -1092,7 +1503,7 @@ def _run_stages(topic: str) -> dict:
     # _check_experiment never returns blockers (see its docstring): a
     # REGRESSED/BLOCKED/SKIPPED experiment is itself useful research
     # information, not an agent defect. This branch only fires on a raw
-    # exception _supervise couldn't resolve after a retry.
+    # exception _supervise couldn't resolve after MAX_ATTEMPTS attempts.
     if blockers:
         update_state({"phase": "EXPERIMENTATION"})
         result.update(phase="EXPERIMENTATION", blockers=blockers)

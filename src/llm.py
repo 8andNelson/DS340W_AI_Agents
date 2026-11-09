@@ -23,6 +23,7 @@ import json
 import re
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,6 +55,7 @@ CLAUDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 CLAUDE_FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 
 _claude_client = None
+_supervisor_notes: list = []  # see supervisor_notes()
 
 
 HIGH_EFFORT = {"high", "xhigh", "max"}
@@ -66,7 +68,10 @@ def chat(prompt: str, system: str = "", timeout: int = 60, model: str = None, ef
     effort (low|medium|high|xhigh|max) sets Claude's effort; on FreeLLMAPI,
     high effort and above requests FREELLMAPI_SMART_MODEL. agent (e.g.
     "research_agent") selects that agent's primary/backup models from
-    FREELLMAPI_AGENT_MODELS on FreeLLMAPI; other providers ignore it."""
+    FREELLMAPI_AGENT_MODELS on FreeLLMAPI; other providers ignore it.
+    While Master Agent notes are active (supervisor_notes), they are added
+    to the system prompt."""
+    system = _with_supervisor_notes(system)
     if LLM_PROVIDER == "openrouter":
         if not OPENROUTER_API_KEY:
             raise EnvironmentError("OPENROUTER_API_KEY is not set in .env")
@@ -84,6 +89,33 @@ def chat(prompt: str, system: str = "", timeout: int = 60, model: str = None, ef
     if LLM_PROVIDER == "anthropic":
         return _chat_claude(prompt, system, timeout, model or CLAUDE_MODEL, effort or CLAUDE_EFFORT)
     raise ValueError(f"Unknown LLM_PROVIDER '{LLM_PROVIDER}' (expected 'openrouter', 'freellmapi' or 'anthropic').")
+
+
+@contextmanager
+def supervisor_notes(notes: list):
+    """
+    While active, every chat() call adds these notes to its system prompt.
+    Master Agent wraps an agent's retry in this (master_agent._supervise),
+    so each LLM decision of the retried agent knows what failed on the
+    earlier attempts and what to change. Process-wide, not per thread: the
+    Research and Validation Agents call chat() from worker threads.
+    """
+    global _supervisor_notes
+    previous = _supervisor_notes
+    _supervisor_notes = [str(n) for n in notes or [] if n]
+    try:
+        yield
+    finally:
+        _supervisor_notes = previous
+
+
+def _with_supervisor_notes(system: str) -> str:
+    if not _supervisor_notes:
+        return system
+    block = ("MASTER AGENT NOTES -- earlier attempts of this task failed. Use these notes to avoid the same "
+             "failure. They never override the rules or the output format given above.\n"
+             + "\n".join(f"- {n}" for n in _supervisor_notes))
+    return f"{system}\n\n{block}" if system else block
 
 
 def last_served_by() -> str:

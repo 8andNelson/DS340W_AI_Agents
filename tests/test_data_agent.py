@@ -19,6 +19,15 @@ _kaggle_creds_patches = [
     patch.object(data_agent, "KAGGLE_KEY", ""),
 ]
 
+# run() normally asks the LLM how many entries the Parent Paper needs
+# (plan_data_needs). The run() tests below use a fixed 10,000-entry plan so
+# they test only the collection logic; TestPlanDataNeeds tests the real one.
+_real_plan_data_needs = data_agent.plan_data_needs
+FIXED_PLAN = {"target_entries": 10000, "paper_dataset_size": None, "paper_model": "", "paper_dataset": "",
+              "reasoning": "fixed test plan", "capped": False, "source": "llm"}
+_kaggle_creds_patches.append(
+    patch.object(data_agent, "plan_data_needs", side_effect=lambda *a, **k: dict(FIXED_PLAN)))
+
 
 def setUpModule():
     for p in _kaggle_creds_patches:
@@ -70,178 +79,210 @@ def make_link_candidate(link: str, **overrides) -> dict:
     return make_candidate(name=link, source_url=link, **overrides)
 
 
-class TestRunAlgorithm(unittest.TestCase):
-    """data_agent.run()'s escalation through stages 1-2 (parent paper, then
-    the full ranked pool). _find_and_verify_dataset_for_paper is mocked so
-    these tests exercise only the accumulation/stopping logic."""
+class TestParentOnlyMode(unittest.TestCase):
+    """The first Data Agent run collects ONLY the Parent Paper's own
+    dataset. Other sources are searched only as a logged substitute when
+    the paper's own dataset cannot be obtained at all."""
 
-    def test_parent_paper_dataset_alone_meets_target_and_no_other_candidates_exist(self):
-        parent = make_paper(dataset="Big Dataset")
-        big = make_link_candidate("https://kaggle.com/big-dataset", entry_count=15000)
+    def test_collects_only_the_parent_dataset_even_when_others_qualify(self):
+        parent, other = make_paper(title="Parent"), make_paper(title="Other", dataset="Other Dataset")
+        own = make_link_candidate("https://kaggle.com/own", entry_count=300)
 
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=big):
+        with patch.object(data_agent, "_find_parent_dataset", return_value=[own]), \
+             patch.object(data_agent, "_find_and_verify_dataset_for_paper") as other_papers, \
+             patch.object(data_agent, "_search_exploration_sites") as explore:
+            result = data_agent.run(parent, [parent, other])
+
+        other_papers.assert_not_called()
+        explore.assert_not_called()
+        self.assertEqual(result["selected_datasets"], [own])
+        self.assertEqual(result["status"], "OK")  # no entry minimum: 300 rows is fine
+        self.assertEqual(result["mode"], "parent_only")
+        self.assertTrue(result["parent_dataset_found"])
+        self.assertIsNone(result["target_entries"])
+        self.assertIsNone(result["target_met"])
+        self.assertEqual(result["search_stage"], "parent_paper")
+        self.assertEqual(result["data_plan"]["reasoning"], "fixed test plan")
+
+    def test_records_what_the_agent_could_read_of_the_paper(self):
+        parent = make_paper(title="Parent")
+        own = make_link_candidate("https://kaggle.com/own")
+        with patch.object(data_agent, "_find_parent_dataset", return_value=[own]):
             result = data_agent.run(parent, [parent])
+        # conftest disables downloads, so only the stored metadata is readable.
+        self.assertEqual(result["paper_text_status"], "ABSTRACT_ONLY")
+        self.assertIn("NOT the full paper", result["paper_text_notes"])
 
-        self.assertEqual(result["status"], "OK")
-        self.assertTrue(result["target_met"])
-        self.assertEqual(result["total_entries"], 15000)
-        self.assertEqual(result["selected_datasets"], [big])
-        self.assertEqual(result["master_dataset"], big)
-        self.assertFalse(result["is_combined"])
-        self.assertEqual(result["search_stage"], "paper_traversal")
-
-    def test_keeps_collecting_past_the_target_when_more_candidates_qualify(self):
-        """The agent no longer stops the instant the entry-count target is
-        met -- it keeps adding further qualifying, non-duplicate datasets
-        (up to MAX_DATASETS) so a pool of several datasets is preferred
-        over stopping at the first one big enough alone."""
-        parent = make_paper(title="Parent", dataset="Big Dataset")
-        big = make_link_candidate("https://kaggle.com/big-dataset", entry_count=15000)
-        second = make_paper(title="Second", dataset="Second Dataset")
-        second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=2000)
-
-        def fake_find(paper, _scope, _parent=None, _ctx=None):
-            return big if paper["title"] == "Parent" else second_candidate
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
-            result = data_agent.run(parent, [parent, second])
-
-        self.assertEqual(result["selected_datasets"], [big, second_candidate])
-        self.assertEqual(result["total_entries"], 17000)
-        self.assertTrue(result["is_combined"])
-        self.assertTrue(result["target_met"])
-
-    def test_falls_through_to_traversal_when_parent_dataset_missing(self):
-        parent = make_paper(title="Parent", dataset="")
-        alt = make_paper(title="Alt", dataset="Alt Dataset")
+    def test_substitute_from_other_papers_when_the_parent_dataset_is_missing(self):
+        parent = make_paper(title="Parent", dataset="Elusive")
+        alt, alt2 = make_paper(title="Alt"), make_paper(title="Alt2")
         alt_candidate = make_link_candidate("https://kaggle.com/alt", entry_count=12000)
 
-        def fake_find(paper, _scope, _parent=None, _ctx=None):
-            if paper["title"] == "Parent":
-                return None  # no dataset name -> nothing to search
-            return alt_candidate
+        with patch.object(data_agent, "_find_parent_dataset", return_value=[]), \
+             patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=alt_candidate) as find, \
+             patch.object(data_agent, "_search_exploration_sites") as explore:
+            result = data_agent.run(parent, [parent, alt, alt2])
 
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
-            result = data_agent.run(parent, [parent, alt])
-
-        self.assertEqual(result["status"], "OK")
+        find.assert_called_once()  # one substitute is enough without a goal
+        self.assertEqual(find.call_args.args[0]["title"], "Alt")  # starts at the second-highest paper
+        explore.assert_not_called()
+        self.assertEqual(result["status"], "DEGRADED")
+        self.assertFalse(result["parent_dataset_found"])
         self.assertEqual(result["selected_datasets"], [alt_candidate])
-        self.assertIn("does not state a dataset", result["warnings"][0])
+        self.assertEqual(result["search_stage"], "substitute_paper_traversal")
+        self.assertTrue(any("SUBSTITUTE" in w for w in result["warnings"]))
 
-    def test_traversal_starts_at_second_highest_ranked_paper(self):
-        parent = make_paper(title="Parent", dataset="Empty Dataset")
-        empty = make_link_candidate("https://kaggle.com/empty", entry_count=0)  # genuinely 0 rows, discarded
-        second = make_paper(title="Second", dataset="Second Dataset")
-        second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=11000)
+    def test_substitute_from_dataset_directories_when_no_paper_has_one(self):
+        parent = make_paper(title="Parent", dataset="Elusive Dataset", abstract="Fraud detection study.")
+        hit = make_link_candidate("https://kaggle.com/explored")
 
-        calls = []
+        with patch.object(data_agent, "_find_parent_dataset", return_value=[]), \
+             patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
+             patch.object(data_agent, "_search_exploration_sites", return_value=[hit]) as explore:
+            result = data_agent.run(parent, [parent, make_paper(title="Alt")])
 
-        def fake_find(paper, _scope, _parent=None, _ctx=None):
-            calls.append(paper["title"])
-            if paper["title"] == "Parent":
-                return empty
-            if paper["title"] == "Second":
-                return second_candidate
-            raise AssertionError(f"unexpected paper checked: {paper['title']}")
+        scope_arg = explore.call_args.args[0]
+        self.assertNotIn("Elusive Dataset", scope_arg)  # scope-based, not a retry of the failed name
+        self.assertIn("Parent", scope_arg)
+        self.assertEqual(result["selected_datasets"], [hit])
+        self.assertIn("exploration_sites", result["search_stage"])
+        self.assertEqual(result["status"], "DEGRADED")
 
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
-            result = data_agent.run(parent, [parent, second])
-
-        self.assertEqual(calls, ["Parent", "Second"])
-        self.assertEqual(result["selected_datasets"], [second_candidate])
-        self.assertEqual(result["total_entries"], 11000)
-
-    def test_parent_dataset_between_thresholds_is_counted_and_traversal_continues(self):
-        parent = make_paper(title="Parent", dataset="Mid Dataset")
-        mid = make_link_candidate("https://kaggle.com/mid", entry_count=4000)
-        second = make_paper(title="Second", dataset="Second Dataset")
-        second_candidate = make_link_candidate("https://kaggle.com/second", entry_count=7000)
-
-        def fake_find(paper, _scope, _parent=None, _ctx=None):
-            return mid if paper["title"] == "Parent" else second_candidate
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
-            result = data_agent.run(parent, [parent, second])
-
-        self.assertEqual(result["total_entries"], 11000)
-        self.assertTrue(result["target_met"])
-        self.assertEqual(len(result["selected_datasets"]), 2)
-        self.assertTrue(result["is_combined"])
-
-    def test_duplicate_dataset_link_is_not_double_counted(self):
-        parent = make_paper(title="Parent", dataset="Shared Dataset")
-        shared = make_link_candidate("https://kaggle.com/shared-dataset", entry_count=4000)
-        dup_paper = make_paper(title="Dup", dataset="Shared Dataset (mirror)")
-        third = make_paper(title="Third", dataset="Unique Dataset")
-        third_candidate = make_link_candidate("https://kaggle.com/unique", entry_count=7000)
-
-        def fake_find(paper, _scope, _parent=None, _ctx=None):
-            if paper["title"] == "Parent":
-                return shared
-            if paper["title"] == "Dup":
-                # Same link (e.g. a different paper describing the same
-                # dataset with different text), different casing/trailing slash.
-                return make_link_candidate("HTTPS://Kaggle.com/shared-dataset/", entry_count=4000)
-            return third_candidate
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
-            result = data_agent.run(parent, [parent, dup_paper, third])
-
-        links = [d["name"] for d in result["selected_datasets"]]
-        self.assertEqual(len(links), 2)
-        self.assertEqual(result["total_entries"], 11000)
-
-    def test_traversal_checks_the_whole_pool_when_under_the_dataset_cap(self):
-        parent = make_paper(title="P0", dataset="D0")
-        alts = [make_paper(title=f"P{i}", dataset=f"D{i}") for i in range(1, 4)]
-        candidates = {
-            f"D{i}": make_link_candidate(f"https://kaggle.com/d{i}", entry_count=1000)
-            for i in range(4)
-        }
-
-        def fake_find(paper, _scope, _parent=None, _ctx=None):
-            return candidates[paper["dataset"]]
-
-        # Falling short of the target with room left under MAX_DATASETS
-        # now falls through to stage 3 in the same run (see
-        # TestEscalationStages) -- mocked to [] here since this test is
-        # specifically about stage 2's traversal, not stage 3.
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find), \
+    def test_not_found_when_nothing_is_usable(self):
+        parent = make_paper(title="Parent")
+        with patch.object(data_agent, "_find_parent_dataset", return_value=[]), \
+             patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
              patch.object(data_agent, "_search_exploration_sites", return_value=[]):
-            result = data_agent.run(parent, [parent] + alts)
+            result = data_agent.run(parent, [parent])
+        self.assertEqual(result["status"], "NOT_FOUND")
+        self.assertEqual(result["selected_datasets"], [])
 
-        # Only 4 candidates exist and none individually meets the target,
-        # so all 4 are checked and added (well under the MAX_DATASETS cap),
-        # leaving the pool DEGRADED rather than stopping short.
-        self.assertEqual(len(result["selected_datasets"]), 4)
-        self.assertEqual(result["total_entries"], 4000)
+
+class TestFindParentDataset(unittest.TestCase):
+    """Stage 1 reads the dataset from the paper itself: each link written in
+    the paper first, then a search for the paper's dataset name."""
+
+    PLAN = {"paper_dataset": "ULB Credit Card Fraud", "dataset_source": "Kaggle",
+            "dataset_urls": ["https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud"]}
+
+    def test_a_link_in_the_paper_is_tried_before_any_search(self):
+        found = make_link_candidate(self.PLAN["dataset_urls"][0])
+        with patch.object(data_agent, "_dataset_from_paper_link", return_value=found) as by_link, \
+             patch.object(data_agent, "_resolve_dataset") as search:
+            tried = data_agent._find_parent_dataset(make_paper(), self.PLAN, "scope", {"target_terms": []})
+        by_link.assert_called_once()
+        search.assert_not_called()
+        self.assertEqual(tried, [found])
+
+    def test_falls_back_to_the_papers_name_then_the_stored_name(self):
+        parent = make_paper(dataset="Credit Card Dataset", dataset_source="Kaggle")
+        with patch.object(data_agent, "_dataset_from_paper_link", return_value=None), \
+             patch.object(data_agent, "_resolve_dataset", return_value=make_candidate(local_csv_path="")) as search:
+            data_agent._find_parent_dataset(parent, self.PLAN, "scope", {"target_terms": []})
+        names = [c.args[0] for c in search.call_args_list]
+        self.assertEqual(names, ["ULB Credit Card Fraud", "Credit Card Dataset"])
+
+    def test_stops_after_the_first_usable_search_result(self):
+        with patch.object(data_agent, "_dataset_from_paper_link", return_value=None), \
+             patch.object(data_agent, "_resolve_dataset", return_value=make_candidate()) as search:
+            data_agent._find_parent_dataset(make_paper(dataset="Other Name"), self.PLAN, "scope", {"target_terms": []})
+        search.assert_called_once()
+
+    def test_paper_link_candidate_is_marked_as_the_papers_own(self):
+        def fake_download(candidate, _terms=None):
+            candidate.update(local_csv_path="data/raw/x.csv", entry_count=284807, download_status="ok")
+            return True
+
+        with patch.object(data_agent, "_check_url_reachable", return_value=(True, 200)), \
+             patch.object(data_agent, "_download_and_convert_to_csv", side_effect=fake_download), \
+             patch.object(data_agent, "_check_fit", return_value=(True, "")):
+            candidate = data_agent._dataset_from_paper_link(
+                self.PLAN["dataset_urls"][0], self.PLAN, make_paper(), {"target_terms": [], "rejected_links": set()})
+
+        self.assertTrue(candidate["matches_parent_paper"])
+        self.assertTrue(candidate["in_scope"])
+        self.assertEqual(candidate["verification_method"], "parent_paper_text")
+        self.assertTrue(data_agent._usable(candidate, 1))
+
+    def test_unreachable_paper_link_gives_nothing(self):
+        with patch.object(data_agent, "_check_url_reachable", return_value=(False, 404)), \
+             patch.object(data_agent, "_download_and_convert_to_csv") as download:
+            candidate = data_agent._dataset_from_paper_link(
+                self.PLAN["dataset_urls"][0], self.PLAN, make_paper(), {"target_terms": [], "rejected_links": set()})
+        self.assertIsNone(candidate)
+        download.assert_not_called()
+
+
+class TestExpandMode(unittest.TestCase):
+    """mode="expand": only on an Evaluation Agent request relayed by Master
+    Agent. Keeps the datasets already collected and adds datasets from
+    sources away from the Parent Paper until the request's goal is met."""
+
+    def setUp(self):
+        self.parent = make_paper(title="Parent")
+        self.own = make_link_candidate("https://kaggle.com/own", entry_count=5000, matches_parent_paper=True)
+
+    def test_needs_a_goal(self):
+        with self.assertRaises(ValueError):
+            data_agent.run(self.parent, [self.parent], mode="expand")
+
+    def test_keeps_existing_data_and_stops_once_the_goal_is_met(self):
+        papers = [self.parent] + [make_paper(title=f"P{i}") for i in range(3)]
+        extra = {"P0": make_link_candidate("https://kaggle.com/p0", entry_count=4000),
+                 "P1": make_link_candidate("https://kaggle.com/p1", entry_count=4000),
+                 "P2": make_link_candidate("https://kaggle.com/p2", entry_count=4000)}
+
+        with patch.object(data_agent, "plan_data_needs") as plan, \
+             patch.object(data_agent, "_find_and_verify_dataset_for_paper",
+                          side_effect=lambda p, *_a, **_k: extra[p["title"]]), \
+             patch.object(data_agent, "_search_exploration_sites") as explore:
+            result = data_agent.run(self.parent, papers, target_entries=12000, mode="expand",
+                                    existing_datasets=[self.own])
+
+        plan.assert_not_called()
+        explore.assert_not_called()
+        self.assertEqual(result["selected_datasets"], [self.own, extra["P0"], extra["P1"]])
+        self.assertEqual(result["total_entries"], 13000)
+        self.assertTrue(result["target_met"])
+        self.assertEqual(result["status"], "OK")
+        self.assertTrue(result["parent_dataset_found"])
+        self.assertEqual(result["data_plan"]["source"], "request")
+
+    def test_searches_dataset_directories_when_other_papers_fall_short(self):
+        hit = make_link_candidate("https://kaggle.com/explored", entry_count=20000)
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
+             patch.object(data_agent, "_search_exploration_sites", return_value=[hit]):
+            result = data_agent.run(self.parent, [self.parent, make_paper(title="Alt")], target_entries=10000,
+                                    mode="expand", existing_datasets=[self.own])
+        self.assertEqual(result["selected_datasets"], [self.own, hit])
+        self.assertEqual(result["search_stage"], "expansion+exploration_sites")
+
+    def test_degraded_when_the_goal_cannot_be_met(self):
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
+             patch.object(data_agent, "_search_exploration_sites", return_value=[]):
+            result = data_agent.run(self.parent, [self.parent], target_entries=50000, mode="expand",
+                                    existing_datasets=[self.own])
         self.assertEqual(result["status"], "DEGRADED")
         self.assertFalse(result["target_met"])
+        self.assertEqual(result["selected_datasets"], [self.own])
 
-    def test_stops_at_max_datasets_cap_even_with_more_candidates_remaining(self):
-        parent = make_paper(title="P0", dataset="D0")
-        alts = [make_paper(title=f"P{i}", dataset=f"D{i}") for i in range(1, 8)]
-        candidates = {
-            f"D{i}": make_link_candidate(f"https://kaggle.com/d{i}", entry_count=1000)
-            for i in range(8)
-        }
-        checked = []
-
-        def fake_find(paper, _scope, _parent=None, _ctx=None):
-            checked.append(paper["dataset"])
-            return candidates[paper["dataset"]]
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find):
-            result = data_agent.run(parent, [parent] + alts)
-
-        # 8 candidates are each individually usable, but the agent stops at
-        # MAX_DATASETS (5) rather than checking all 8 or trying to reach
-        # the 10000-entry target, which is never hit.
-        self.assertEqual(len(result["selected_datasets"]), data_agent.MAX_DATASETS)
-        self.assertEqual(len(checked), data_agent.MAX_DATASETS)
+    def test_a_duplicate_link_is_not_counted_twice(self):
+        duplicate = make_link_candidate("https://kaggle.com/own", entry_count=5000)
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=duplicate), \
+             patch.object(data_agent, "_search_exploration_sites", return_value=[]):
+            result = data_agent.run(self.parent, [self.parent, make_paper(title="A")], target_entries=8000,
+                                    mode="expand", existing_datasets=[self.own])
         self.assertEqual(result["total_entries"], 5000)
-        self.assertEqual(result["status"], "DEGRADED")
-        self.assertFalse(result["target_met"])
+
+    def test_stops_at_the_dataset_cap(self):
+        papers = [self.parent] + [make_paper(title=f"P{i}") for i in range(10)]
+        with patch.object(data_agent, "_find_and_verify_dataset_for_paper",
+                          side_effect=lambda p, *_a, **_k: make_link_candidate(f"https://kaggle.com/{p['title']}",
+                                                                               entry_count=10)), \
+             patch.object(data_agent, "_search_exploration_sites", return_value=[]):
+            result = data_agent.run(self.parent, papers, target_entries=400000, mode="expand",
+                                    existing_datasets=[self.own])
+        self.assertEqual(len(result["selected_datasets"]), data_agent.MAX_DATASETS)
 
 
 class TestKaggleSearchIntegration(unittest.TestCase):
@@ -299,98 +340,6 @@ class TestKaggleSearchIntegration(unittest.TestCase):
         kaggle_mock.assert_called_once()
         results_arg = extract_mock.call_args.args[0]
         self.assertIn(kaggle_hit, results_arg)
-
-
-class TestEscalationStages(unittest.TestCase):
-    """Stage 3 (curated exploration sites) only fires when stages 1-2 found
-    nothing usable at all -- and it must NOT retry the same (already-failed)
-    per-paper dataset names, only search generally for the project scope."""
-
-    def test_exploration_only_fires_when_paper_traversal_finds_nothing(self):
-        parent = make_paper(title="Parent", dataset="Elusive Dataset")
-        exploration_hit = make_link_candidate("https://kaggle.com/explored", entry_count=11000)
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
-             patch.object(data_agent, "_search_exploration_sites", return_value=[exploration_hit]) as explore_mock:
-            result = data_agent.run(parent, [parent])
-
-        explore_mock.assert_called_once()
-        self.assertEqual(result["search_stage"], "exploration_sites")
-        self.assertEqual(result["status"], "OK")
-        self.assertEqual(result["selected_datasets"], [exploration_hit])
-
-    def test_exploration_search_is_scope_based_not_name_based(self):
-        """The exploration search must be driven by the project's scope
-        description, never by re-searching a specific paper's dataset name."""
-        parent = make_paper(title="Parent", dataset="Elusive Dataset", abstract="Fraud detection study.")
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
-             patch.object(data_agent, "_search_exploration_sites", return_value=[]) as explore_mock:
-            data_agent.run(parent, [parent])
-
-        explore_mock.assert_called_once()
-        call_args = explore_mock.call_args
-        scope_arg = call_args.args[0]
-        self.assertNotIn("Elusive Dataset", scope_arg)
-        self.assertIn("Parent", scope_arg)
-
-    def test_exploration_does_not_fire_when_paper_traversal_already_met_the_target(self):
-        parent = make_paper(title="Parent", dataset="Findable Dataset")
-        found = make_link_candidate("https://kaggle.com/found", entry_count=15000)
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=found), \
-             patch.object(data_agent, "_search_exploration_sites") as explore_mock:
-            result = data_agent.run(parent, [parent])
-
-        explore_mock.assert_not_called()
-        self.assertEqual(result["search_stage"], "paper_traversal")
-
-    def test_exploration_fires_in_the_same_run_when_paper_traversal_falls_short_of_target(self):
-        """The behavior this whole stage exists to fix: papers finding
-        *something* (but not enough) must not require a separate external
-        re-run to reach the web-search fallback -- it happens in the same
-        run() call."""
-        parent = make_paper(title="Parent", dataset="Findable Dataset")
-        found = make_link_candidate("https://kaggle.com/found", entry_count=3000)
-        exploration_hit = make_link_candidate("https://kaggle.com/explored", entry_count=8000)
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=found), \
-             patch.object(data_agent, "_search_exploration_sites", return_value=[exploration_hit]) as explore_mock:
-            result = data_agent.run(parent, [parent])
-
-        explore_mock.assert_called_once()
-        self.assertEqual(result["search_stage"], "paper_traversal+exploration_sites")
-        self.assertEqual(result["status"], "OK")
-        self.assertEqual(result["total_entries"], 11000)
-        self.assertEqual(result["selected_datasets"], [found, exploration_hit])
-
-    def test_exploration_stops_at_max_datasets_cap(self):
-        """Stage 3 collects more than one dataset when more than one
-        exploration hit qualifies, but still stops at MAX_DATASETS rather
-        than adding every hit returned."""
-        parent = make_paper(title="Parent", dataset="Elusive Dataset")
-        hits = [
-            make_link_candidate(f"https://kaggle.com/explored{i}", entry_count=1000)
-            for i in range(data_agent.MAX_DATASETS + 3)
-        ]
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
-             patch.object(data_agent, "_search_exploration_sites", return_value=hits):
-            result = data_agent.run(parent, [parent])
-
-        self.assertEqual(len(result["selected_datasets"]), data_agent.MAX_DATASETS)
-        self.assertEqual(result["selected_datasets"], hits[:data_agent.MAX_DATASETS])
-
-    def test_not_found_when_every_stage_fails(self):
-        parent = make_paper(title="Parent", dataset="Ghost Dataset")
-
-        with patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=None), \
-             patch.object(data_agent, "_search_exploration_sites", return_value=[]):
-            result = data_agent.run(parent, [parent])
-
-        self.assertEqual(result["status"], "NOT_FOUND")
-        self.assertEqual(result["selected_datasets"], [])
-        self.assertIsNone(result["master_dataset"])
 
 
 class TestUsabilityScore(unittest.TestCase):
@@ -513,10 +462,10 @@ class TestResolveDataset(unittest.TestCase):
         self.assertFalse(data_agent._usable(candidate, 1))
         cache_dataset.assert_not_called()
 
-    def test_reproducibility_fit_failure_leaves_candidate_unusable_and_uncached(self):
-        """A candidate that downloads fine but fails the reproducibility-fit
-        check (e.g. anonymized columns the LLM can't confirm against the
-        Parent Paper) is rejected and not cached, same as any other gate."""
+    def test_fit_failure_leaves_candidate_unusable_and_uncached(self):
+        """A candidate that downloads fine but fails the fit check (no label
+        for the prediction target) is rejected and not cached, same as any
+        other gate."""
         llm_response = self._llm_response(
             '[{"name": "Anonymized Dataset", "source": "Kaggle", "in_scope": true, '
             '"source_url": "https://kaggle.com/anon", "entry_count": null}]'
@@ -536,7 +485,7 @@ class TestResolveDataset(unittest.TestCase):
              patch("requests.post", return_value=llm_response), \
              patch.object(data_agent, "_check_url_reachable", return_value=(True, 200)), \
              patch.object(data_agent, "_download_and_convert_to_csv", side_effect=fake_download), \
-             patch.object(data_agent, "_check_reproducibility_fit", return_value=(False, "columns are anonymized")):
+             patch.object(data_agent, "_check_fit", return_value=(False, "no column matches the target")):
             candidate = data_agent._resolve_dataset(
                 "Anonymized Dataset", "", "", "", query_builder=data_agent._build_query,
                 parent_paper={"title": "P", "methodology": "named features"},
@@ -664,9 +613,8 @@ class TestEntryCountFloor(unittest.TestCase):
         self.assertFalse(data_agent._usable(candidate, data_agent.MIN_ENTRIES_TO_CONSIDER))
 
     def test_reproducibility_unfit_candidate_is_never_usable(self):
-        """A downloaded, verified, in-scope candidate that failed the
-        reproducibility-fit check (e.g. anonymized/opaque columns that
-        can't be verified against the paper) is still rejected."""
+        """A downloaded, verified, in-scope candidate that failed the fit
+        check (no label for the prediction target) is still rejected."""
         candidate = make_candidate(entry_count=50000, reproducibility_fit=False)
         self.assertFalse(data_agent._usable(candidate, data_agent.MIN_ENTRIES_TO_CONSIDER))
 
@@ -960,15 +908,10 @@ class TestDownloadAndConvertToCsv(unittest.TestCase):
         self.assertEqual(candidate["entry_count"], 2)
 
 
-class TestReproducibilityFitCheck(unittest.TestCase):
-    """_check_reproducibility_fit: deterministic, not an LLM judgment call
-    -- an earlier LLM-based version proved non-deterministic on borderline
-    cases (same dataset + same paper, opposite verdicts on different runs),
-    which is unacceptable for a hard accept/reject gate. Anonymized/opaque
-    columns (PCA components, generic V1/col_3/feature_7 names) are rejected
-    unconditionally when they're the majority of a dataset's columns --
-    no exception for what the paper's methodology says. Fails open (True)
-    only on a technical failure (can't re-read the file)."""
+class TestColumnNamesAreNotAGate(unittest.TestCase):
+    """Anonymized/PCA columns and columns with no descriptive name are
+    accepted: _check_fit only checks for a label of the prediction target,
+    and records a note on undescribed columns for the report."""
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
@@ -981,60 +924,109 @@ class TestReproducibilityFitCheck(unittest.TestCase):
         pd.DataFrame(columns_and_rows).to_csv(path, index=False)
         return str(path)
 
-    def test_majority_opaque_columns_rejected(self):
-        candidate = make_candidate(local_csv_path=self._write_csv({
+    def test_pca_columns_are_accepted_with_a_note(self):
+        candidate = make_candidate(display_name="Credit Card Fraud", local_csv_path=self._write_csv({
             "Time": [0, 1], "V1": [-1.35, 0.2], "V2": [-0.07, 1.1], "V3": [1.0, 2.0],
             "Amount": [149.6, 2.6], "Class": [0, 1],
         }))
         with patch("requests.post") as post_mock:
-            fit, explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
+            fit, explanation = data_agent._check_fit(candidate, {"title": "P"}, {"target_terms": ["fraud"]})
 
-        post_mock.assert_not_called()  # no LLM call at all -- fully deterministic
-        self.assertFalse(fit)
-        self.assertIn("V1", explanation)
-        self.assertIn("anonymized", explanation)
-
-    def test_result_is_identical_across_repeated_calls(self):
-        """The whole point of the fix -- same input, same verdict, every time."""
-        candidate = make_candidate(local_csv_path=self._write_csv({
-            "Time": [0, 1], "V1": [-1.35, 0.2], "V2": [-0.07, 1.1], "V3": [1.0, 2.0],
-            "Amount": [149.6, 2.6], "Class": [0, 1],
-        }))
-        results = [data_agent._check_reproducibility_fit(candidate, {"title": "P"}) for _ in range(5)]
-        self.assertEqual(len({r[0] for r in results}), 1)
-        self.assertFalse(results[0][0])
-
-    def test_normal_named_columns_accepted(self):
-        candidate = make_candidate(local_csv_path=self._write_csv({
-            "merchant_category": ["grocery", "retail"], "transaction_amount": [10.5, 200.0],
-            "cardholder_age": [34, 51], "is_fraud": [0, 1],
-        }))
-        fit, explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
+        post_mock.assert_not_called()  # deterministic, no LLM call
         self.assertTrue(fit)
         self.assertEqual(explanation, "")
+        self.assertIn("V1", candidate["column_notes"])
+        self.assertIn("3/6 columns", candidate["column_notes"])
 
-    def test_single_opaque_column_among_many_named_ones_is_still_accepted(self):
-        """Below the 50% threshold -- one anonymized column doesn't make an
-        otherwise-interpretable dataset unusable."""
+    def test_only_undescribed_columns_are_accepted(self):
         candidate = make_candidate(local_csv_path=self._write_csv({
-            "merchant_category": ["grocery", "retail"], "transaction_amount": [10.5, 200.0],
-            "cardholder_age": [34, 51], "is_fraud": [0, 1], "pc1": [0.1, 0.2],
+            "col_1": [1, 2], "col_2": [3, 4], "col_3": [0, 1],
         }))
-        fit, _explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
+        fit, _explanation = data_agent._check_fit(candidate, {"title": "P"}, {"target_terms": []})
         self.assertTrue(fit)
+        self.assertIn("3/3 columns", candidate["column_notes"])
 
-    def test_exactly_half_opaque_is_rejected(self):
+    def test_named_columns_get_no_note(self):
         candidate = make_candidate(local_csv_path=self._write_csv({
-            "amount": [1, 2], "V1": [0.1, 0.2],
+            "transaction_amount": [10.5, 200.0], "is_fraud": [0, 1],
         }))
-        fit, _explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
+        fit, _explanation = data_agent._check_fit(candidate, {"title": "P"}, {"target_terms": ["fraud"]})
+        self.assertTrue(fit)
+        self.assertEqual(candidate["column_notes"], "")
+
+    def test_wrong_target_is_still_rejected(self):
+        candidate = make_candidate(
+            display_name="Default of Credit Card Clients", name="https://x/default", source_url="https://x/default",
+            scope_explanation="", local_csv_path=self._write_csv({"limit_bal": [1, 2], "default_payment": [0, 1]}),
+        )
+        fit, explanation = data_agent._check_fit(candidate, {"title": "P"}, {"target_terms": ["fraud"]})
         self.assertFalse(fit)
+        self.assertIn("predicts something else", explanation)
 
-    def test_unreadable_local_file_fails_open(self):
-        candidate = make_candidate(local_csv_path=str(Path(self._tmpdir) / "does_not_exist.csv"))
-        fit, explanation = data_agent._check_reproducibility_fit(candidate, {"title": "P"})
-        self.assertTrue(fit)
-        self.assertIn("not checked", explanation)
+
+class TestPlanDataNeeds(unittest.TestCase):
+    """plan_data_needs: the agent sets its own entry target from the Parent
+    Paper; the code checks what the LLM returns."""
+
+    PAPER = {"title": "Fraud detection with XGBoost", "dataset": "ULB Credit Card Fraud",
+             "methodology": "XGBoost with SMOTE",
+             "abstract": "We use 284,807 transactions from European cardholders.",
+             "results_summary": "AUC 0.98"}
+
+    def _plan(self, answer: str, paper=None):
+        with patch.object(data_agent.llm, "chat", return_value=answer) as chat:
+            plan = _real_plan_data_needs(paper or self.PAPER, ["fraud"])
+        return plan, chat
+
+    def test_uses_the_agents_target_and_the_papers_stated_size(self):
+        plan, chat = self._plan('{"paper_model": "XGBoost", "paper_dataset": "ULB Credit Card Fraud", '
+                                '"paper_dataset_size": 284807, "target_entries": 284807, '
+                                '"reasoning": "Match the full dataset."}')
+        self.assertEqual(plan["target_entries"], 284807)
+        self.assertEqual(plan["paper_dataset_size"], 284807)
+        self.assertEqual(plan["paper_model"], "XGBoost")
+        self.assertEqual(plan["source"], "llm")
+        prompt = chat.call_args.args[0]
+        self.assertIn("XGBoost with SMOTE", prompt)
+        self.assertIn("AUC 0.98", prompt)
+
+    def test_a_small_target_is_allowed(self):
+        """No project minimum: a few hundred rows is a valid choice."""
+        plan, _ = self._plan('{"target_entries": 300, "paper_dataset_size": null, "reasoning": "Small set."}')
+        self.assertEqual(plan["target_entries"], 300)
+
+    def test_size_not_in_the_paper_text_is_dropped(self):
+        plan, _ = self._plan('{"target_entries": 50000, "paper_dataset_size": 123456, "reasoning": "r"}')
+        self.assertIsNone(plan["paper_dataset_size"])
+        self.assertEqual(plan["target_entries"], 50000)
+        self.assertIn("not in the paper's text", plan["reasoning"])
+
+    def test_target_above_the_row_budget_is_capped(self):
+        plan, _ = self._plan('{"target_entries": 99000000, "reasoning": "r"}')
+        self.assertEqual(plan["target_entries"], data_agent.MAX_TARGET_ENTRIES)
+        self.assertTrue(plan["capped"])
+
+    def test_invalid_target_means_no_target(self):
+        plan, _ = self._plan('{"target_entries": "lots", "reasoning": "r"}')
+        self.assertIsNone(plan["target_entries"])
+
+    def test_llm_failure_means_no_target(self):
+        with patch.object(data_agent.llm, "chat", side_effect=RuntimeError("router down")):
+            plan = _real_plan_data_needs(self.PAPER)
+        self.assertIsNone(plan["target_entries"])
+        self.assertIn("router down", plan["reasoning"])
+        self.assertEqual(plan["source"], "none")
+
+    def test_dataset_links_must_be_written_in_the_paper(self):
+        paper = dict(self.PAPER, dataset_source="Available at https://www.kaggle.com/mlg-ulb/creditcardfraud.")
+        plan, _ = self._plan('{"target_entries": 1000, "dataset_urls": ["https://www.kaggle.com/mlg-ulb/creditcardfraud", '
+                             '"https://made-up.example.com/data"], "reasoning": "r"}', paper)
+        self.assertEqual(plan["dataset_urls"], ["https://www.kaggle.com/mlg-ulb/creditcardfraud"])
+        self.assertIn("not written in the paper", plan["reasoning"])
+
+    def test_json_inside_extra_text_is_parsed(self):
+        plan, _ = self._plan('Here you go:\n{"target_entries": 20000, "reasoning": "r"}')
+        self.assertEqual(plan["target_entries"], 20000)
 
 
 class TestDownloadKaggleDataset(unittest.TestCase):
@@ -1306,11 +1298,8 @@ def test_target_fit_rejects_a_cached_wrong_target_dataset(tmp_path):
                            local_csv_path=str(fraud_csv))
     parent, other = make_paper(title="Parent", dataset="Loan"), make_paper(title="Other", dataset="Fraud")
 
-    def fake_find(paper, _scope, _parent=None, _ctx=None):
-        return loan if paper["title"] == "Parent" else fraud
-
-    with patch.object(data_agent, "_find_and_verify_dataset_for_paper", side_effect=fake_find), \
-         patch.object(data_agent, "_search_exploration_sites", return_value=[]):
+    # A plain pytest function: setUpModule's fixed plan may not be active here.
+    with patch.object(data_agent, "plan_data_needs", return_value=dict(FIXED_PLAN)),          patch.object(data_agent, "_find_parent_dataset", return_value=[loan]),          patch.object(data_agent, "_find_and_verify_dataset_for_paper", return_value=fraud),          patch.object(data_agent, "_search_exploration_sites", return_value=[]):
         result = data_agent.run(parent, [parent, other], target_terms=["fraud"])
 
     assert result["selected_datasets"] == [fraud]

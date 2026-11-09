@@ -430,3 +430,27 @@ class TestDataEnvAndRepair(ExperimentAgentTestCase):
         self.assertEqual(result["status"], "OK")
         self.assertIn("Swapped the model.", repair_mock.call_args.args[1])
         self.assertEqual((Path(result["experiment_dir"]) / "train.py").read_text(), "fixed")
+
+
+class TestEvaluationRecommendation(unittest.TestCase):
+    """The Evaluation Agent's recommended experiment is used when it is
+    usable; otherwise the exhaustion order applies."""
+
+    def test_recommended_category_is_used_for_a_reconstructed_baseline(self):
+        self.assertEqual(experiment_agent._next_category("reconstructed", [], "alternative_sampling_technique"),
+                         "alternative_sampling_technique")
+
+    def test_recommended_category_is_not_repeated(self):
+        tried = [{"category": "alternative_sampling_technique"}]
+        self.assertEqual(experiment_agent._next_category("reconstructed", tried, "alternative_sampling_technique"),
+                         experiment_agent.CODE_LEVEL_CATEGORIES[0])
+
+    def test_cloned_baseline_ignores_a_code_level_recommendation(self):
+        self.assertEqual(experiment_agent._next_category("cloned_repository", [], "alternative_model"),
+                         experiment_agent.DATASET_SPLIT_CATEGORY)
+
+    def test_guidance_reaches_the_proposal_prompt(self):
+        with patch.object(experiment_agent.llm, "chat", return_value="") as chat:
+            experiment_agent._propose_code_change("alternative_sampling_technique", {"title": "P"}, "code()", [],
+                                                  ["Try ADASYN inside an imblearn Pipeline."])
+        self.assertIn("Try ADASYN inside an imblearn Pipeline.", chat.call_args.args[0])

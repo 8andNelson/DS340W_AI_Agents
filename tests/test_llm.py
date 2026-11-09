@@ -273,3 +273,25 @@ class TestFreeLLMAPIAgentRouting:
         from src.config import FREELLMAPI_AGENT_MODELS
         for agent, models in FREELLMAPI_AGENT_MODELS.items():
             assert len(models) == 2 and all(models), agent
+
+
+@patch("src.llm.OPENROUTER_API_KEY", "key")
+def test_master_agent_notes_are_added_to_the_system_prompt_only_while_active():
+    with patch("src.llm.requests.post", return_value=response(200)) as post:
+        with llm.supervisor_notes(["Attempt 1 failed: only 3 papers. Do this next time: broaden the queries."]):
+            llm.chat("hi", system="You are the Research Agent.")
+        llm.chat("hi", system="You are the Research Agent.")
+    with_notes = post.call_args_list[0].kwargs["json"]["messages"][0]["content"]
+    without = post.call_args_list[1].kwargs["json"]["messages"][0]["content"]
+    assert with_notes.startswith("You are the Research Agent.")
+    assert "MASTER AGENT NOTES" in with_notes and "broaden the queries" in with_notes
+    assert without == "You are the Research Agent."
+
+
+@patch("src.llm.OPENROUTER_API_KEY", "key")
+def test_notes_become_the_system_prompt_when_the_call_has_none():
+    with patch("src.llm.requests.post", return_value=response(200)) as post:
+        with llm.supervisor_notes(["fix it"]):
+            llm.chat("hi")
+    messages = post.call_args.kwargs["json"]["messages"]
+    assert messages[0]["role"] == "system" and "- fix it" in messages[0]["content"]

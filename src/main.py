@@ -79,8 +79,12 @@ def _print_parent_paper_recommendation(rec: dict) -> None:
 
 def _print_dataset_summary(result: dict) -> None:
     print(f"\n--- Dataset Pool ({result['status']}) ---")
-    print(f"  Total entries: {result['total_entries']} / {result['target_entries']} "
+    target = result.get("target_entries")
+    print(f"  Total entries: {result['total_entries']} / {target if target is not None else 'no target'} "
           f"(target met: {result['target_met']})")
+    plan = result.get("data_plan") or {}
+    if plan.get("reasoning"):
+        print(f"  Data plan:     {plan['reasoning']}")
     print(f"  Datasets used: {len(result['selected_datasets'])} "
           f"(considered {result['datasets_considered']} candidate papers)")
     print(f"  Search stage:  {result['search_stage']}")
@@ -99,7 +103,7 @@ def _print_cleaning_summary(result: dict) -> None:
     print(f"\n--- Master Dataset ({result['status']}) ---")
     print(f"  Datasets merged: {result['datasets_merged']} / {result['datasets_attempted']}")
     print(f"  Rows / columns:  {result['rows_total']} / {result['columns_total']} "
-          f"(target: {result.get('target_rows', 10000)}, target met: {result.get('target_met', False)})")
+          f"(target: {result.get('target_rows') or 'none'}, target met: {result.get('target_met')})")
     if result.get("master_csv_path"):
         print(f"  Master CSV:      {result['master_csv_path']}")
 
@@ -168,6 +172,23 @@ def _print_evaluation_summary(result: dict) -> None:
         print("  Likely causes:")
         for c in result["likely_causes"]:
             print(f"    - {c}")
+    review = result.get("review") or {}
+    if review.get("assessment"):
+        print(f"  Analyst review: {review['assessment']}")
+    for f in review.get("static_findings", []) + [f for f in review.get("findings", []) if f.get("verified")]:
+        print(f"    - [{f['severity']}] {f['issue']}")
+    decision = result.get("decision") or {}
+    if decision:
+        print(f"  Decision: {decision.get('action', '')}"
+              + (f" -> {decision['target_agent']}" if decision.get("target_agent") else ""))
+
+
+def _print_improvement_rounds(rounds: list) -> None:
+    if not rounds:
+        return
+    print("\n--- Improvement rounds (Evaluation Agent requests run by Master Agent) ---")
+    for r in rounds:
+        print(f"  Round {r['round']}: {r['action']} -> {r['target_agent']}: {r.get('outcome', '')}")
 
 
 def _print_experiment_summary(result: dict) -> None:
@@ -214,8 +235,9 @@ def main():
     result = master_agent.run_pipeline(topic)
 
     if not result["success"]:
-        print(f"\nPipeline halted at phase {result['phase']}. Master Agent could not get "
-              f"a passing result after retrying. See corrections above and logs/master_agent_log.json.")
+        print(f"\nPipeline halted at phase {result['phase']}. Master Agent could not get a passing "
+              f"result after {master_agent.MAX_ATTEMPTS} diagnosed attempts. See the corrections above, "
+              f"logs/master_agent_log.json and logs/agent_reports/.")
         sys.exit(1)
 
     if result["structured"]:
@@ -245,6 +267,7 @@ def main():
 
     if result["evaluation_result"]:
         _print_evaluation_summary(result["evaluation_result"])
+        _print_improvement_rounds(result.get("improvement_rounds") or [])
 
     if result["experiment_result"]:
         _print_experiment_summary(result["experiment_result"])

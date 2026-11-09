@@ -15,6 +15,7 @@ from src.agents import (
     cleaning_agent, data_agent, experiment_agent, master_agent, replication_agent,
 )
 from src.orchestration import code_discovery_cache, column_mapping, dataset_cache, run_store, state_manager
+from src.search import paper_fulltext
 
 
 @pytest.fixture(autouse=True)
@@ -49,3 +50,10 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "CALL_LOG", logs / "llm_calls.jsonl")
     monkeypatch.setattr(run_store, "DB_FILE", tmp_path / "database" / "project_runs.db")
     monkeypatch.setattr(run_store, "_project_git_commit", lambda: "test-commit")
+    monkeypatch.setattr(master_agent, "ROUND_BACKUP_DIR", logs / "round_backups")
+    # The Parent Paper's full text: no download (no open-access links) and
+    # no reading of a real papers/parent/ cache, so agents fall back to the
+    # paper's stored metadata. tests/test_paper_fulltext.py tests the real
+    # lookup with mocked HTTP.
+    monkeypatch.setattr(paper_fulltext, "PARENT_PAPER_DIR", tmp_path / "papers" / "parent")
+    monkeypatch.setattr(paper_fulltext, "candidate_pdf_urls", lambda parent_paper: [])

@@ -481,3 +481,106 @@ class TestReconstructionLiveRunFixes(ReplicationAgentTestCase):
         self.assertIn("train=2", profile)
         self.assertIn("candidate labels", profile)
         self.assertIn("_source_dataset", profile)
+
+
+class TestReadsTheParentPaper(ReplicationAgentTestCase):
+    """The reconstruction reads the Parent Paper itself, not only the
+    search record's one-line summary."""
+
+    def test_generation_prompt_contains_the_papers_method_text(self):
+        paper_text = {"status": "FULL_TEXT", "text": "We split 80/20, then applied SMOTE to the training set only."}
+        with patch.object(replication_agent.llm, "chat", return_value="") as chat:
+            replication_agent._generate_baseline_script(make_paper(), make_cleaning_result(), "profile", paper_text)
+        prompt = chat.call_args.args[0]
+        self.assertIn("applied SMOTE to the training set only", prompt)
+        self.assertIn("Excerpts from the paper's own full text", prompt)
+
+    def test_without_full_text_the_prompt_says_so(self):
+        with patch.object(replication_agent.llm, "chat", return_value="") as chat:
+            replication_agent._generate_baseline_script(make_paper(), make_cleaning_result(), "profile")
+        prompt = chat.call_args.args[0]
+        self.assertIn("full text was not available", prompt)
+        self.assertIn("Random Forests", prompt)  # the stored methodology is still given
+
+    def test_result_records_what_could_be_read(self):
+        generated = {"code": "print(1)", "inferred_assumptions": [], "libraries_required": []}
+        with patch.object(replication_agent, "_generate_baseline_script", return_value=generated), \
+             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_freeze", return_value=""), \
+             patch.object(replication_agent, "_run_bounded", return_value=run_result(stdout="METRIC accuracy=0.9")):
+            result = replication_agent._replicate_by_reconstruction(make_paper(), make_cleaning_result())
+        self.assertEqual(result["paper_text_status"], "ABSTRACT_ONLY")
+
+
+class TestRevision(ReplicationAgentTestCase):
+    """Master Agent relays an Evaluation Agent request: fix stated defects,
+    or re-run the same script on more data. The previous baseline is
+    archived first, and a cloned repository is never revised."""
+
+    def _baseline(self, code="X_res = SMOTE().fit_resample(X, y)\nsplit()\n"):
+        recon = Path(self._tmpdir.name) / replication_agent._slugify(make_paper()["title"]) / "reconstructed"
+        recon.mkdir(parents=True)
+        (recon / "train.py").write_text(code)
+        (recon.parent / "run_stdout.txt").write_text("METRIC accuracy=0.999")
+        return recon
+
+    def _run(self, revision, revised=None):
+        revised = revised if revised is not None else {"code": "fixed()", "inferred_assumptions": ["new"],
+                                                       "libraries_required": []}
+        with patch.object(replication_agent, "_revise_baseline_script", return_value=revised) as revise, \
+             patch.object(replication_agent, "_generate_baseline_script") as generate, \
+             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
+             patch.object(replication_agent, "_pip_freeze", return_value=""), \
+             patch.object(replication_agent, "_run_bounded", return_value=run_result(stdout="METRIC accuracy=0.91")):
+            result = replication_agent.run(make_paper(), {"status": "NOT_FOUND"}, make_cleaning_result(), revision)
+        return result, revise, generate
+
+    def test_revision_archives_the_old_baseline_and_fixes_the_defects(self):
+        recon = self._baseline()
+        result, revise, generate = self._run({"round": 1, "instructions": ["Split before SMOTE."],
+                                              "previous_inferred_assumptions": ["old"]})
+        generate.assert_not_called()
+        self.assertIn("SMOTE().fit_resample(X, y)", revise.call_args.args[0])
+        self.assertEqual(revise.call_args.args[1], ["Split before SMOTE."])
+        archive = recon.parent / "revisions" / "round_1"
+        self.assertIn("fit_resample", (archive / "train.py").read_text())
+        self.assertEqual((archive / "run_stdout.txt").read_text(), "METRIC accuracy=0.999")
+        self.assertEqual((recon / "train.py").read_text(), "fixed()")
+        self.assertEqual(result["revision_round"], 1)
+        self.assertEqual(result["inferred_assumptions"], ["old", "new"])
+        self.assertEqual(result["status"], "OK")
+
+    def test_a_retry_of_the_same_round_keeps_the_original_archive(self):
+        recon = self._baseline("original()")
+        self._run({"round": 1, "instructions": ["fix"]})
+        (recon / "train.py").write_text("failed attempt()")
+        self._run({"round": 1, "instructions": ["fix"]})
+        self.assertEqual((recon.parent / "revisions" / "round_1" / "train.py").read_text(), "original()")
+
+    def test_more_data_reruns_the_same_script(self):
+        recon = self._baseline("same_script()")
+        result, revise, generate = self._run({"round": 1, "reuse_script": True,
+                                              "previous_inferred_assumptions": ["kept"]})
+        revise.assert_not_called()
+        generate.assert_not_called()
+        self.assertEqual((recon / "train.py").read_text(), "same_script()")
+        self.assertEqual(result["inferred_assumptions"], ["kept"])
+
+    def test_cloned_repository_is_never_revised(self):
+        with patch.object(replication_agent, "_replicate_from_repository",
+                          return_value=replication_agent._default_result(status="OK", source="cloned_repository")), \
+             patch.object(replication_agent, "_revise_baseline_script") as revise:
+            result = replication_agent.run(make_paper(), make_code_discovery_result(), make_cleaning_result(),
+                                           {"round": 1, "instructions": ["fix leakage"]})
+        revise.assert_not_called()
+        self.assertTrue(any("Revision not applied" in w for w in result["warnings"]))
+
+    def test_revise_prompt_states_the_defects_and_the_leakage_rule(self):
+        with patch.object(replication_agent.llm, "chat", return_value="") as chat:
+            replication_agent._revise_baseline_script("code()", ["SMOTE is applied before the split."], make_paper(),
+                                                      {"status": "ABSTRACT_ONLY", "text": "t"}, "profile")
+        prompt = chat.call_args.args[0]
+        self.assertIn("SMOTE is applied before the split.", prompt)
+        self.assertIn("fitted on the\nTRAINING data only", prompt)

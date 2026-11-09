@@ -39,13 +39,12 @@ an unreadable file, or an incompatible schema -- is written to
 logs/cleaning_conflicts.json and printed as it's found, per CLAUDE.md's
 "never silently drop, always log why" policy.
 
-The project's >=10,000-entry target is enforced here, on the merged
-master CSV's actual row count -- not on any individual dataset. Data
-Agent no longer gates individual candidates on entry count (removed so
-Kaggle's own dataset-search API, which doesn't expose row counts up
-front, can be used for discovery); this is the one place total volume
-actually gets checked, since it's the only point where the true, final,
-deduplicated row count is known.
+There is no fixed entry minimum. The Data Agent decides how many entries
+this replication needs from the Parent Paper (data_agent.plan_data_needs)
+and Master Agent passes that number here as target_rows; it is checked on
+the merged master CSV's actual row count, since that is the only point
+where the true, final, deduplicated total is known. Without a target
+(target_rows=None) no row count is checked.
 
 Once the master CSV is written, it's also split into train (70%), test
 (20%), and validation (10%) CSVs for the future Modeling Agent to consume.
@@ -76,7 +75,6 @@ TEST_CSV_NAME = "test.csv"
 VALIDATION_CSV_NAME = "validation.csv"
 
 SOURCE_COLUMN = "_source_dataset"
-TARGET_ROWS = 10000
 
 TRAIN_FRAC = 0.7
 TEST_FRAC = 0.2
@@ -296,7 +294,7 @@ def _merge_by_label(loaded: list, conflicts: list, mappings: list) -> tuple[list
     return accepted, label_column
 
 
-def run(selected_datasets: list, target_terms: list = None) -> dict:
+def run(selected_datasets: list, target_terms: list = None, target_rows: int | None = None) -> dict:
     """
     Merge every dataset in selected_datasets (Data Agent's output, each
     already downloaded to a local CSV) into one cleaned master CSV. Never
@@ -306,6 +304,9 @@ def run(selected_datasets: list, target_terms: list = None) -> dict:
     target_terms (the Intake Agent's prediction-target keywords) enables
     the label-aware, semantically mapped merge; without them, datasets
     merge on shared column names.
+
+    target_rows is the Data Agent's own entry target for this run (None
+    when it set none); the merged row count is checked against it.
     """
     print(f"\n[Cleaning Agent] Cleaning and merging {len(selected_datasets)} dataset(s)...")
 
@@ -335,8 +336,8 @@ def run(selected_datasets: list, target_terms: list = None) -> dict:
             "datasets_merged": 0,
             "rows_total": 0,
             "columns_total": 0,
-            "target_rows": TARGET_ROWS,
-            "target_met": False,
+            "target_rows": target_rows,
+            "target_met": False if target_rows is not None else None,
             "conflicts": conflicts,
             "label_column": "",
             "column_mappings": mappings,
@@ -364,8 +365,8 @@ def run(selected_datasets: list, target_terms: list = None) -> dict:
     master_path = PROCESSED_DATA_DIR / MASTER_CSV_NAME
     master.to_csv(master_path, index=False)
 
-    target_met = len(master) >= TARGET_ROWS
-    status = "OK" if (not conflicts and target_met) else "DEGRADED"
+    target_met = None if target_rows is None else len(master) >= target_rows
+    status = "OK" if (not conflicts and target_met is not False) else "DEGRADED"
     sampled = master_cap["sampled"] or any(i["sampled"] for i in sampling)
 
     notes_parts = []
@@ -374,12 +375,14 @@ def run(selected_datasets: list, target_terms: list = None) -> dict:
     if sampled:
         notes_parts.append(f"Row budget applied (at most {MAX_ROWS_PER_DATASET} rows per dataset, "
                            f"{MAX_MASTER_ROWS} in total; stratified, seed fixed) -- see 'sampling'.")
-    if not target_met:
-        notes_parts.append(f"Merged total is {len(master)} rows, below the {TARGET_ROWS}-row target.")
+    if target_met is False:
+        notes_parts.append(f"Merged total is {len(master)} rows, below the Data Agent's "
+                           f"{target_rows}-row target.")
     notes = " ".join(notes_parts)
 
     print(f"[Cleaning Agent] Done. Status={status}, merged={len(accepted)}/{len(selected_datasets)}, "
-          f"rows={len(master)}/{TARGET_ROWS} (target met: {target_met}), "
+          f"rows={len(master)}/{target_rows if target_rows is not None else 'no target'} "
+          f"(target met: {target_met}), "
           f"columns={master.shape[1]}, label='{label_column or 'unknown'}', wrote {master_path}.")
 
     split_info = _write_split_csvs(master)
@@ -391,7 +394,7 @@ def run(selected_datasets: list, target_terms: list = None) -> dict:
         "datasets_merged": len(accepted),
         "rows_total": len(master),
         "columns_total": master.shape[1],
-        "target_rows": TARGET_ROWS,
+        "target_rows": target_rows,
         "target_met": target_met,
         "conflicts": conflicts,
         "label_column": label_column,

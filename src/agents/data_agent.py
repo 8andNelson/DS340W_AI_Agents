@@ -1,31 +1,28 @@
 """
 Data Agent (Milestone 6).
 
-Builds a dataset pool of at least TARGET_ENTRIES total entries to support
-the Parent Paper's replication, escalating through three stages within a
-single run() call -- reaching stage 3 never requires an external re-run:
+Builds the dataset pool for the Parent Paper's replication. It reads the
+Parent Paper itself -- the open-access full text when one exists
+(src/search/paper_fulltext.py), else its stored abstract and metadata --
+to find the exact dataset the paper used: its name, its source, the links
+the paper gives, and its stated size (plan_data_needs). Two modes:
 
-  1. Parent Paper's own stated dataset.
-  2. The full ranked candidate pool (composite-score order, starting at the
-     second-highest paper), each paper's own stated dataset -- no cap on
-     how many papers are checked.
-  3. Whenever stages 1-2 leave the entry-count target unmet -- whether they
-     found nothing usable at all, or found some datasets but total_entries
-     is still short -- fall through, in this same run, to a general web
-     search instead of retrying the specific (already-failed) dataset
-     names again: curated dataset directories (Google Dataset Search,
-     Kaggle Datasets, awesome-public-datasets) for anything relevant to
-     the project's scope, scoring each candidate on usability (entry
-     count, license, format, access method) since there's no single paper
-     claim to match against here. Skipped only when stages 1-2 already met
-     the target on their own.
+  parent_only (the first run): collect ONLY the Parent Paper's own dataset
+     -- each link written in the paper, then a search for the paper's
+     dataset name. There is no entry minimum; the plan's suggested size is
+     recorded as advice for the Evaluation Agent. Only when the paper's own
+     dataset cannot be obtained at all does the agent search other sources
+     (stages 2-3 below) for a SUBSTITUTE, logged as such (status DEGRADED).
 
-Collection does NOT stop the moment the entry-count target is reached --
-it keeps adding further qualifying, non-duplicate datasets (across all
-three stages) up to MAX_DATASETS, so a pool of several smaller datasets is
-preferred over stopping at the first single dataset big enough to meet the
-target alone. It still stops early once MAX_DATASETS is reached, or once
-a stage's candidates are exhausted, whichever comes first.
+  expand (only on an Evaluation Agent request, relayed and run by Master
+     Agent): keep the datasets already collected and add datasets from
+     sources away from the Parent Paper until the request's goal
+     (target_entries) is met or MAX_DATASETS is reached:
+       2. the ranked candidate papers' own datasets (composite-score order,
+          starting at the second-highest paper);
+       3. curated dataset directories (Google Dataset Search, Kaggle,
+          awesome-public-datasets, Hugging Face, UCI) for anything relevant
+          to the project's scope, scored on usability.
 
 A dataset's identity is its resolved downloadable link (`name`), not any
 text name mentioned in a paper -- two papers naming the same dataset
@@ -62,18 +59,18 @@ from bs4 import BeautifulSoup
 
 from src import llm
 from src.config import KAGGLE_USERNAME, KAGGLE_KEY
-from src.search import brave_search
+from src.search import brave_search, paper_fulltext
 from src.orchestration import dataset_cache
 from src.orchestration.dataset_budget import (
-    MAX_ROWS_PER_DATASET, check_target_fit, find_label_column, read_csv_capped, stratified_cap,
+    MAX_MASTER_ROWS, MAX_ROWS_PER_DATASET, check_target_fit, find_label_column, read_csv_capped, stratified_cap,
 )
 from src.agents.validation_agent import _check_url_reachable
 
-TARGET_ENTRIES = 10000
-MIN_ENTRIES_TO_CONSIDER = 1  # any real, non-empty download counts -- the
-                             # 10,000+ target is enforced on the merged
-                             # master CSV by the Cleaning Agent, not per
-                             # individual dataset here
+MIN_ENTRIES_TO_CONSIDER = 1  # any real, non-empty download counts
+# The agent's own entry target (plan_data_needs) is capped at the local row
+# budget: the Cleaning Agent samples the master CSV down to MAX_MASTER_ROWS,
+# so a larger target could never be met.
+MAX_TARGET_ENTRIES = MAX_MASTER_ROWS
 MAX_DATASETS = 5
 RESULTS_PER_QUERY = 20  # Brave's maximum (brave_search.BRAVE_MAX_COUNT)
 PAGE_FETCH_TIMEOUT = 15
@@ -122,7 +119,7 @@ _CANDIDATE_DEFAULTS = {
     "verification_method": "",
     "local_csv_path": "",   # set once downloaded and converted -- see _download_and_convert_to_csv
     "download_status": "",  # "" until attempted; "ok" or "failed: <reason>" after
-    "reproducibility_fit": None,  # None until checked -- see _check_reproducibility_fit
+    "reproducibility_fit": None,  # None until checked -- see _check_fit
     "reproducibility_notes": "",
     "notes": "",
 }
@@ -152,6 +149,140 @@ def _build_query(dataset_name: str, dataset_source: str) -> str:
         parts.append(dataset_source)
     parts.append("dataset")
     return " ".join(parts)
+
+
+_PAPER_FIELDS_FOR_PLAN = ("title", "venue", "year", "abstract", "methodology", "dataset", "dataset_source",
+                          "results_summary", "notes")
+
+
+def _paper_text(parent_paper: dict) -> str:
+    return "\n".join(f"{k}: {parent_paper.get(k)}" for k in _PAPER_FIELDS_FOR_PLAN if parent_paper.get(k))
+
+
+PAPER_EXCERPT_CHARS = 10000
+_URL_RE = re.compile(r"https?://[^\s)\]>,;\"']+")
+
+
+def _stated_in(number: int, text: str) -> bool:
+    """Is this number written in the paper's own text (e.g. 284807,
+    284,807 or 284 807)? Used to drop a dataset size the LLM did not read
+    from the paper."""
+    digits = str(number)
+    return any(digits == re.sub(r"[,\s.]", "", m) for m in re.findall(r"\d[\d,\s.]*\d|\d", text))
+
+
+def _positive_int(value) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _urls_in(text: str) -> list:
+    return [u.rstrip(".") for u in _URL_RE.findall(text or "")]
+
+
+def plan_data_needs(parent_paper: dict, target_terms: list = None, paper: dict = None) -> dict:
+    """
+    Read the Parent Paper itself (its open-access full text when one exists
+    -- src/search/paper_fulltext.py -- else its stored abstract and
+    metadata) and return what the Data Agent needs to collect its dataset:
+    the dataset's name, source and the links the paper gives, its stated
+    size, the model the paper used, and how many entries the replication
+    needs. One LLM call; the code then checks the answer:
+
+      - a dataset link is kept only if it is written in the paper's text;
+      - paper_dataset_size is kept only if that number is written in the
+        paper's text (never a guess -- No Hallucination Policy);
+      - target_entries must be a positive integer, capped at
+        MAX_TARGET_ENTRIES (the local row budget).
+
+    target_entries is advice for the Evaluation Agent: the first Data Agent
+    run collects only the Parent Paper's own dataset, whatever its size.
+    """
+    plan = {"target_entries": None, "paper_dataset_size": None, "paper_model": "", "paper_dataset": "",
+            "dataset_source": "", "dataset_urls": [], "reasoning": "", "capped": False, "source": "none",
+            "paper_text_status": (paper or {}).get("status", "")}
+    if not parent_paper:
+        plan["reasoning"] = "No Parent Paper, so no entry target was set."
+        return plan
+
+    paper_text = (paper or {}).get("text") or _paper_text(parent_paper)
+    text = paper_fulltext.excerpt(paper_text, paper_fulltext.DATA_KEYWORDS + ("model", "classifier"),
+                                  max_chars=PAPER_EXCERPT_CHARS)
+    full_text_note = ("This is text from the paper's own PDF." if (paper or {}).get("status") == "FULL_TEXT"
+                      else "Only the paper's abstract and metadata are available, not the full paper.")
+    target_line = f"Prediction target: {', '.join(target_terms)}\n" if target_terms else ""
+    prompt = f"""You are the Data Agent of a research pipeline that must replicate a Parent Paper's experiment and
+reach results as close to (or better than) the paper's as possible. Read the paper below and find the exact
+dataset it used, and decide how many dataset entries (rows) the replication needs.
+
+Parent Paper ({full_text_note}):
+{text}
+{target_line}
+Reason from the paper itself:
+- Which dataset did it use, from which source, and does the text give a link (URL) to it? Copy links exactly.
+- How many rows does the paper state? If it states a size, replicating at that scale is the strongest choice.
+- Which model(s) did it use? Deep learning models usually need far more rows than tree ensembles, linear models or
+  SVMs.
+- How was it evaluated (splits, cross-validation, metrics)? For an imbalanced target, the minority class needs
+  enough examples in every split.
+
+Return ONE JSON object:
+{{
+  "paper_dataset": "<the dataset's name exactly as the paper gives it, else empty string>",
+  "dataset_source": "<where the paper says it comes from (e.g. Kaggle, UCI, a company), else empty string>",
+  "dataset_urls": ["<every link to the dataset written in the text above, copied exactly; [] if none>"],
+  "paper_model": "<model(s) the paper used, as stated, else empty string>",
+  "paper_dataset_size": <integer number of rows ONLY if the paper text above states it, else null -- never guess>,
+  "target_entries": <integer: the number of rows this replication should have>,
+  "reasoning": "<2-4 sentences: why this number is enough to reproduce the paper's results>"
+}}
+Return ONLY valid JSON. No explanation or markdown."""
+
+    try:
+        content = llm.chat(prompt, timeout=300, agent="data_agent")
+        try:
+            answer = json.loads(content)
+        except json.JSONDecodeError:
+            match = re.search(r"\{[\s\S]*\}", content)
+            answer = json.loads(match.group(0)) if match else {}
+        if not isinstance(answer, dict):
+            answer = {}
+    except Exception as e:
+        plan["reasoning"] = f"Could not read the paper for its dataset ({e})."
+        return plan
+
+    plan["source"] = "llm"
+    plan["paper_model"] = str(answer.get("paper_model") or "")
+    plan["paper_dataset"] = str(answer.get("paper_dataset") or "")
+    plan["dataset_source"] = str(answer.get("dataset_source") or "")
+    plan["reasoning"] = str(answer.get("reasoning") or "")
+
+    written = set(_urls_in(paper_text))
+    urls = answer.get("dataset_urls") if isinstance(answer.get("dataset_urls"), list) else []
+    kept = [str(u).rstrip(".") for u in urls if str(u).rstrip(".") in written]
+    if len(kept) < len(urls):
+        plan["reasoning"] += f" ({len(urls) - len(kept)} dataset link(s) not written in the paper were dropped.)"
+    plan["dataset_urls"] = list(dict.fromkeys(kept))
+
+    size = _positive_int(answer.get("paper_dataset_size"))
+    if size is not None and not _stated_in(size, paper_text):
+        plan["reasoning"] += f" (A paper dataset size of {size} was given but is not in the paper's text; dropped.)"
+        size = None
+    plan["paper_dataset_size"] = size
+
+    target = _positive_int(answer.get("target_entries"))
+    if target is None:
+        plan["reasoning"] += " (No valid entry target was returned.)"
+    elif target > MAX_TARGET_ENTRIES:
+        plan["reasoning"] += (f" (Target {target} is above the local row budget; capped at "
+                              f"{MAX_TARGET_ENTRIES}.)")
+        target = MAX_TARGET_ENTRIES
+        plan["capped"] = True
+    plan["target_entries"] = target
+    return plan
 
 
 def _extract_dataset_candidates_from_results(
@@ -592,39 +723,20 @@ def _download_and_convert_to_csv(candidate: dict, target_terms: list = None) -> 
 _OPAQUE_COLUMN_RE = re.compile(r"^(v|col|column|feature|feat|f|x|pc)_?\d+$", re.IGNORECASE)
 
 
-def _check_reproducibility_fit(candidate: dict, parent_paper: dict) -> tuple[bool, str]:
-    """Check whether the actual downloaded dataset's columns are readable
-    enough to be usable -- deterministic, not an LLM judgment call. An
-    earlier LLM-based version of this check (comparing columns against the
-    Parent Paper's methodology text) proved non-deterministic on borderline
-    cases -- the same dataset against the same paper got opposite verdicts
-    on different runs, which is unacceptable for a hard accept/reject gate.
-    Anonymized/opaque columns (PCA components, generic V1/col_3/feature_7
-    names) make a dataset unusable regardless of topical fit, since the
-    actual features can't be understood or verified -- so this rejects
-    unconditionally when a majority of columns match that pattern, with no
-    exception for what the paper's methodology says.
-
-    `parent_paper` is accepted but unused -- kept so this stays a drop-in
-    replacement for the call sites in _resolve_dataset and
-    _search_exploration_sites. Fails open (True) only on a technical
-    failure (can't re-read the file), never fabricating a rejection it
-    can't support."""
+def _describe_columns(candidate: dict) -> str:
+    """A note (never a rejection) when columns have no descriptive names,
+    e.g. PCA components V1..V28. Such datasets are accepted -- many papers,
+    including the ULB credit-card fraud papers, use exactly these -- but the
+    report should say the features cannot be interpreted."""
     try:
-        sample = pd.read_csv(candidate["local_csv_path"], nrows=5)
-    except Exception as e:
-        return True, f"not checked -- could not re-read downloaded file ({e})"
-
-    columns = list(sample.columns)
-    opaque = [c for c in columns if _OPAQUE_COLUMN_RE.match(str(c).strip())]
-    if columns and len(opaque) / len(columns) >= 0.5:
-        return False, (
-            f"{len(opaque)}/{len(columns)} columns are anonymized/opaque "
-            f"(e.g. {', '.join(str(c) for c in opaque[:5])}) with no stated meaning -- "
-            "rejected regardless of topical fit, since the actual features "
-            "can't be verified or understood."
-        )
-    return True, ""
+        columns = list(pd.read_csv(candidate["local_csv_path"], nrows=5).columns)
+    except Exception:
+        return ""
+    opaque = [str(c) for c in columns if _OPAQUE_COLUMN_RE.match(str(c).strip())]
+    if not opaque:
+        return ""
+    return (f"{len(opaque)}/{len(columns)} columns have no descriptive name (e.g. {', '.join(opaque[:5])}), "
+            "such as anonymized or PCA features; accepted, but these features cannot be interpreted.")
 
 
 def _dataset_text(candidate: dict) -> str:
@@ -633,16 +745,15 @@ def _dataset_text(candidate: dict) -> str:
 
 
 def _check_fit(candidate: dict, parent_paper: dict, ctx: dict = None) -> tuple[bool, str]:
-    """Both deterministic fit checks on a downloaded dataset: readable
-    (non-anonymized) columns, and a label for the project's prediction
-    target (dataset_budget.check_target_fit)."""
-    fit, explanation = _check_reproducibility_fit(candidate, parent_paper)
-    if not fit:
-        return fit, explanation
+    """The deterministic fit check on a downloaded dataset: a label for the
+    project's prediction target (dataset_budget.check_target_fit). Column
+    names are not checked -- anonymized/PCA columns are accepted, with a
+    note (`column_notes`)."""
+    candidate["column_notes"] = _describe_columns(candidate)
     target_fit, target_explanation = check_target_fit(
         candidate["local_csv_path"], (ctx or {}).get("target_terms"), _dataset_text(candidate))
     candidate["target_fit_notes"] = target_explanation
-    return target_fit, explanation if target_fit else target_explanation
+    return target_fit, "" if target_fit else target_explanation
 
 
 def _already_rejected(candidate: dict, ctx: dict = None) -> bool:
@@ -668,6 +779,7 @@ _VERIFICATION_METHOD_DESCRIPTIONS = {
     "cache_hit": "reused from an earlier search",
     "brave_search": "found via Brave search for the paper's stated dataset name",
     "exploration_site": "found via a curated dataset-directory search",
+    "parent_paper_text": "linked in the Parent Paper's own text",
 }
 
 _ENTRY_COUNT_SOURCE_DESCRIPTIONS = {
@@ -693,6 +805,8 @@ def _describe_provenance(candidate: dict) -> str:
     notes = candidate.get("reproducibility_notes", "")
     if notes and not notes.startswith("not checked"):
         parts.append(f"reproducibility fit: {notes}")
+    if candidate.get("column_notes"):
+        parts.append(candidate["column_notes"])
     return "; ".join(p for p in parts if p)
 
 
@@ -885,36 +999,112 @@ def _usable(candidate: dict | None, min_entries: int) -> bool:
     )
 
 
-def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTRIES,
-        search_query: str = "", target_terms: list = None) -> dict:
+def _dataset_from_paper_link(url: str, plan: dict, parent_paper: dict, ctx: dict) -> dict | None:
+    """Try one dataset link written in the Parent Paper itself. The paper
+    names it, so it is in scope by definition; it must still be reachable,
+    download as real data and pass the target-fit check."""
+    candidate = _default_candidate(
+        name=url, source_url=url, display_name=plan.get("paper_dataset") or url,
+        matches_parent_paper=True, match_explanation="The link is written in the Parent Paper's own text.",
+        in_scope=True, scope_explanation="Named by the Parent Paper itself.",
+        source=plan.get("dataset_source", ""), verification_method="parent_paper_text",
+    )
+    reachable, _status = _check_url_reachable(url)
+    candidate["verified"] = reachable
+    if not reachable or _already_rejected(candidate, ctx):
+        return None
+    if not _download_and_convert_to_csv(candidate, ctx.get("target_terms")):
+        print(f"[Data Agent] The paper's link {url} did not download as tabular data.")
+        return None
+    fit, explanation = _check_fit(candidate, parent_paper, ctx)
+    candidate["reproducibility_fit"] = fit
+    candidate["reproducibility_notes"] = explanation
+    if not fit:
+        print(f"[Data Agent] The paper's link {url} downloaded but was rejected: {explanation}")
+        _remember_rejection(candidate, ctx)
+        return None
+    return candidate
+
+
+def _find_parent_dataset(parent_paper: dict, plan: dict, scope_description: str, ctx: dict) -> list:
+    """Stage 1: the Parent Paper's own dataset, in this order -- each link
+    the paper's text gives, then a search for the name the paper's text
+    gives, then a search for the name stored with the paper's search record
+    (when it differs). Returns every candidate tried, best last."""
+    tried = []
+    for url in plan.get("dataset_urls") or []:
+        candidate = _dataset_from_paper_link(url, plan, parent_paper, ctx)
+        if candidate:
+            return tried + [candidate]
+
+    names = []
+    for name, source in ((plan.get("paper_dataset"), plan.get("dataset_source")),
+                         (parent_paper.get("dataset"), parent_paper.get("dataset_source"))):
+        name = (name or "").strip()
+        if name and name.lower() not in [n.lower() for n, _s in names]:
+            names.append((name, (source or "").strip()))
+    for name, source in names:
+        tried.append(_resolve_dataset(name, source, parent_paper.get("title", ""), scope_description,
+                                      query_builder=_build_query, parent_paper=parent_paper, top_k=3, ctx=ctx))
+        if _usable(tried[-1], MIN_ENTRIES_TO_CONSIDER):
+            break
+    return tried
+
+
+def run(parent_paper: dict, ranked_pool: list, target_entries: int | None = None,
+        search_query: str = "", target_terms: list = None, mode: str = "parent_only",
+        existing_datasets: list = None) -> dict:
     """
-    Build a dataset pool of >= target_entries total entries for the Parent
-    Paper's replication, escalating through the three stages described in
-    this module's docstring.
+    Build the dataset pool for the Parent Paper's replication.
 
-    target_entries defaults to the project's standard TARGET_ENTRIES, but
-    is overridable so Master Agent can re-run this stage with a higher
-    target -- e.g. relaying a downstream agent's Slack request for more
-    data (see master_agent.check_agent_requests) -- without duplicating
-    this whole function.
+    mode="parent_only" (the first run): read the Parent Paper itself
+    (plan_data_needs) and collect only the Parent Paper's own dataset.
+    Other papers' datasets and general dataset directories are searched
+    only as a logged substitute when the paper's own dataset cannot be
+    obtained at all. The plan's target_entries is recorded as advice; the
+    Evaluation Agent decides later whether more data is needed.
 
-    search_query is the short query used for stage 3's general search
-    (normally the user's project topic) -- see _search_exploration_sites.
+    mode="expand" (only when Master Agent relays an Evaluation Agent
+    request): keep existing_datasets and add datasets from sources away
+    from the Parent Paper -- the ranked candidate papers' datasets, then
+    curated dataset directories -- until target_entries (the goal set by
+    the request) is met or MAX_DATASETS is reached.
 
-    target_terms (the Intake Agent's prediction-target keywords, e.g.
-    ["fraud"]) drive the target-fit check every accepted dataset must pass
-    -- including cache hits -- and the stratified row budget.
+    search_query is the short query for the directory search (normally the
+    user's project topic). target_terms (the Intake Agent's
+    prediction-target keywords) drive the target-fit check every accepted
+    dataset must pass, cache hits included.
     """
-    print(f"\n[Data Agent] Building dataset pool (target: {target_entries} entries)...")
+    if mode not in ("parent_only", "expand"):
+        raise ValueError(f"Unknown Data Agent mode: {mode}")
+    if mode == "expand" and target_entries is None:
+        raise ValueError("mode='expand' needs a target_entries goal.")
+
+    paper = paper_fulltext.get_parent_paper_text(parent_paper) if parent_paper else {}
+    if mode == "parent_only":
+        plan = plan_data_needs(parent_paper, target_terms, paper)
+    else:
+        plan = {"target_entries": target_entries, "paper_dataset_size": None, "paper_model": "",
+                "paper_dataset": "", "dataset_source": "", "dataset_urls": [],
+                "reasoning": f"Goal of {target_entries} entries set by an Evaluation Agent request, "
+                             "relayed by Master Agent.",
+                "capped": False, "source": "request", "paper_text_status": paper.get("status", "")}
+    goal = target_entries if mode == "expand" else None
+    goal_label = goal if goal is not None else "the Parent Paper's own dataset"
+    print(f"\n[Data Agent] Building dataset pool (mode: {mode}, goal: {goal_label})...")
+    if paper.get("notes"):
+        print(f"[Data Agent] {paper['notes']}")
+    if plan["reasoning"]:
+        print(f"[Data Agent] Data plan: {plan['reasoning']}")
 
     scope_description = _scope_description(parent_paper)
-    stated_dataset = (parent_paper.get("dataset", "") if parent_paper else "") or ""
     selected_datasets = []
     seen_links = set()
     total_entries = 0
     datasets_considered = 0
     warnings = []
     search_stage = "parent_paper"
+    parent_dataset_found = False
     ctx = {"target_terms": target_terms or [], "rejected_links": set()}
 
     def try_add(candidate: dict | None) -> bool:
@@ -944,69 +1134,79 @@ def run(parent_paper: dict, ranked_pool: list, target_entries: int = TARGET_ENTR
               f"running total {total_entries}.")
         return True
 
-    # --- Stage 1: Parent Paper's own dataset ---
-    parent_candidate = None
-    if parent_paper:
-        parent_candidate = _find_and_verify_dataset_for_paper(parent_paper, scope_description, parent_paper, ctx)
-        datasets_considered += 1
-
-    if parent_candidate is None:
-        warnings.append("Parent Paper does not state a dataset.")
-    elif not try_add(parent_candidate):
-        warnings.append(
-            f"Parent Paper's stated dataset ('{stated_dataset}') could not be verified, "
-            f"was not in scope, or has fewer than {MIN_ENTRIES_TO_CONSIDER} entries."
-        )
-
-    # --- Stage 2: full ranked candidate pool, no cap on how many papers are
-    # checked for candidacy -- keeps going even after the entry-count target
-    # is already met, stopping only once MAX_DATASETS unique datasets have
-    # been collected (or the pool is exhausted), so more than one dataset
-    # gets combined whenever more than one genuinely qualifies. ---
-    for paper in ranked_pool[1:]:
+    def keep_searching() -> bool:
         if len(selected_datasets) >= MAX_DATASETS:
-            break
+            return False
+        return total_entries < goal if goal is not None else not selected_datasets
+
+    if mode == "parent_only":
+        # --- Stage 1: the Parent Paper's own dataset, read from the paper ---
         datasets_considered += 1
-        try_add(_find_and_verify_dataset_for_paper(paper, scope_description, parent_paper, ctx))
+        for candidate in _find_parent_dataset(parent_paper, plan, scope_description, ctx) if parent_paper else []:
+            if try_add(candidate):
+                parent_dataset_found = True
+                break
+        if not parent_dataset_found:
+            stated = plan.get("paper_dataset") or (parent_paper or {}).get("dataset") or ""
+            warnings.append(
+                f"The Parent Paper's own dataset ('{stated or 'not stated'}') could not be found, downloaded, "
+                "or did not fit the target; searching other sources for a SUBSTITUTE (logged, not the paper's "
+                "own data)."
+            )
+    else:
+        for candidate in existing_datasets or []:
+            if try_add(candidate):
+                parent_dataset_found = parent_dataset_found or bool(candidate.get("matches_parent_paper"))
+        search_stage = "expansion"
+        print(f"[Data Agent] Kept {len(selected_datasets)} existing dataset(s) ({total_entries} entries); "
+              f"collecting more from sources away from the Parent Paper to reach {goal}...")
 
-    if selected_datasets:
-        search_stage = "paper_traversal"
+    # --- Stage 2: other ranked candidate papers' datasets (expansion, or a
+    # substitute when the Parent Paper's own dataset was not obtained) ---
+    if keep_searching():
+        search_stage = "expansion" if mode == "expand" else "substitute_paper_traversal"
+        for other in (ranked_pool or [])[1:]:
+            if not keep_searching():
+                break
+            datasets_considered += 1
+            try_add(_find_and_verify_dataset_for_paper(other, scope_description, parent_paper, ctx))
 
-    # --- Stage 3: fall through to a general web search in this SAME run
-    # whenever papers' own named datasets left the entry-count target
-    # unmet -- whether nothing usable was found at all, or something was
-    # found but total_entries is still short -- instead of retrying the
-    # specific (already-failed) dataset names again. This must never
-    # require a separate external re-run to reach: a partial paper-based
-    # result used to silently stop here even when far under target. ---
-    if total_entries < target_entries and len(selected_datasets) < MAX_DATASETS:
-        search_stage = "paper_traversal+exploration_sites" if selected_datasets else "exploration_sites"
-        print(f"[Data Agent] Candidate papers' own datasets left the entry target unmet "
-              f"({total_entries}/{target_entries}); searching generally for datasets "
-              "relevant to the project scope to fill the gap...")
+    # --- Stage 3: curated dataset directories for anything in scope ---
+    if keep_searching():
+        search_stage = (search_stage + "+exploration_sites") if search_stage != "parent_paper" else "exploration_sites"
+        print(f"[Data Agent] Searching dataset directories for datasets relevant to the project "
+              f"({total_entries} entries so far, goal {goal_label})...")
         for candidate in _search_exploration_sites(scope_description, parent_paper, search_query, ctx):
-            if len(selected_datasets) >= MAX_DATASETS:
+            if not keep_searching():
                 break
             try_add(candidate)
 
-    target_met = total_entries >= target_entries
+    target_met = None if goal is None else total_entries >= goal
     if not selected_datasets:
         status = "NOT_FOUND"
-    elif target_met:
-        status = "OK"
-    else:
+    elif mode == "parent_only" and not parent_dataset_found:
+        status = "DEGRADED"
+    elif target_met is False:
         status = "DEGRADED"
         warnings.append(
             f"Stopped after {len(selected_datasets)} unique dataset(s) with {total_entries} total "
-            f"entries -- below the {target_entries}-entry target, even after all escalation stages."
+            f"entries -- below the requested goal of {goal}, even after all sources were searched."
         )
+    else:
+        status = "OK"
 
-    print(f"[Data Agent] Done. Status={status}, total_entries={total_entries}, "
+    print(f"[Data Agent] Done. Status={status}, total_entries={total_entries}, goal={goal_label}, "
           f"datasets_used={len(selected_datasets)}, stage={search_stage}.")
 
     return {
         "status": status,
-        "target_entries": target_entries,
+        "mode": mode,
+        "target_entries": goal,
+        "data_plan": plan,
+        "parent_dataset_found": parent_dataset_found,
+        "paper_text_status": paper.get("status", ""),
+        "paper_text_notes": paper.get("notes", ""),
+        "parent_paper_pdf_path": paper.get("pdf_path", ""),
         "total_entries": total_entries,
         "target_met": target_met,
         "datasets_considered": datasets_considered,

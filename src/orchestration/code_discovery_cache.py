@@ -4,7 +4,7 @@ Code-repository caching for the Code Discovery Agent.
 One cache, a plain JSON file under logs/ (gitignored, like
 dataset_search_cache.json): a lookup from normalized parent-paper title to
 the repository that was found for it, so a retry of this stage (Master
-Agent's own retry-once, or a future re-run request) doesn't re-search.
+Agent's own diagnose-and-retry, or a future re-run request) doesn't re-search.
 
 Keyed by paper title rather than by URL (dataset_cache.py's key) because
 the lookup direction here is "given this paper, what repo did we already

@@ -6,11 +6,21 @@ entirely on Code Discovery Agent's result:
 
   1. FOUND -- clone the discovered repository, set up an isolated
      environment, and run it against the Cleaning Agent's dataset.
-  2. NOT_FOUND -- reconstruct a baseline implementation from the paper's
-     own stored text (title/abstract/methodology/results_summary), since
-     CLAUDE.md's Preferred Implementation Order allows this as the last
-     resort. Every inferred detail is documented; the result is never
-     presented as the authors' own code.
+  2. NOT_FOUND -- reconstruct a baseline implementation from the paper
+     itself, since CLAUDE.md's Preferred Implementation Order allows this
+     as the last resort. The agent reads the Parent Paper directly: its
+     open-access full text when one exists (src/search/paper_fulltext.py;
+     the methodology, preprocessing, split and hyperparameter passages are
+     given to the generation call), else its stored abstract and metadata.
+     Every inferred detail is documented; the result is never presented as
+     the authors' own code.
+
+A reconstructed baseline can be REVISED when Master Agent relays an
+Evaluation Agent finding (e.g. SMOTE applied before the split, so the test
+set leaked into training): the previous script and its output are archived
+under replication/<slug>/revisions/round_<n>/, and one LLM call fixes only
+the stated defects. A cloned repository is never revised -- the authors'
+code is the baseline; a defect in it is left for the Experiment Agent.
 
 This agent clones and executes code from the internet (or LLM-generated
 code), which is a different risk category than every other agent in this
@@ -47,6 +57,7 @@ import pandas as pd
 
 from src import llm
 from src.agents.evaluation_agent import METRIC_LINE_FORMAT, parse_metric_lines
+from src.search import paper_fulltext
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 REPLICATION_DIR = REPO_ROOT / "replication"
@@ -63,6 +74,7 @@ GENERATION_TIMEOUT_SECONDS = 600
 PROFILE_SAMPLE_ROWS = 2000
 PROFILE_MAX_COLUMNS = 60
 STDERR_FEEDBACK_CHARS = 3000
+PAPER_EXCERPT_CHARS = 12000
 
 ENTRY_POINT_CANDIDATES = ("train.py", "main.py", "run.py", "run_experiment.py")
 README_FILENAMES = ("README.md", "README.rst", "README.txt", "readme.md")
@@ -107,6 +119,9 @@ _RESULT_DEFAULTS = {
     "inferred_assumptions": [],
     "generated_by": [],            # model(s) that wrote/repaired a reconstructed script, in order
     "modifications": [],
+    "paper_text_status": "",       # "FULL_TEXT" | "ABSTRACT_ONLY" -- what the agent could read
+    "revision_round": 0,           # 0 = first baseline; n = revised on an Evaluation Agent request
+    "revision_instructions": [],
     "warnings": [],
     "notes": "",
 }
@@ -479,17 +494,96 @@ def _script_requirements() -> str:
     )
 
 
-def _generate_baseline_script(parent_paper: dict, cleaning_result: dict, dataset_profile: str = "") -> dict:
-    """One LLM call asking for a self-contained baseline script
-    reconstructed purely from the paper's own stored text, since no
-    implementation could be located. Returns {} on any failure."""
-    prompt = f"""You are reconstructing a baseline machine learning implementation purely from an academic paper's own text, because no public code implementation could be found.
+def _paper_section(paper: dict) -> str:
+    """The paper text for a prompt: methodology-focused excerpts of the
+    full text, or the stored metadata, labelled as which it is."""
+    paper = paper or {}
+    if paper.get("status") == "FULL_TEXT":
+        label = "Excerpts from the paper's own full text (methodology, preprocessing, split, training, results)"
+    else:
+        label = "The paper's stored abstract and metadata (the full text was not available)"
+    body = paper_fulltext.excerpt(paper.get("text", ""), paper_fulltext.METHOD_KEYWORDS,
+                                  max_chars=PAPER_EXCERPT_CHARS)
+    return f"{label}:\n\"\"\"\n{body or '(none)'}\n\"\"\""
+
+
+def _parse_generation(content: str) -> dict:
+    code = llm.parse_code(content)
+    if not code:
+        return {}
+    meta = llm.parse_json(content, default={})
+    meta = meta if isinstance(meta, dict) else {}
+    assumptions = meta.get("inferred_assumptions") or []
+    libraries = meta.get("libraries_required") or []
+    return {
+        "code": code,
+        "inferred_assumptions": [str(a) for a in assumptions] if isinstance(assumptions, list) else [],
+        "libraries_required": [str(l) for l in libraries] if isinstance(libraries, list) else [],
+        # A router (FreeLLMAPI) may serve each call from a different model;
+        # the replication records which one wrote its code.
+        "generated_by": llm.last_served_by(),
+    }
+
+
+def _revise_baseline_script(code: str, instructions: list, parent_paper: dict, paper: dict,
+                            dataset_profile: str) -> dict:
+    """One LLM call fixing the defects an Evaluation Agent review found in
+    the reconstructed baseline (relayed by Master Agent), changing nothing
+    else. Returns {} on any failure."""
+    fixes = "\n".join(f"- {i}" for i in instructions) or "- (none given)"
+    prompt = f"""You are revising a reconstructed baseline machine learning script. A senior data analyst reviewed it
+and found defects that make its results invalid or weaker than the paper's method. Fix ONLY these defects; keep the
+paper's method, the model, and every other part of the script the same.
 
 Paper title: "{parent_paper.get('title', '')}"
-Abstract: "{parent_paper.get('official_abstract') or parent_paper.get('abstract', '') or ''}"
-Methodology: "{parent_paper.get('methodology', '') or ''}"
-Results summary: "{parent_paper.get('results_summary', '') or ''}"
+
+{_paper_section(paper)}
+
+The data the script runs on:
+{dataset_profile}
+
+Defects to fix:
+{fixes}
+
+Current script:
+```python
+{code}
+```
+
+Rules for the fix: resampling (e.g. SMOTE), scaling, imputation, encoding and feature selection are fitted on the
+TRAINING data only and then applied to the test data; the test set is never used to train, tune, select features
+or stop training early.
+
+{_script_requirements()}
+
+Respond with exactly two fenced blocks and nothing else. First, a JSON block:
+```json
+{{"inferred_assumptions": ["<one sentence per detail you inferred while fixing>"], "libraries_required": ["<pip package name>"]}}
+```
+Then the full revised script:
+```python
+<the script>
+```"""
+    try:
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent")
+    except Exception as e:
+        print(f"[Replication Agent] Revision call failed: {e}")
+        return {}
+    return _parse_generation(content)
+
+
+def _generate_baseline_script(parent_paper: dict, cleaning_result: dict, dataset_profile: str = "",
+                              paper: dict = None) -> dict:
+    """One LLM call asking for a self-contained baseline script
+    reconstructed from the paper itself (its full text when available),
+    since no implementation could be located. Returns {} on any failure."""
+    paper = paper or {"status": "ABSTRACT_ONLY", "text": paper_fulltext._metadata_text(parent_paper or {})}
+    prompt = f"""You are reconstructing a baseline machine learning implementation from an academic paper, because no public code implementation could be found. Read the paper text below carefully: follow its stated preprocessing order, data split, resampling, model, hyperparameters and evaluation exactly where it states them.
+
+Paper title: "{parent_paper.get('title', '')}"
 Dataset the paper describes: "{parent_paper.get('dataset', '') or ''}"
+
+{_paper_section(paper)}
 
 The data this reconstruction runs on:
 {dataset_profile or _dataset_profile(cleaning_result)}
@@ -512,22 +606,7 @@ Then the full script:
     except Exception as e:
         print(f"[Replication Agent] Script generation call failed: {e}")
         return {}
-
-    code = llm.parse_code(content)
-    if not code:
-        return {}
-    meta = llm.parse_json(content, default={})
-    meta = meta if isinstance(meta, dict) else {}
-    assumptions = meta.get("inferred_assumptions") or []
-    libraries = meta.get("libraries_required") or []
-    return {
-        "code": code,
-        "inferred_assumptions": [str(a) for a in assumptions] if isinstance(assumptions, list) else [],
-        "libraries_required": [str(l) for l in libraries] if isinstance(libraries, list) else [],
-        # A router (FreeLLMAPI) may serve each call from a different model;
-        # the replication records which one wrote its code.
-        "generated_by": llm.last_served_by(),
-    }
+    return _parse_generation(content)
 
 
 def _repair_generated_script(code: str, stderr: str, parent_paper: dict, stdout: str = "",
@@ -587,7 +666,27 @@ def _install_libraries(venv_dir: Path, cwd: Path, libraries: list) -> tuple:
     return installed, failed
 
 
-def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> dict:
+def _archive_previous_baseline(slug_dir: Path, recon_dir: Path, revision_round: int) -> Path | None:
+    """Keep the baseline being revised (script, notes, output) under
+    revisions/round_<n>/, so the revision never destroys it (CLAUDE.md:
+    Baseline Preservation). Returns the archived script, or None."""
+    archive = slug_dir / "revisions" / f"round_{revision_round}"
+    if (archive / "train.py").is_file():
+        # A retry of the same round: the archive already holds the baseline
+        # from before the round; never overwrite it with a failed attempt.
+        return archive / "train.py"
+    script = recon_dir / "train.py"
+    if not script.is_file():
+        return None
+    archive.mkdir(parents=True, exist_ok=True)
+    for source in (script, recon_dir / "RECONSTRUCTION_NOTES.md", slug_dir / "run_stdout.txt",
+                   slug_dir / "run_stderr.txt"):
+        if source.is_file():
+            shutil.copy2(source, archive / source.name)
+    return archive / "train.py"
+
+
+def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revision: dict = None) -> dict:
     paper_title = (parent_paper or {}).get("title", "")
     slug_dir = REPLICATION_DIR / _slugify(paper_title or "reconstructed")
     recon_dir = slug_dir / "reconstructed"
@@ -595,18 +694,46 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
     venv_dir = slug_dir / "venv"
     attempts_dir.mkdir(parents=True, exist_ok=True)
     warnings = []
+    revision = revision or {}
+    revision_round = int(revision.get("round") or 0)
+    instructions = [str(i) for i in revision.get("instructions") or []]
 
-    print(f"\n[Replication Agent] No implementation found; reconstructing a baseline from the paper "
-          f"for '{paper_title}'...")
-
+    paper = paper_fulltext.get_parent_paper_text(parent_paper or {})
     dataset_profile = _dataset_profile(cleaning_result)
-    generated = _generate_baseline_script(parent_paper, cleaning_result, dataset_profile)
+    previous_assumptions = []
+    archived = _archive_previous_baseline(slug_dir, recon_dir, revision_round) if revision_round else None
+
+    if archived and revision.get("reuse_script"):
+        # More data, same code: only the data changes (one variable at a time).
+        print(f"\n[Replication Agent] Re-running the same baseline script for '{paper_title}' on the new data "
+              f"(round {revision_round})...")
+        previous_assumptions = [str(a) for a in revision.get("previous_inferred_assumptions") or []]
+        generated = {"code": archived.read_text(encoding="utf-8", errors="ignore"), "inferred_assumptions": [],
+                     "libraries_required": [],
+                     "generated_by": ", ".join(map(str, revision.get("previous_generated_by") or []))}
+        failure = "The previous baseline script could not be read."
+    elif archived and instructions:
+        print(f"\n[Replication Agent] Revising the reconstructed baseline for '{paper_title}' "
+              f"(round {revision_round}): {'; '.join(instructions)}")
+        previous_assumptions = [str(a) for a in revision.get("previous_inferred_assumptions") or []]
+        generated = _revise_baseline_script(archived.read_text(encoding="utf-8", errors="ignore"), instructions,
+                                            parent_paper, paper, dataset_profile)
+        failure = "LLM could not revise the baseline script."
+    else:
+        print(f"\n[Replication Agent] No implementation found; reconstructing a baseline from the paper "
+              f"for '{paper_title}' ({paper.get('status', 'ABSTRACT_ONLY')})...")
+        if revision_round and not archived:
+            warnings.append("No previous reconstructed script to revise; generated a new one with the requested fixes.")
+        generated = _generate_baseline_script(parent_paper, cleaning_result, dataset_profile, paper)
+        failure = "LLM could not generate a baseline script from the paper."
     if not generated:
         return _default_result(
             status="BLOCKED", source="reconstructed", replication_dir=str(slug_dir),
-            warnings=["LLM could not generate a baseline script from the paper's stored text."],
+            paper_text_status=paper.get("status", ""), revision_round=revision_round,
+            revision_instructions=instructions, warnings=[failure],
             notes="Reconstruction failed at generation.",
         )
+    generated["inferred_assumptions"] = previous_assumptions + generated.get("inferred_assumptions", [])
 
     requested_libs = set(generated.get("libraries_required") or [])
     rejected_libs = sorted(requested_libs - DEPENDENCY_ALLOWLIST)
@@ -702,21 +829,35 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict) -> d
         duration_seconds=run_result["duration_seconds"], pip_freeze_path=str(pip_freeze_path),
         inferred_assumptions=generated.get("inferred_assumptions", []), warnings=warnings,
         notes=f"Repair attempts: {attempts}.", generated_by=generated_by,
+        paper_text_status=paper.get("status", ""), revision_round=revision_round,
+        revision_instructions=instructions,
     )
 
 
-def run(parent_paper: dict, code_discovery_result: dict, cleaning_result: dict) -> dict:
+def run(parent_paper: dict, code_discovery_result: dict, cleaning_result: dict, revision: dict = None) -> dict:
     """
     Establish the baseline reproduction: run the discovered repository if
-    Code Discovery Agent found one, else reconstruct from the paper's own
-    text. Every branch returns the same fully-populated result shape.
+    Code Discovery Agent found one, else reconstruct from the paper itself.
+    Every branch returns the same fully-populated result shape.
+
+    revision ({"round", "instructions", "reuse_script",
+    "previous_inferred_assumptions", "previous_generated_by"}) is given only
+    by Master Agent, relaying an Evaluation Agent request: with
+    instructions, a reconstructed baseline is revised to fix exactly those
+    defects; with reuse_script (after the Data Agent collected more data),
+    the same script runs again on the new data. A cloned repository is
+    never revised (it is the authors' code); it is simply run again.
     """
     code_discovery_result = code_discovery_result or {}
     cleaning_result = cleaning_result or {}
     if code_discovery_result.get("status") == "FOUND" and code_discovery_result.get("repository"):
         result = _replicate_from_repository(parent_paper, code_discovery_result["repository"], cleaning_result)
+        if revision and revision.get("instructions"):
+            result["warnings"] = list(result.get("warnings") or []) + [
+                "Revision not applied: the cloned repository is the authors' own code and is preserved as the "
+                "baseline. Requested fixes: " + "; ".join(map(str, revision["instructions"]))]
     else:
-        result = _replicate_by_reconstruction(parent_paper, cleaning_result)
+        result = _replicate_by_reconstruction(parent_paper, cleaning_result, revision)
     result["dataset_sampled"] = bool(cleaning_result.get("sampled"))
     result["dataset_semantic_mappings"] = sum(
         1 for m in cleaning_result.get("column_mappings", []) for c in m.get("columns", []) if c.get("accepted")

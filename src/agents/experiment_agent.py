@@ -39,6 +39,11 @@ in previous_experiments for this paper):
      variables being held fixed, same as the code for the dataset-split
      category.
 
+When the Evaluation Agent's review recommends an experiment (its decision
+is "run_experiment" with a supported category), that category is used
+instead of the exhaustion order -- if it has not been tried and the source
+is reconstructed -- and its instructions guide the proposed change.
+
 A cloned repository that has already tried "different_dataset_split" has
 no further category this version knows how to attempt safely without
 understanding that specific repo's own code/CLI -- reported as SKIPPED,
@@ -112,10 +117,14 @@ def _default_result(**overrides) -> dict:
     return result
 
 
-def _next_category(source: str, previous_experiments: list) -> str:
-    """Deterministic, exhaustion-ordered category choice -- never
-    repeats a category already recorded for this paper, never random."""
+def _next_category(source: str, previous_experiments: list, recommended: str = "") -> str:
+    """Deterministic category choice -- the Evaluation Agent's recommended
+    category when it is usable, else exhaustion order. Never repeats a
+    category already recorded for this paper, never random."""
     tried = {e.get("category", "") for e in (previous_experiments or [])}
+    if recommended and recommended not in tried and source == "reconstructed" \
+            and recommended in CODE_LEVEL_CATEGORIES:
+        return recommended
     if source == "reconstructed":
         for category in CODE_LEVEL_CATEGORIES:
             if category not in tried:
@@ -252,7 +261,8 @@ def _run_dataset_split_experiment(source: str, baseline_dir: Path, replication_r
     }
 
 
-def _propose_code_change(category: str, parent_paper: dict, baseline_code: str, inferred_assumptions: list) -> dict:
+def _propose_code_change(category: str, parent_paper: dict, baseline_code: str, inferred_assumptions: list,
+                         guidance: list = None) -> dict:
     """One LLM call proposing a single, scoped code modification
     implementing exactly one experiment category -- same
     JSON-call-with-regex-fallback-parsing pattern as every other
@@ -267,6 +277,9 @@ Baseline script (already a working reproduction):
 
 Previously inferred assumptions in the baseline (context only -- do not change these unless the category above specifically calls for it):
 {chr(10).join(inferred_assumptions) or "(none)"}
+
+The senior data analyst's recommendation for this experiment (follow it within the category):
+{chr(10).join(f"- {g}" for g in guidance or []) or "(none)"}
 
 Modify ONLY what the "{category}" category calls for (e.g. "alternative_model" -> swap the model class; "hyperparameter_change" -> change one hyperparameter; "different_preprocessing" -> change one preprocessing step; "different_feature_selection" -> change which features are used; "alternative_loss_function" -> change the loss/objective; "alternative_sampling_technique" -> change how class imbalance/sampling is handled; "additional_evaluation_metric" -> add one new metric to the printed output without changing the model). Keep everything else identical to the baseline script, including how it reads its input paths (the TRAIN_CSV/TEST_CSV/VALIDATION_CSV environment variables) and its "{METRIC_LINE_FORMAT}" metric lines. Use only libraries the baseline script already imports, plus the Python standard library -- nothing new is installed for an experiment.
 
@@ -299,13 +312,15 @@ Then the full modified script:
 
 
 def _run_code_level_experiment(category: str, parent_paper: dict, baseline_dir: Path,
-                                replication_result: dict, experiment_dir: Path, cleaning_result: dict = None) -> dict:
+                                replication_result: dict, experiment_dir: Path, cleaning_result: dict = None,
+                                guidance: list = None) -> dict:
     baseline_script_path = baseline_dir / "reconstructed" / "train.py"
     baseline_code = baseline_script_path.read_text(errors="ignore") if baseline_script_path.is_file() else ""
     if not baseline_code:
         return {"error": "Baseline reconstructed script could not be read; cannot propose a code-level experiment."}
 
-    proposal = _propose_code_change(category, parent_paper, baseline_code, replication_result.get("inferred_assumptions", []))
+    proposal = _propose_code_change(category, parent_paper, baseline_code, replication_result.get("inferred_assumptions", []),
+                                    guidance)
     if not proposal:
         return {"error": "LLM could not propose a code-level modification for this category."}
 
@@ -358,7 +373,10 @@ def run(parent_paper: dict, replication_result: dict, evaluation_result: dict, c
     paper_title = parent_paper.get("title", "")
     source = replication_result.get("source", "")
 
-    category = _next_category(source, previous_experiments)
+    decision = (evaluation_result or {}).get("decision") or {}
+    recommended = decision.get("experiment_category", "") if decision.get("action") == "run_experiment" else ""
+    guidance = decision.get("instructions") or [] if decision.get("action") == "run_experiment" else []
+    category = _next_category(source, previous_experiments, recommended)
     if not category:
         print(f"\n[Experiment Agent] No remaining experiment category available for '{paper_title}' "
               f"(source={source}); every category this version knows how to attempt has already been tried.")
@@ -381,7 +399,7 @@ def run(parent_paper: dict, replication_result: dict, evaluation_result: dict, c
         outcome = _run_dataset_split_experiment(source, baseline_dir, replication_result, cleaning_result, experiment_dir)
     else:
         outcome = _run_code_level_experiment(category, parent_paper, baseline_dir, replication_result, experiment_dir,
-                                             cleaning_result)
+                                             cleaning_result, guidance if category == recommended else None)
 
     if "error" in outcome:
         return _default_result(

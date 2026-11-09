@@ -189,6 +189,8 @@ def make_data_result(**overrides) -> dict:
     result = {
         "status": "OK" if total >= 10000 else ("DEGRADED" if selected else "NOT_FOUND"),
         "target_entries": 10000,
+        "data_plan": {"target_entries": 10000, "paper_dataset_size": None, "paper_model": "",
+                      "paper_dataset": "", "reasoning": "test plan", "capped": False, "source": "llm"},
         "total_entries": total,
         "target_met": total >= 10000,
         "datasets_considered": len(selected),
@@ -373,7 +375,7 @@ class TestIntakeAndResearchChecks(MasterAgentTestCase):
 
 
 class TestSupervise(MasterAgentTestCase):
-    def test_retries_once_then_succeeds(self):
+    def test_retries_then_succeeds(self):
         calls = []
 
         def run_fn():
@@ -447,6 +449,57 @@ class TestSupervise(MasterAgentTestCase):
         self.assertEqual(len(report_files), 2)
         self.assertIn("report for bad", report_files[0].read_text())
         self.assertIn("report for good", report_files[1].read_text())
+
+    def test_a_stage_halts_after_five_errors(self):
+        self.assertEqual(master_agent.MAX_ATTEMPTS, 5)
+
+    def test_each_retry_gets_the_failure_and_the_diagnosis(self):
+        from src import llm
+        seen = []
+
+        def run_fn():
+            seen.append(llm._with_supervisor_notes("SYSTEM"))
+            return "good" if len(seen) == 3 else "bad"
+
+        def checker_fn(output):
+            return [] if output == "good" else [
+                master_agent._log_entry("Correction", "Research Agent", "only 3 qualifying papers", "Rejected", "x")
+            ]
+
+        diagnosis = '{"cause": "The search queries were too narrow.", "guidance": ["Use broader queries."]}'
+        with patch("src.llm.chat", return_value=diagnosis) as chat:
+            output, blockers = master_agent._supervise("Research Agent", run_fn, checker_fn, lambda o: f"report {o}")
+
+        self.assertEqual((output, blockers), ("good", []))
+        self.assertEqual(chat.call_count, 2)  # one diagnosis per failed attempt
+        self.assertEqual(seen[0], "SYSTEM")
+        self.assertIn("only 3 qualifying papers", seen[1])
+        self.assertIn("Use broader queries.", seen[1])
+        self.assertEqual(seen[2].count("Diagnosis:"), 2)  # notes accumulate
+        self.assertIn("too narrow", chat.call_args_list[1].args[0])  # earlier diagnoses go to the next one
+        self.assertEqual(llm._supervisor_notes, [])  # notes end with the stage
+
+        retrying = [e for e in self._log_entries() if e["decision"] == "Retrying"]
+        self.assertTrue(any("too narrow" in e["issue"] and "Use broader queries." in e["next"] for e in retrying))
+        report = (master_agent.REPORT_DIR / "research_agent_attempt1.txt").read_text()
+        self.assertIn("Master Agent diagnosis", report)
+
+    def test_a_failed_diagnosis_still_retries_with_the_raw_failure(self):
+        from src import llm
+        seen = []
+
+        def run_fn():
+            seen.append(list(llm._supervisor_notes))
+            if len(seen) == 1:
+                raise ValueError("bad column 'Class'")
+            return "good"
+
+        with patch("src.llm.chat", side_effect=RuntimeError("router down")):
+            output, blockers = master_agent._supervise("Cleaning Agent", run_fn, lambda o: [], lambda o: "r")
+
+        self.assertEqual((output, blockers), ("good", []))
+        self.assertIn("bad column 'Class'", seen[1][0])
+        self.assertIn("could not diagnose", seen[1][0])
 
 
 def make_validation_result(ranked_pool: list) -> dict:
@@ -565,7 +618,8 @@ class TestCleaningAgentPipelineWiring(MasterAgentTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["phase"], "EXPERIMENTATION")
         self.assertEqual(result["cleaning_result"], cleaning_result)
-        cleaning_run.assert_called_once_with(data_result["selected_datasets"], target_terms=[])
+        cleaning_run.assert_called_once_with(data_result["selected_datasets"], target_terms=[],
+                                             target_rows=data_result["target_entries"])
 
     def test_halts_when_nothing_could_be_merged(self):
         data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
@@ -807,7 +861,7 @@ class TestEvaluationAgentPipelineWiring(MasterAgentTestCase):
              patch("src.orchestration.dataset_cache.cache_validated_papers"):
             master_agent.run_pipeline("credit card fraud detection")
 
-        evaluation_run.assert_called_once_with(ranked_pool[0], replication_result)
+        evaluation_run.assert_called_once_with(ranked_pool[0], replication_result, ANY, ANY)
 
 
 class TestExperimentChecks(MasterAgentTestCase):
@@ -1068,7 +1122,7 @@ class TestCheckAgentRequests(MasterAgentTestCase):
             result = master_agent.check_agent_requests(parent_paper, ranked_pool)
 
         data_run.assert_called_once_with(parent_paper, ranked_pool, target_entries=25000, search_query=ANY,
-                                         target_terms=ANY)
+                                         target_terms=ANY, mode="expand", existing_datasets=ANY)
         self.assertEqual(result["dataset_result"], new_data_result)
         self.assertEqual(result["cleaning_result"], new_cleaning_result)
         self.assertEqual(result["blockers"], [])
@@ -1078,15 +1132,18 @@ class TestCheckAgentRequests(MasterAgentTestCase):
         ranked_pool = [parent_paper]
         messages = [make_dataset_agent_request(detail="")]
 
+        # The previous pool: the agent's own target was 12000 and it collected 15000.
+        state = {"dataset": {"target_entries": 12000, "total_entries": 15000}}
         with patch.object(master_agent.slack_client, "fetch_new_messages", return_value=messages), \
+             patch("src.orchestration.state_manager.load_state", return_value=state), \
              patch("src.agents.data_agent.run", return_value=make_data_result()) as data_run, \
              patch("src.agents.cleaning_agent.run", return_value=make_cleaning_result()):
             master_agent.check_agent_requests(parent_paper, ranked_pool)
 
-        from src.agents import data_agent
-        expected_target = data_agent.TARGET_ENTRIES + master_agent.DATA_REQUEST_TARGET_INCREMENT
+        expected_target = 15000 + master_agent.DATA_REQUEST_TARGET_INCREMENT
         data_run.assert_called_once_with(
             parent_paper, ranked_pool, target_entries=expected_target, search_query=ANY, target_terms=ANY,
+            mode="expand", existing_datasets=ANY,
         )
 
     def test_blocked_when_no_parent_paper_available(self):
