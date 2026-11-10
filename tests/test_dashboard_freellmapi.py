@@ -152,6 +152,9 @@ class StubRouter:
         self.stopped = True
         return True
 
+    def stop_now(self):
+        self.stopped = True
+
 
 @pytest.fixture
 def make_client(tmp_path, monkeypatch):
@@ -190,3 +193,35 @@ def test_router_cannot_be_stopped_during_a_run(make_client):
     client.post("/api/run", json={"topic": "a"})
     assert client.post("/api/freellmapi/stop").status_code == 409
     assert router.stopped is False
+
+
+def test_dashboard_exit_stops_the_router(monkeypatch):
+    from src.dashboard import __main__ as dashboard_main
+    monkeypatch.setattr(dashboard_main, "run_in_progress", lambda runner: False)
+    router = StubRouter(enabled=True, healthy=True)
+    dashboard_main.stop_router_on_exit(router, runner=None)
+    assert router.stopped is True
+
+
+def test_dashboard_exit_keeps_the_router_during_a_run(monkeypatch):
+    from src.dashboard import __main__ as dashboard_main
+    monkeypatch.setattr(dashboard_main, "run_in_progress", lambda runner: True)
+    router = StubRouter(enabled=True, healthy=True)
+    dashboard_main.stop_router_on_exit(router, runner=None)
+    assert router.stopped is False
+
+
+def test_dashboard_exit_ignores_the_router_for_other_providers(monkeypatch):
+    from src.dashboard import __main__ as dashboard_main
+    monkeypatch.setattr(dashboard_main, "run_in_progress", lambda runner: False)
+    router = StubRouter(enabled=False)
+    dashboard_main.stop_router_on_exit(router, runner=None)
+    assert router.stopped is False
+
+
+def test_stop_now_runs_compose_down(compose_dir, monkeypatch):
+    manager, fake = FreeLLMAPIManager(), FakeDocker()
+    fake.install(manager, monkeypatch)
+    manager.stop_now()
+    assert fake.calls[-1] == (["compose", "down"], str(compose_dir))
+    assert manager.state == "stopped"

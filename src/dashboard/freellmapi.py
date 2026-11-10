@@ -11,10 +11,10 @@ FreeLLMAPI folder. The dashboard does the same steps:
   3. Run `docker compose up -d` in FREELLMAPI_COMPOSE_DIR (.env).
   4. Wait until /api/ping answers.
 
-This is the same as typing the commands; the pipeline does not change. The
-dashboard never stops the router on exit: a pipeline run can outlive the
-dashboard and still needs it. "Stop" runs `docker compose down`, and only
-when the user asks.
+This is the same as typing the commands; the pipeline does not change.
+"Stop" runs `docker compose down`. When the dashboard closes, it also runs
+`docker compose down` (stop_now), unless a pipeline run is still active: a
+run can outlive the dashboard and still needs the router.
 """
 import os
 import shutil
@@ -126,6 +126,10 @@ class FreeLLMAPIManager:
 
     def stop_async(self) -> bool:
         return self._spawn(self._stop)
+
+    def stop_now(self) -> None:
+        """Run `docker compose down` in this thread (used when the dashboard closes)."""
+        self._guard(self._stop)()
 
     def _spawn(self, target) -> bool:
         with self._lock:

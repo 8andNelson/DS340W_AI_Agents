@@ -367,6 +367,11 @@ def _script_bytes(artifact_id: int) -> tuple[dict, bytes]:
         return record, handle.read()
 
 
+def run_in_progress(runner: PipelineRunner) -> bool:
+    """True while a pipeline run is active, started here or outside the dashboard."""
+    return _run_overview(runner)[2]
+
+
 def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager | None = None) -> Flask:
     app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
     app.config["RUNNER"] = runner or PipelineRunner()
