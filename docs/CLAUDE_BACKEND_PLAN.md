@@ -1273,17 +1273,36 @@ Done when:
 solutions, failures, decisions) with a quality score that can be
 explained.
 
-Deliverables:
-- [ ] `src/memory/features.py`: task features with fixed vocabularies,
+Deliverables (status 2026-11-13):
+- [x] `src/memory/features.py`: task features with fixed vocabularies,
       model family and techniques from the script (`ast`), failure
-      signature (5.2).
-- [ ] `src/memory/retain.py`: the record → memory rules (8.2), duplicates,
-      lineage rule (only `kept` gives a positive solution).
-- [ ] Memory states (8.4) and the `approve` / `quarantine` CLI.
-- [ ] `src/memory/ranking.py`: base quality with the validity and gap
-      rules (9.1).
-- [ ] `retain_run` in Master Agent's `finally` block, after `run_metrics.compute`.
-- [ ] Backfill of the 10 runs, with trust labels and a report (10).
+      signature (5.2). The signature comes only from a real error or a
+      failed check, never from the LLM's diagnosis text.
+- [x] `src/memory/retain.py`: the record → memory rules (8.2), duplicates
+      (same agent and content hash in another run: `seen_count` + 1, not a
+      new row), lineage rule (only `kept` gives a positive solution; a kept
+      baseline with verified leakage is a warning). Machine paths are
+      replaced by `<repo>` / `~`. Not covered, because no agent records
+      them: rejected datasets, rejected repositories, column mappings. A
+      diagnosis that itself failed makes no memory. Changed from 8.2: a
+      duplicate's new evidence is not added (the pipeline role may update
+      only counters and state).
+- [x] Memory states (8.4): `set_state` op, append-only `memory_state_changes`,
+      and the `approve` / `quarantine` CLI. (Automatic activation of
+      candidate lessons and contradiction links come with the curator, M6.)
+- [x] `src/memory/ranking.py`: base quality with the validity and gap
+      rules (9.1); warning usefulness for failures; every component's reason
+      stored in `quality_reasons`.
+- [x] `retain_run` at run end: in `run_store.finish_run`, after
+      `run_metrics.compute` (not in `master_agent.py`), once per run
+      (`memory_runs`).
+- [ ] Backfill of the recorded runs (12 now), with trust labels and a
+      report (10): **dry run done** (`backfill --dry-run`,
+      `reports/memory_backfill_dry_run.md`: 83 memories, every positive
+      one `kept`, 4 `low_trust` from two review-paper runs). The write to
+      the team store waits for the person's check below. Older runs'
+      lineage is derived from their stages; it is `unknown` where a rerun
+      may have replaced a result.
 
 Done when:
 - The backfill report lists the memories of each run with their score

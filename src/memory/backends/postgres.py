@@ -146,6 +146,10 @@ class PostgresStore:
                     conn.execute(sql.SQL("INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING").format(
                         table, sql.SQL(", ").join(map(sql.Identifier, encoded)),
                         sql.SQL(", ").join(sql.Placeholder() * len(encoded))), list(encoded.values()))
+            elif op["type"] == "set_state":
+                conn.execute(f"UPDATE {SCHEMA_NAME}.memories SET state = %s, "
+                             "superseded_by = COALESCE(%s, superseded_by), updated_at = now() WHERE id = %s",
+                             (op["state"], op.get("superseded_by"), op["key"]["id"]))
             else:
                 sets = sql.SQL(", ").join(sql.SQL("{0} = {0} + %s").format(sql.Identifier(c)) for c in op["counters"])
                 where = sql.SQL(" AND ").join(sql.SQL("{} = %s").format(sql.Identifier(k)) for k in op["key"])
@@ -156,11 +160,11 @@ class PostgresStore:
     # --- Reads ---
 
     def fetch_memories(self, agent: str = None, kind: str = None, states: tuple = ("active",),
-                       ids: list = None, limit: int = 50, conn=None) -> list[dict]:
+                       ids: list = None, limit: int = 50, conn=None, content_shas: list = None) -> list[dict]:
         if conn is None:
             with self.session() as conn:
-                return self.fetch_memories(agent, kind, states, ids, limit, conn)
-        if ids is not None and not ids:
+                return self.fetch_memories(agent, kind, states, ids, limit, conn, content_shas)
+        if (ids is not None and not ids) or (content_shas is not None and not content_shas):
             return []
         columns = ", ".join(schema.TABLES["memories"])
         where, params = [], []
@@ -176,6 +180,9 @@ class PostgresStore:
         if ids is not None:
             where.append("id = ANY(%s)")
             params.append(list(ids))
+        if content_shas is not None:
+            where.append("content_sha = ANY(%s)")
+            params.append(list(content_shas))
         query = f"SELECT {columns} FROM {SCHEMA_NAME}.memories" + (" WHERE " + " AND ".join(where) if where else "")
         rows = conn.execute(query + " ORDER BY created_at DESC LIMIT %s", [*params, limit]).fetchall()
         return [decode("memories", r) for r in rows]

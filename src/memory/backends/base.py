@@ -9,6 +9,10 @@ A backend applies write "ops" and answers reads. An op is a JSON-safe dict:
   {"op_id": <uuid>, "type": "increment", "table": "memories",
    "key": {"id": <id>}, "counters": {<counter column>: <n>, ...}}
       Add to counter columns (schema.COUNTER_COLUMNS) only.
+  {"op_id": <uuid>, "type": "set_state", "table": "memories", "key": {"id": <id>},
+   "state": <state>, "superseded_by": <id or None>}
+      Change a memory's state (plan 8.4); the change itself is recorded by a
+      separate insert into memory_state_changes.
 
 apply(op) applies an op exactly once: its op_id is recorded in
 applied_ops in the same transaction, so an op resent after a lost
@@ -48,6 +52,11 @@ def check_op(op: dict) -> None:
         key = op.get("key") or {}
         if set(key) != set(schema.PRIMARY_KEYS[table]) or not all(key.values()):
             raise ValueError(f"an increment op needs the key {schema.PRIMARY_KEYS[table]}")
+    elif op.get("type") == "set_state":
+        if op.get("table") != "memories" or set(op.get("key") or {}) != {"id"} or not op["key"]["id"]:
+            raise ValueError("a set_state op changes one memory, by id")
+        if op.get("state") not in schema.STATES:
+            raise ValueError(f"state must be one of {', '.join(schema.STATES)}")
     else:
         raise ValueError(f"unknown op type: {op.get('type')}")
 

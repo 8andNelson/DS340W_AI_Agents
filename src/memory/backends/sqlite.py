@@ -128,6 +128,9 @@ class SqliteStore:
                 columns = list(encoded)
                 conn.execute(f"INSERT OR IGNORE INTO {table} ({', '.join(columns)}) "
                              f"VALUES ({', '.join('?' * len(columns))})", [encoded[c] for c in columns])
+        elif op["type"] == "set_state":
+            conn.execute("UPDATE memories SET state = ?, superseded_by = COALESCE(?, superseded_by), updated_at = ? "
+                         "WHERE id = ?", (op["state"], op.get("superseded_by"), _now(), op["key"]["id"]))
         else:
             sets = ", ".join(f"{c} = {c} + ?" for c in op["counters"])
             where = " AND ".join(f"{k} = ?" for k in op["key"])
@@ -216,8 +219,13 @@ class SqliteStore:
     # --- Reads ---
 
     def fetch_memories(self, agent: str = None, kind: str = None, states: tuple = ("active",),
-                       ids: list = None, limit: int = 50, conn=None) -> list[dict]:
+                       ids: list = None, limit: int = 50, conn=None, content_shas: list = None) -> list[dict]:
         where, params = [], []
+        if content_shas is not None:
+            if not content_shas:
+                return []
+            where.append(f"content_sha IN ({', '.join('?' * len(content_shas))})")
+            params.extend(content_shas)
         if agent:
             where.append("agent = ?")
             params.append(agent)

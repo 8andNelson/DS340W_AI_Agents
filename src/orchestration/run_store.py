@@ -372,6 +372,12 @@ def finish_run(run_id: str | None, status: str, final_phase: str = "",
         run_metrics.compute(run_id)
     except Exception as e:
         _warn(f"compute the metrics of run {run_id}", e)
+    # Turn the run's records into memories (src/memory/retain.py); fail-soft.
+    try:
+        from src.memory import retain
+        retain.retain_run(run_id)
+    except Exception as e:
+        _warn(f"retain the memories of run {run_id}", e)
     run_context.clear(run_id)
     _sync_memory()
 

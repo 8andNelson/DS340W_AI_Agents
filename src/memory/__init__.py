@@ -333,6 +333,42 @@ def increment(memory_id: str, **counters) -> bool:
         return False
 
 
+def set_state(memory_id: str, state: str, reason: str, actor: str = None, superseded_by: str = None) -> bool:
+    """Change a memory's state (candidate, active, quarantined, superseded,
+    retired; plan 8.4) and record who changed it and why. The memory row is
+    never deleted; a quarantined memory is no longer recalled."""
+    try:
+        c = client()
+        if c.backend == "off":
+            return False
+        if state not in schema.STATES:
+            raise ValueError(f"state must be one of {', '.join(schema.STATES)}")
+        current = get_memory(memory_id)
+        if current is None:
+            raise ValueError(f"no memory {memory_id}")
+        if not reason:
+            raise ValueError("a state change needs a reason")
+        c.write({"op_id": str(uuid.uuid4()), "type": "set_state", "table": "memories", "key": {"id": memory_id},
+                 "state": state, "superseded_by": superseded_by})
+        change = _scrub({"id": str(uuid.uuid4()), "memory_id": memory_id, "old_state": current["state"],
+                         "new_state": state, "reason": reason, "actor": actor or MEMORY_CONTRIBUTOR or None,
+                         "created_at": _now()})
+        c.write({"op_id": str(uuid.uuid4()), "type": "insert", "table": "memory_state_changes", "rows": [change]})
+        return True
+    except Exception as e:
+        _warn(f"change the state of memory {memory_id}", e)
+        return False
+
+
+def find_memories(agent: str = None, kind: str = None, states: tuple = ("active",), limit: int = 1000) -> list[dict]:
+    """Memories of any state set (states=None: all), for review and reports."""
+    try:
+        return client().fetch(agent=agent, kind=kind, states=states, limit=limit)
+    except Exception as e:
+        _warn("read memories", e)
+        return []
+
+
 def sync() -> dict:
     """Send the outbox and the run metrics to the hosted store, and refresh
     the local copy. Does nothing unless MEMORY_BACKEND=postgres."""
