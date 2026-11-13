@@ -6,7 +6,7 @@ data/, replication/ and experiments/ are overwritten by the next run. This
 module keeps a copy of each run in one SQLite file (database/project_runs.db,
 gitignored), so any past run can be reviewed or restored later.
 
-Four tables:
+Evidence tables:
 
   runs       -- one row per `python run.py` invocation: topic, start/finish
                 time, final status and phase, LLM provider, the project's own
@@ -14,11 +14,21 @@ Four tables:
   stages     -- one row per agent attempt (pass or fail): the agent's full
                 structured output as JSON, the Master Agent's decision, and
                 the human-readable report text.
+  stage_timings -- one durable start/finish and monotonic duration per
+                invocation, independent of approval and completion order.
   artifacts  -- one row per file a stage produced (master CSV, splits, each
                 replication/experiment script, stdout/stderr, ENVIRONMENT.md,
                 and later the report and slides).
   blobs      -- file contents, zlib-compressed and keyed by SHA-256, so a file
                 that is identical across runs is stored only once.
+
+Two more tables hold each finished run's measurements, written by
+src/orchestration/run_metrics.py when the run finishes:
+
+  run_conditions -- one row per run: the conditions it ran under (topic,
+                    Parent Paper, data, code version, models, memory).
+  run_metrics    -- one row per metric value (result quality, reliability,
+                    cost and time, memory use), so runs can be compared.
 
 A file larger than MAX_BLOB_BYTES is recorded by path, size and hash only
 (content_stored = 0), so one huge raw download cannot inflate the database.
@@ -27,17 +37,24 @@ Every public function fails soft, like Slack posting: a database error is
 printed and swallowed, so it never changes pipeline behavior.
 """
 import json
+import platform
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import uuid
 import zlib
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 
+from src.orchestration import run_context
+
 REPO_ROOT = Path(__file__).parent.parent.parent
 DB_FILE = REPO_ROOT / "database" / "project_runs.db"
+_write_lock = threading.RLock()  # timers must not time out behind another agent's artifact transaction
 
 MAX_BLOB_BYTES = 200 * 1024 * 1024  # larger files are recorded by hash only
 
@@ -92,7 +109,70 @@ CREATE TABLE IF NOT EXISTS artifacts (
     recorded_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_stages_run ON stages(run_id);
+CREATE TABLE IF NOT EXISTS stage_timings (
+    invocation_id    TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL REFERENCES runs(run_id),
+    agent            TEXT NOT NULL,
+    attempt          INTEGER NOT NULL,
+    max_attempts     INTEGER NOT NULL,
+    started_at       TEXT NOT NULL,
+    finished_at      TEXT,
+    duration_seconds REAL CHECK (duration_seconds >= 0),
+    UNIQUE (run_id, agent, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_stage_timings_run ON stage_timings(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
+CREATE TABLE IF NOT EXISTS run_conditions (
+    run_id               TEXT NOT NULL REFERENCES runs(run_id),
+    metrics_version      INTEGER NOT NULL,
+    status               TEXT,     -- success | halted | crashed (a stale "running" run is crashed)
+    contributor          TEXT,
+    started_at           TEXT,
+    finished_at          TEXT,
+    topic                TEXT,
+    topic_key            TEXT,     -- normalized topic, groups runs on the same task
+    parent_paper_doi     TEXT,
+    parent_paper_title   TEXT,
+    dataset_identities   TEXT,     -- JSON list of resolved dataset links
+    rows_used            INTEGER,
+    sampled              INTEGER,
+    code_source          TEXT,     -- cloned_repo | reconstructed
+    model_family         TEXT,     -- JSON list
+    git_commit           TEXT,
+    git_dirty            INTEGER,
+    llm_provider         TEXT,
+    served_models        TEXT,     -- JSON {model: successful calls}
+    memory_mode          TEXT,
+    memory_backend       TEXT,
+    memory_reuse         INTEGER,
+    memory_tuning        INTEGER,
+    memory_curator       INTEGER,
+    memory_exposure      TEXT,     -- none | partial | full
+    memory_bank_size     TEXT,     -- JSON {agent: visible memories}
+    memory_bank_snapshot TEXT,
+    comparison_group     TEXT,
+    seeds                TEXT,     -- JSON
+    python_version       TEXT,
+    os                   TEXT,
+    log_matching         TEXT,     -- JSON {log: run_id | time_span}
+    timing_method        TEXT,
+    notes                TEXT,     -- JSON list of caveats about this run's measurements
+    computed_at          TEXT NOT NULL,
+    PRIMARY KEY (run_id, metrics_version)
+);
+CREATE TABLE IF NOT EXISTS run_metrics (
+    run_id           TEXT NOT NULL REFERENCES runs(run_id),
+    metrics_version  INTEGER NOT NULL,
+    scope            TEXT NOT NULL,  -- "run" or an agent name
+    metric           TEXT NOT NULL,
+    value_num        REAL,
+    value_text       TEXT,
+    unit             TEXT,
+    missing_reason   TEXT,           -- set when the value is null; a missing value is never 0
+    computed_at      TEXT NOT NULL,
+    PRIMARY KEY (run_id, metrics_version, scope, metric)
+);
+CREATE INDEX IF NOT EXISTS idx_run_metrics_metric ON run_metrics(metric, scope);
 """
 
 
@@ -122,6 +202,16 @@ def _project_git_commit() -> str:
         return ""
 
 
+def _project_git_dirty() -> bool | None:
+    """True when tracked files differ from the commit; None when unknown."""
+    try:
+        proc = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPO_ROOT,
+                              capture_output=True, text=True, timeout=10)
+        return bool(proc.stdout.strip()) if proc.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _to_json(value) -> str:
     return json.dumps(value, default=str)
 
@@ -130,7 +220,13 @@ def _to_json(value) -> str:
 
 def start_run(topic: str, llm_provider: str = "") -> str | None:
     """Open a new run row. Returns its run_id, or None if the database is unavailable."""
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    try:  # an earlier run killed before its `finally` block: resolve its lineage now
+        from src.memory import events
+        events.recover_unfinished()
+    except Exception as e:
+        _warn("recover unfinished runs in the memory store", e)
+    _sync_memory()  # writes left over from an earlier run that could not reach the hosted store
+    run_id =datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     try:
         with _connect() as conn:
             conn.execute(
@@ -138,6 +234,8 @@ def start_run(topic: str, llm_provider: str = "") -> str | None:
                 "VALUES (?, ?, ?, 'running', ?, ?)",
                 (run_id, topic, _now(), llm_provider, _project_git_commit()),
             )
+        run_context.set_run(run_id, git_dirty=_project_git_dirty(), python_version=platform.python_version(),
+                            os=platform.platform())
         return run_id
     except sqlite3.Error as e:
         _warn("start a run record", e)
@@ -150,7 +248,7 @@ def record_stage(run_id: str | None, agent: str, attempt: int, decision: str,
     if not run_id:
         return None
     try:
-        with _connect() as conn:
+        with _write_lock, _connect() as conn:
             cur = conn.execute(
                 "INSERT INTO stages (run_id, agent, attempt, decision, output_json, report_text, recorded_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -165,13 +263,79 @@ def record_stage(run_id: str | None, agent: str, attempt: int, decision: str,
         return None
 
 
+def last_stage_attempt(run_id: str | None, agent: str) -> int:
+    """Keep invocation numbers unique across ordinary, rerun and Slack requests."""
+    if not run_id:
+        return 0
+    try:
+        with _connect() as conn:
+            row = conn.execute("SELECT MAX(attempt) FROM (SELECT attempt FROM stages WHERE run_id=? AND agent=? "
+                               "UNION ALL SELECT attempt FROM stage_timings WHERE run_id=? AND agent=?)",
+                               (run_id, agent, run_id, agent)).fetchone()
+        return row[0] or 0
+    except (sqlite3.Error, OSError) as error:
+        _warn(f"read the {agent} invocation number", error)
+        return 0
+
+
+def start_stage_attempt(run_id: str | None, agent: str, attempt: int, max_attempts: int) -> str | None:
+    """Persist a start before invoking an agent, including attempts that crash.
+
+    Completion/approval remains in stages; this record measures execution only.
+    """
+    if not run_id:
+        return None
+    invocation_id = str(uuid.uuid4())
+    try:
+        with _write_lock, _connect() as conn:
+            conn.execute("INSERT INTO stage_timings (invocation_id, run_id, agent, attempt, max_attempts, started_at) "
+                         "VALUES (?, ?, ?, ?, ?, ?)",
+                         (invocation_id, run_id, agent, attempt, max_attempts,
+                          datetime.now(timezone.utc).isoformat(timespec="microseconds")))
+        return invocation_id
+    except (sqlite3.Error, OSError) as error:
+        _warn(f"start the {agent} attempt timer", error)
+        return None
+
+
+def finish_stage_attempt(invocation_id: str | None, duration_seconds: float) -> None:
+    """Close an execution timer once; a missing finish stays unknown."""
+    if not invocation_id:
+        return
+    finished_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    try:
+        with _write_lock, _connect() as conn:
+            conn.execute("UPDATE stage_timings SET finished_at = ?, duration_seconds = ? "
+                         "WHERE invocation_id = ? AND finished_at IS NULL",
+                         (finished_at, max(0.0, duration_seconds), invocation_id))
+    except (sqlite3.Error, OSError) as error:
+        _warn("finish an agent attempt timer", error)
+
+
+@contextmanager
+def stage_timer(run_id: str | None, agent: str, attempt: int, max_attempts: int):
+    """Time the invocation body, excluding reporting, approval and diagnosis.
+
+    UTC timestamps support live displays; a monotonic clock measures elapsed
+    seconds even if the system clock changes. Persisting the finish is outside
+    the measured interval. A killed process leaves an unfinished start record.
+    """
+    invocation_id = start_stage_attempt(run_id, agent, attempt, max_attempts)
+    started = time.monotonic()
+    try:
+        yield invocation_id
+    finally:
+        elapsed = time.monotonic() - started
+        finish_stage_attempt(invocation_id, elapsed)
+
+
 def record_artifact(run_id: str | None, agent: str, kind: str, path) -> None:
     """Store one file directly. For agents whose files are not named in their
     output dict (for example a future Report or Presentation Agent)."""
     if not run_id:
         return
     try:
-        with _connect() as conn:
+        with _write_lock, _connect() as conn:
             _store_file(conn, run_id, None, agent, kind, Path(path))
     except (sqlite3.Error, OSError) as e:
         _warn(f"record artifact {path}", e)
@@ -193,6 +357,36 @@ def finish_run(run_id: str | None, status: str, final_phase: str = "",
             )
     except sqlite3.Error as e:
         _warn("finish the run record", e)
+    # Record the run's end and each agent attempt's lineage (kept, superseded,
+    # reverted, rejected, unknown) in the memory store; fail-soft.
+    try:
+        from src.memory import events
+        events.run_finished(run_id, status)
+    except Exception as e:
+        _warn(f"record the end of run {run_id} in the memory store", e)
+    # Measure the run (success, halted or crashed) from what was just recorded.
+    # Fail-soft: `python -m src.orchestration.run_metrics compute <run_id>`
+    # can make the same measurements later.
+    try:
+        from src.orchestration import run_metrics
+        run_metrics.compute(run_id)
+    except Exception as e:
+        _warn(f"compute the metrics of run {run_id}", e)
+    run_context.clear(run_id)
+    _sync_memory()
+
+
+def _sync_memory() -> None:
+    """Send the memory outbox and run metrics to the team's hosted store
+    (only when MEMORY_BACKEND=postgres; fail-soft, see src/memory)."""
+    try:
+        from src import memory
+        if memory.backend_name() == "postgres":
+            report = memory.sync()
+            if report.get("error"):
+                print(f"[Memory] Sync incomplete: {report['error']}")
+    except Exception as e:
+        _warn("sync the memory store", e)
 
 
 def collect_artifact_paths(output) -> list[tuple[str, Path]]:
@@ -287,7 +481,10 @@ def get_run(run_id: str) -> dict | None:
             "SELECT id, agent, kind, original_path, size_bytes, content_stored FROM artifacts "
             "WHERE run_id = ? ORDER BY id", (run_id,),
         ).fetchall()
-    return {**dict(run), "stages": [dict(s) for s in stages], "artifacts": [dict(a) for a in artifacts]}
+        timings = conn.execute("SELECT * FROM stage_timings WHERE run_id = ? ORDER BY started_at, invocation_id",
+                               (run_id,)).fetchall()
+    return {**dict(run), "stages": [dict(s) for s in stages], "artifacts": [dict(a) for a in artifacts],
+            "stage_timings": [dict(t) for t in timings]}
 
 
 def get_stage_output(run_id: str, agent: str) -> object:

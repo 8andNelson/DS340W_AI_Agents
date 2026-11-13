@@ -53,12 +53,23 @@
     <section class="view" id="view-overview">
       <header class="view-head">
         <h1>Overview</h1>
-        <p class="muted">Enter a machine learning or data topic. The Master Agent runs each agent in order, checks its work, and when an agent fails, diagnoses the failure and runs the agent again (at most 5 tries).</p>
+        <p class="muted">Enter a research topic, or supply a fixed Parent Paper to compare modeling runs. The Master Agent supervises each stage and runs independent work in parallel.</p>
       </header>
 
       <form class="card prompt" id="prompt-form">
         <label for="topic" class="label">Research topic</label>
         <textarea id="topic" rows="2" maxlength="500" placeholder="e.g. machine learning for detecting credit card fraud"></textarea>
+        <label class="check paper-toggle"><input type="checkbox" id="use-parent-pdf"> Start from my Parent Paper PDF</label>
+        <div id="parent-pdf-fields" hidden>
+          <p class="muted small">Skips Intake, Research and paper selection. Reuse the same PDF, title, topic and prediction target for matching inputs. Dataset and modeling decisions still happen during the run.</p>
+          <label for="parent-pdf" class="label">Parent Paper PDF (text-based, up to 50 MB)</label>
+          <input id="parent-pdf" type="file" accept=".pdf,application/pdf">
+          <label for="parent-title" class="label">Title printed on the paper</label>
+          <input id="parent-title" type="text" maxlength="500" placeholder="Exact paper title">
+          <label for="parent-target" class="label">Prediction target</label>
+          <input id="parent-target" type="text" maxlength="400" placeholder="e.g. fraud (separate multiple keywords with commas)">
+          <p class="muted small" id="parent-input-status" role="status"></p>
+        </div>
         <div class="prompt-row">
           <label class="check"><input type="checkbox" id="reset"> Reset project state first</label>
           <div class="spacer"></div>

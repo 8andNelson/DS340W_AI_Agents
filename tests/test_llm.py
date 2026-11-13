@@ -295,3 +295,26 @@ def test_notes_become_the_system_prompt_when_the_call_has_none():
             llm.chat("hi")
     messages = post.call_args.kwargs["json"]["messages"]
     assert messages[0]["role"] == "system" and "- fix it" in messages[0]["content"]
+
+
+def test_parallel_supervisor_notes_are_isolated_and_inherited_by_children():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    barrier = threading.Barrier(2)
+
+    def invocation(note):
+        with llm.supervisor_notes([note]):
+            barrier.wait(timeout=5)
+            with ThreadPoolExecutor(max_workers=1) as children:
+                child = llm.submit_with_context(children, llm._with_supervisor_notes, "SYSTEM").result()
+            return llm._with_supervisor_notes("SYSTEM"), child
+
+    with ThreadPoolExecutor(max_workers=2) as agents:
+        a = agents.submit(invocation, "DATA ONLY")
+        b = agents.submit(invocation, "CODE ONLY")
+        for text in a.result():
+            assert "DATA ONLY" in text and "CODE ONLY" not in text
+        for text in b.result():
+            assert "CODE ONLY" in text and "DATA ONLY" not in text
+    assert llm._with_supervisor_notes("SYSTEM") == "SYSTEM"

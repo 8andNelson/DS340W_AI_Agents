@@ -24,6 +24,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.orchestration import run_context
 from src.search import brave_search, serpapi_search
 
 SEARCH_LOG = Path(__file__).parent.parent.parent / "logs" / "search_calls.jsonl"
@@ -39,8 +40,8 @@ _failures = {name: 0 for name, _module in PROVIDERS}
 
 
 def _log(provider: str, query: str, results: int, error: str = "") -> None:
-    entry = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"), "provider": provider,
-             "query": query, "results": results}
+    entry = run_context.tag({"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                             "provider": provider, "query": query, "results": results})
     if error:
         entry["error"] = error
     try:

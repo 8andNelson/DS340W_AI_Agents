@@ -2,11 +2,13 @@
 Agent-to-agent handoffs, through Master Agent.
 
 No agent runs another agent. When an agent finishes, its module's
-handoff(result, context) returns its request to Master Agent: which agent
-to run next and the information to pass on (CLAUDE.md's agent message
-model). Master Agent checks the request (master_agent._review_handoff),
-runs the requested agent, and asks that agent for its own handoff -- until
-an agent requests nothing more.
+handoff(result, context) returns a list of requests to Master Agent: which
+agents to run next and the information to pass on. Master Agent checks
+each request and runs independent first-pass stages concurrently, up to
+its worker limit. Requests wait for approved prerequisites; identical
+requests joining two branches execute once, while conflicting inputs are
+rejected. An unresolved dependency halts rather than skipping a stage.
+Reruns remain serial to preserve baseline snapshot/restore semantics.
 
 This module holds the shared parts: the request builder, the workflow
 order each request is checked against, and the phase each agent's stage

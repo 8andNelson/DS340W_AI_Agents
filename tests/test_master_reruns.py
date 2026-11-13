@@ -120,7 +120,7 @@ def test_the_relayed_instructions_reach_the_requested_agents_prompts(tmp_path):
     seen = {}
 
     def replicate(*_args, **kwargs):
-        seen["notes"] = list(llm._supervisor_notes)
+        seen["notes"] = list(llm._supervisor_notes.get())
         seen["revision"] = kwargs["revision"]
         return dict(ctx["replication_result"])
 
@@ -133,7 +133,7 @@ def test_the_relayed_instructions_reach_the_requested_agents_prompts(tmp_path):
     assert "Use 500 trees." in seen["notes"][0] and "Experiment Agent" in seen["notes"][0]
     assert seen["revision"]["instructions"] == ["Use 500 trees."]
     assert loop["reruns"][0]["gap_before"] == 4.0 and loop["reruns"][0]["gap_after"] == 1.5
-    assert llm._supervisor_notes == []
+    assert llm._supervisor_notes.get() == ()
 
 
 def test_a_code_discovery_rerun_skips_the_cache_and_replicates_afresh(tmp_path):

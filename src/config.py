@@ -16,6 +16,15 @@ SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "")  # main status/activity cha
 SLACK_ERRORS_CHANNEL_ID = os.getenv("SLACK_ERRORS_CHANNEL_ID", "")  # Master Agent corrections/failures
 KAGGLE_USERNAME = os.getenv("KAGGLE_USERNAME", "")
 KAGGLE_KEY = os.getenv("KAGGLE_KEY", "")
+# Short name of the team member whose machine ran a pipeline run (run
+# metrics, src/orchestration/run_metrics.py); not an email address.
+MEMORY_CONTRIBUTOR = os.getenv("MEMORY_CONTRIBUTOR", "").strip()
+# Shared agent memory store (src/memory/): "sqlite" (local file only, the
+# default), "postgres" (the team's hosted store, with a local mirror and
+# outbox) or "off". MEMORY_DATABASE_URL is the memory_agent role's
+# connection string -- never the admin one.
+MEMORY_BACKEND = os.getenv("MEMORY_BACKEND", "sqlite").strip().lower()
+MEMORY_DATABASE_URL = os.getenv("MEMORY_DATABASE_URL", "").strip()
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 

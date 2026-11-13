@@ -409,14 +409,9 @@ def run(selected_datasets: list, target_terms: list = None, target_rows: int | N
 
 
 def handoff(result: dict, context: dict) -> list:
-    """The Cleaning Agent's request to Master Agent when it finishes. Before
-    the implementation search has run: run the Code Discovery Agent. After
-    it (a rerun with new data): run the Replication Agent again, with the
-    SAME baseline script on the new data, so only the data changes."""
+    """Request replication once both cleaning and code discovery are approved.
+    With new data in a rerun, preserve the SAME baseline script."""
     rows = (result or {}).get("rows_total", 0)
-    if not context.get("code_discovery_result"):
-        return [handoff_request("cleaning_agent", "Code Discovery Agent", {},
-                                f"Master CSV ready ({rows} rows); the Parent Paper's implementation is needed next.")]
     revision = {"reuse_script": True} if context.get("replication_result") else None
     return [handoff_request("cleaning_agent", "Replication Agent", {"revision": revision},
                             f"New master CSV ready ({rows} rows); the baseline must run again on it.")]

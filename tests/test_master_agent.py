@@ -469,7 +469,7 @@ class TestSupervise(MasterAgentTestCase):
         self.assertIn("Use broader queries.", seen[1])
         self.assertEqual(seen[2].count("Diagnosis:"), 2)  # notes accumulate
         self.assertIn("too narrow", chat.call_args_list[1].args[0])  # earlier diagnoses go to the next one
-        self.assertEqual(llm._supervisor_notes, [])  # notes end with the stage
+        self.assertEqual(llm._supervisor_notes.get(), ())  # notes end with the stage
 
         retrying = [e for e in self._log_entries() if e["decision"] == "Retrying"]
         self.assertTrue(any("too narrow" in e["issue"] and "Use broader queries." in e["next"] for e in retrying))
@@ -481,7 +481,7 @@ class TestSupervise(MasterAgentTestCase):
         seen = []
 
         def run_fn():
-            seen.append(list(llm._supervisor_notes))
+            seen.append(list(llm._supervisor_notes.get()))
             if len(seen) == 1:
                 raise ValueError("bad column 'Class'")
             return "good"
@@ -1192,9 +1192,9 @@ class TestRunPipelineSlackBanner(MasterAgentTestCase):
              patch.object(master_agent.slack_client, "fetch_new_messages", return_value=[]) as fetch:
             self._run_minimal_success()
 
-        # Validation, Data, Cleaning, Code Discovery and Replication stages and the
-        # rerun loop (Evaluation + Experiment Agent requests) all trigger a relay check.
-        self.assertEqual(fetch.call_count, 6)
+        # Parallel branches coalesce relay checks until shared files are idle.
+        # The initial approval, joined branches and final result still check Slack.
+        self.assertGreaterEqual(fetch.call_count, 3)
         for call in fetch.call_args_list:
             self.assertEqual(call.kwargs["oldest_ts"], "1234.5678")
 

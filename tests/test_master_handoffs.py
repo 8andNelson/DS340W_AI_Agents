@@ -3,6 +3,7 @@ requests, checks each request first (known agent, no skipped workflow
 state, no second run outside an approved rerun), and puts reruns through
 the same path."""
 import json
+import threading
 from unittest.mock import patch
 
 from src.agents import master_agent
@@ -110,3 +111,107 @@ def test_a_report_with_characters_outside_cp1252_is_saved(tmp_path):
     # PDF ligature U+FB01, which the Windows default encoding cannot write.
     path = master_agent._write_report("Experiment Agent", 1, "classi\ufb01cation \u2248 0.99")
     assert path.read_text(encoding="utf-8") == "classi\ufb01cation \u2248 0.99"
+
+
+def test_parallel_handoffs_clean_while_code_runs_and_join_once(tmp_path):
+    from src.agents import validation_agent
+
+    ctx = first_pass_ctx(tmp_path, dataset_result=None, cleaning_result=None)
+    drive = master_agent._new_drive()
+    code_started, cleaned = threading.Event(), threading.Event()
+    calls = []
+
+    def run(target, req, snapshot, state):
+        calls.append(target)
+        if target == "Data Agent":
+            assert code_started.wait(5), "Data and Code Discovery must overlap"
+        elif target == "Code Discovery Agent":
+            code_started.set()
+            assert cleaned.wait(5), "Cleaning must not wait for Code Discovery"
+        elif target == "Cleaning Agent":
+            assert snapshot["dataset_result"] is not None
+            assert snapshot["code_discovery_result"] is None
+            cleaned.set()
+        elif target == "Replication Agent":
+            assert snapshot["cleaning_result"] is not None
+            assert snapshot["code_discovery_result"] is not None
+        return (stops() if target == "Experiment Agent" else {}), []
+
+    requests = validation_agent.handoff({"recommended_parent_paper": ctx["parent_paper"]}, ctx)
+    with patch.object(master_agent, "_run_stage", side_effect=run), \
+         patch.object(master_agent, "_after_stage"):
+        master_agent._drive(ctx, requests, drive, sender="Validation Agent")
+    assert not drive["blockers"]
+    assert calls.count("Code Discovery Agent") == 1
+    assert calls.count("Replication Agent") == 1
+    assert drive["evaluated"]
+
+
+def test_parallel_failure_does_not_launch_dependents(tmp_path):
+    ctx = first_pass_ctx(tmp_path, dataset_result=None, cleaning_result=None)
+    drive = master_agent._new_drive()
+    started = threading.Barrier(2)
+    calls = []
+
+    def run(target, req, snapshot, state):
+        calls.append(target)
+        started.wait(timeout=5)
+        return {}, ([{"issue": "no usable data"}] if target == "Data Agent" else [])
+
+    with patch.object(master_agent, "_run_stage", side_effect=run), \
+         patch.object(master_agent, "_after_stage"):
+        master_agent._drive(ctx, [request("validation_agent", "Data Agent"),
+                                  request("validation_agent", "Code Discovery Agent")], drive)
+    assert drive["blockers"]
+    assert set(calls) == {"Data Agent", "Code Discovery Agent"}
+
+
+def test_code_finishes_first_replication_waits_for_data_and_cleaning(tmp_path):
+    from src.agents import validation_agent
+
+    ctx = first_pass_ctx(tmp_path, dataset_result=None, cleaning_result=None)
+    drive = master_agent._new_drive()
+    code_published = threading.Event()
+    calls = []
+
+    def run(target, req, snapshot, state):
+        if target == "Data Agent":
+            assert code_published.wait(5)
+            snapshot["parent_paper"]["title"] = "private worker mutation"
+        if target == "Replication Agent":
+            assert snapshot["cleaning_result"] is not None
+            assert snapshot["code_discovery_result"] is not None
+        calls.append(target)
+        return (stops() if target == "Experiment Agent" else {}), []
+
+    def publish(target, output, context, state):
+        if target == "Code Discovery Agent":
+            code_published.set()
+
+    requests = validation_agent.handoff({"recommended_parent_paper": ctx["parent_paper"]}, ctx)
+    with patch.object(master_agent, "_run_stage", side_effect=run), \
+         patch.object(master_agent, "_after_stage", side_effect=publish):
+        master_agent._drive(ctx, requests, drive, sender="Validation Agent")
+    assert calls.index("Code Discovery Agent") < calls.index("Data Agent")
+    assert calls.index("Cleaning Agent") < calls.index("Replication Agent")
+    assert calls.count("Replication Agent") == 1
+    assert ctx["parent_paper"]["title"] == "Paper"
+    assert not drive["blockers"]
+
+
+def test_parallel_supervisors_preserve_all_log_entries():
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        list(workers.map(lambda n: master_agent._append_log([{"id": n}]), range(30)))
+    assert sorted(e["id"] for e in log_entries()) == list(range(30))
+
+
+def test_conflicting_parallel_requests_are_rejected(tmp_path):
+    ctx = first_pass_ctx(tmp_path, dataset_result=None)
+    drive = master_agent._new_drive()
+    with patch.object(master_agent, "_run_stage", return_value=({}, [])) as stage:
+        master_agent._drive(ctx, [request("validation_agent", "Data Agent", {"query": "a"}),
+                                  request("validation_agent", "Data Agent", {"query": "b"})], drive)
+    assert stage.call_count == 1
+    assert "conflicting handoff inputs" in drive["blockers"][0]["issue"]

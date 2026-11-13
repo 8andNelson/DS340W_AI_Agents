@@ -39,7 +39,11 @@ function fmtTime(iso) {
 
 function duration(startIso, endIso) {
   if (!startIso) return "";
-  const s = Math.max(0, Math.round(((endIso ? new Date(endIso) : new Date()) - new Date(startIso)) / 1000));
+  return elapsedSeconds(((endIso ? new Date(endIso) : new Date()) - new Date(startIso)) / 1000);
+}
+
+function elapsedSeconds(seconds) {
+  const s = Math.max(0, Math.round(seconds));
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
@@ -50,7 +54,7 @@ function slug(name) { return name.toLowerCase().replace(/ /g, "_"); }
 const STATUS_LABELS = {
   running: "Running", starting: "Starting", success: "Finished", halted: "Halted", crashed: "Crashed",
   stopped: "Stopped", unknown: "Unknown", approved: "Approved", retrying: "Retrying", rejected: "Rejected",
-  failed: "Failed",
+  failed: "Failed", checking: "Checking", interrupted: "Interrupted",
 };
 const statusLabel = (s) => STATUS_LABELS[s] || (s ? s[0].toUpperCase() + s.slice(1) : "");
 
@@ -226,14 +230,20 @@ function agentBadge(agent) {
   if (agent.planned) return `<span class="badge">Planned</span>`;
   const live = agent.live;
   if (!live) return `<span class="badge">${status.run && status.run.active ? "Waiting" : "Not reached"}</span>`;
-  return `<span class="badge ${esc(live.status)}">${esc(statusLabel(live.status))}</span>`;
+  const inferred = live.timing_method === "inferred" ? " (inferred)" : "";
+  return `<span class="badge ${esc(live.status)}">${esc(statusLabel(live.status) + inferred)}</span>`;
 }
 
 function renderPipeline() {
   $("#pipeline").innerHTML = status.agents.map((a, i) => {
     const live = a.live || {};
     const attempt = live.attempt ? `Attempt ${live.attempt}${live.max_attempts ? ` of ${live.max_attempts}` : ""}` : "";
-    const took = live.started_at ? (live.status === "running" ? `running for ${duration(live.started_at)}` : `took ${duration(live.started_at, live.finished_at)}`) : "";
+    let took = "";
+    if (live.status === "running" && live.started_at) took = `running for ${duration(live.started_at)}`;
+    else if (live.duration_seconds != null) took = `execution took ${elapsedSeconds(live.duration_seconds)}`;
+    else if (live.timing_method === "legacy_estimate" && live.started_at && live.finished_at)
+      took = `estimated ${duration(live.started_at, live.finished_at)}`;
+    else if (live.status === "interrupted") took = "execution duration unknown";
     const meta = [attempt, took].filter(Boolean).join(", ");
     return `
       <div class="card agent ${a.planned ? "planned" : ""} ${live.status === "running" ? "running" : ""}" data-agent="${esc(a.name)}">
@@ -259,7 +269,23 @@ $("#prompt-form").addEventListener("submit", async (e) => {
   msg.textContent = "";
   $("#start-btn").disabled = true;
   try {
-    await postJson("/api/run", { topic: $("#topic").value, reset: $("#reset").checked });
+    const body = { topic: $("#topic").value, reset: $("#reset").checked };
+    if ($("#use-parent-pdf").checked) {
+      const file = $("#parent-pdf").files[0];
+      if (!file) throw new Error("Choose a Parent Paper PDF.");
+      const data = new FormData();
+      data.append("pdf", file);
+      data.append("topic", body.topic);
+      data.append("title", $("#parent-title").value);
+      data.append("target_terms", $("#parent-target").value);
+      msg.textContent = "Checking Parent Paper PDF…";
+      const response = await fetch("/api/parent-paper", { method: "POST", body: data });
+      const uploaded = await response.json();
+      if (!response.ok) throw new Error(uploaded.error || "The PDF could not be uploaded.");
+      body.parent_paper_id = uploaded.parent_paper_id;
+      $("#parent-input-status").textContent = `Fixed input ${uploaded.input_fingerprint.slice(0, 12)} · ${uploaded.pages} page(s)`;
+    }
+    await postJson("/api/run", body);
     msg.className = "form-msg ok";
     msg.textContent = "Run started.";
     // A new run is the current run: leave any past run and start clean.
@@ -269,6 +295,12 @@ $("#prompt-form").addEventListener("submit", async (e) => {
     msg.textContent = err.message;
     $("#start-btn").disabled = false;
   }
+});
+
+$("#use-parent-pdf").addEventListener("change", () => {
+  const enabled = $("#use-parent-pdf").checked;
+  $("#parent-pdf-fields").hidden = !enabled;
+  for (const id of ["parent-pdf", "parent-title", "parent-target"]) $("#" + id).required = enabled;
 });
 
 $("#topic").addEventListener("keydown", (e) => {
@@ -375,6 +407,7 @@ function renderAgentDetail(agent) {
     <div class="card">
       <h3>Report</h3>
       <div class="muted small">Recorded ${esc(fmtTime(chosen.recorded_at))}. Master Agent decision: ${esc(chosen.decision)}.</div>
+      ${chosen.duration_seconds != null ? `<p class="muted small">Agent execution: ${esc(elapsedSeconds(chosen.duration_seconds))}. Started ${esc(fmtTime(chosen.started_at))}; finished ${esc(fmtTime(chosen.finished_at))}.</p>` : ""}
       <pre class="report">${esc(chosen.report_text || "No report text was recorded for this attempt.")}</pre>
     </div>
     <div class="card">
@@ -634,23 +667,24 @@ async function loadPapers() {
           </div>
           <div class="paper-badges">
             ${p.is_parent ? `<span class="badge parent">Parent Paper</span>` : ""}
-            ${vs ? `<span class="badge ${esc(vs)}">${esc(p.validation_status)}</span>` : ""}
+            ${vs ? `<span class="badge ${esc(vs)}">${esc(p.selection_source === "user_pdf" ? "User supplied" : p.validation_status)}</span>` : ""}
             ${p.has_code ? `<span class="badge">Has code</span>` : ""}
           </div>
         </div>
         <dl class="paper-body">
-          <div><dt>Dataset</dt><dd>${esc(p.dataset || "Not stated")}</dd></div>
-          <div><dt>Methodology</dt><dd>${esc(p.methodology || "Not stated")}</dd></div>
-          <div><dt>Results</dt><dd>${esc(p.results_summary || "Not stated")}</dd></div>
+          <div><dt>Dataset</dt><dd>${esc(p.dataset || (p.selection_source === "user_pdf" ? "See supplied PDF" : "Not stated"))}</dd></div>
+          <div><dt>Methodology</dt><dd>${esc(p.methodology || (p.selection_source === "user_pdf" ? "See supplied PDF" : "Not stated"))}</dd></div>
+          <div><dt>Results</dt><dd>${esc(p.results_summary || (p.selection_source === "user_pdf" ? "See supplied PDF" : "Not stated"))}</dd></div>
+          ${p.input_fingerprint ? `<div><dt>Fixed input</dt><dd>${esc(p.input_fingerprint.slice(0, 12))}</dd></div>` : ""}
           ${p.rejection_reason ? `<div><dt>Rejection reason</dt><dd>${esc(p.rejection_reason)}</dd></div>` : ""}
         </dl>
         ${p.abstract ? `<details><summary>Abstract</summary><p>${esc(p.abstract)}</p></details>` : ""}
         <div class="paper-actions">
           ${p.paper_url ? `<a class="btn sm" href="${esc(p.paper_url)}" target="_blank" rel="noopener noreferrer">Publisher page</a>` : ""}
           ${p.code_url ? `<a class="btn sm ghost" href="${esc(p.code_url)}" target="_blank" rel="noopener noreferrer">Code</a>` : ""}
-          ${p.pdf_name
-            ? `<button class="btn sm primary" data-view-pdf="/api/pdfs/${esc(p.pdf_name)}/view">View PDF</button>
-               <a class="btn sm ghost" href="/api/pdfs/${esc(p.pdf_name)}/download">Download PDF</a>`
+          ${p.pdf_view_url || p.pdf_name
+            ? `<button class="btn sm primary" data-view-pdf="${esc(p.pdf_view_url || `/api/pdfs/${p.pdf_name}/view`)}">View PDF</button>
+               <a class="btn sm ghost" href="${esc(p.pdf_download_url || `/api/pdfs/${p.pdf_name}/download`)}">Download PDF</a>`
             : `<button class="btn sm" data-fetch-pdf="${p.index}">Get open-access PDF</button>`}
           <span class="note" data-note="${p.index}"></span>
         </div>

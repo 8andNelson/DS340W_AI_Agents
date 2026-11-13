@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from src.orchestration import run_context
 from src.search import content_validator
 from src.search import camoufox_fetch
 
@@ -58,9 +59,9 @@ def response_prefix(response, streamed: bool = False) -> bytes:
 
 def _log(url: str, status: int, verdict: str, reason: str, size: int = 0,
          provider: str = "direct") -> None:
-    entry = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-             "url": url, "status": status, "verdict": verdict, "reason": reason,
-             "inspected_bytes": size, "provider": provider}
+    entry = run_context.tag({"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                             "url": url, "status": status, "verdict": verdict, "reason": reason,
+                             "inspected_bytes": size, "provider": provider})
     try:
         with _lock:
             FETCH_LOG.parent.mkdir(parents=True, exist_ok=True)

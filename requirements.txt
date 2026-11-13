@@ -8,4 +8,5 @@ pandas
 pyarrow
 pypdf
 flask
+psycopg[binary]==3.3.9
 pytest

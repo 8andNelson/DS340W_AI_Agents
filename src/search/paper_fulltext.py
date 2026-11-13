@@ -179,6 +179,17 @@ def get_parent_paper_text(parent_paper: dict, use_cache: bool = True) -> dict:
     in papers/parent/<slug>.*, so every agent reads the same copy.
     """
     parent_paper = parent_paper or {}
+    if parent_paper.get("selection_source") == "user_pdf":
+        # A pinned local paper must never fall through to a title-based cache
+        # or download a different edition when the supplied bytes are missing.
+        from src.paper_input import load_input, read_pdf
+        manifest, pdf = load_input(Path(parent_paper["input_manifest_path"]))
+        if manifest["pdf_sha256"] != parent_paper.get("pdf_sha256"):
+            raise ValueError("The supplied Parent Paper identity has changed.")
+        text, pages = read_pdf(pdf.read_bytes())
+        return {"status": "FULL_TEXT", "text": text, "source_url": "", "pdf_path": str(pdf),
+                "text_path": "", "pages": pages, "pdf_sha256": manifest["pdf_sha256"],
+                "notes": "Read the user-supplied Parent Paper PDF; checksum verified."}
     slug = _slug(parent_paper.get("title", ""))
     pdf_path = PARENT_PAPER_DIR / f"{slug}.pdf"
     text_path = PARENT_PAPER_DIR / f"{slug}.txt"

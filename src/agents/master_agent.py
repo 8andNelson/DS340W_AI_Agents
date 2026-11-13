@@ -25,10 +25,11 @@ a human prompt -- diagnose-and-retry-then-halt is itself the final decision, and
 every step is logged (both the structured JSON log and the saveable text
 reports) so a person can review the full trail after the fact.
 
-Agents never run other agents. Each agent's module has a handoff()
-that returns its request to Master Agent: which agent to run next, and
+Agents never run other agents directly. Each agent's module has a handoff()
+that returns requests to Master Agent: which agents to run next, and
 what to pass on (src/orchestration/handoff.py). Master Agent checks each
-request and runs the requested agent (see _drive). After the first
+request and runs independent first-pass stages concurrently, joining at
+approved prerequisites (see _drive_initial). After the first
 evaluation the pipeline is not linear: the Evaluation Agent (validity
 fixes) and the Experiment Agent (closing the gap to the Parent Paper's
 score) hand off rerun requests for an earlier agent, with new knowledge.
@@ -50,9 +51,13 @@ visibility.
 import json
 import shutil
 import traceback
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.memory import events
 from src.orchestration import run_store
 from src.slack import slack_client, message_formatter
 
@@ -76,6 +81,9 @@ SLACK_SUMMARY_MAX_CHARS = 600
 # Module-level, like Slack, so every _supervise call -- including the ones
 # check_agent_requests makes -- records its attempt without extra plumbing.
 _current_run_id = None
+_log_lock = threading.Lock()
+_stage_record_lock = threading.Lock()
+MAX_PARALLEL_AGENTS = 3
 
 
 def _log_entry(action: str, target: str, issue: str, decision: str, next_step: str) -> dict:
@@ -91,6 +99,12 @@ def _log_entry(action: str, target: str, issue: str, decision: str, next_step: s
 
 
 def _append_log(entries: list) -> None:
+    # Parallel supervisors must not overwrite one another's read/modify/write.
+    with _log_lock:
+        _append_log_unlocked(entries)
+
+
+def _append_log_unlocked(entries: list) -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     existing = []
     if LOG_FILE.exists():
@@ -697,6 +711,7 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
     output = None
     blockers = []
     notes = list(notes or [])  # the relayed request, then one per failed attempt (failure + diagnosis)
+    attempt_offset = max(attempt_offset, run_store.last_stage_attempt(_current_run_id, agent_name))
     last = attempt_offset + max_attempts
 
     for attempt in range(attempt_offset + 1, last + 1):
@@ -706,10 +721,14 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             + (f" Master Agent passed {len(notes)} note(s): relayed instructions and/or diagnoses." if notes else "")
         ))
 
+        invocation_id = None
+        error = None
         try:
-            with llm.supervisor_notes(notes):
+            with llm.supervisor_notes(notes), \
+                    run_store.stage_timer(_current_run_id, agent_name, attempt, last) as invocation_id:
                 output = run_fn()
         except Exception as e:
+            error = f"{type(e).__name__}: {e}"
             slack_client.post_error_message(message_formatter.format_finished(
                 agent_name, "Failed", f"Raised an exception: {e}",
             ))
@@ -738,7 +757,9 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
                 )
                 _print_entry(approval)
                 _append_log([approval])
-                run_store.record_stage(_current_run_id, agent_name, attempt, "Approved", output, report_text)
+                with _stage_record_lock:
+                    run_store.record_stage(_current_run_id, agent_name, attempt, "Approved", output, report_text)
+                events.attempt(_current_run_id, invocation_id, agent_name, attempt, "Approved")
                 return output, []
             failure = "\n".join(b["issue"] for b in blockers)
 
@@ -752,7 +773,10 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             report_text += (f"\n\n--- Master Agent diagnosis ---\nCause: {diagnosis['cause']}\n"
                             + "\n".join(f"- {g}" for g in diagnosis["guidance"]))
             report_path = _write_report(agent_name, attempt, report_text)
-            run_store.record_stage(_current_run_id, agent_name, attempt, "Retrying", output, report_text)
+            with _stage_record_lock:
+                run_store.record_stage(_current_run_id, agent_name, attempt, "Retrying", output, report_text)
+            events.attempt(_current_run_id, invocation_id, agent_name, attempt, "Retrying",
+                           failed_checks=[b["issue"] for b in blockers], error=error)
             retry_note = _log_entry(
                 "Correction", agent_name,
                 f"{agent_name} failed attempt {attempt}. Diagnosis: {diagnosis['cause']} "
@@ -765,7 +789,10 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             _append_log([retry_note])
         else:
             report_path = _write_report(agent_name, attempt, report_text)
-            run_store.record_stage(_current_run_id, agent_name, attempt, "Rejected", output, report_text)
+            with _stage_record_lock:
+                run_store.record_stage(_current_run_id, agent_name, attempt, "Rejected", output, report_text)
+            events.attempt(_current_run_id, invocation_id, agent_name, attempt, "Rejected",
+                           failed_checks=[b["issue"] for b in blockers], error=error)
             final = _log_entry(
                 "Correction", agent_name,
                 f"{agent_name} still failing after {max_attempts} error(s), each diagnosed and retried. "
@@ -1194,7 +1221,12 @@ def _after_stage(agent_name: str, output, ctx: dict, drive: dict) -> None:
         # ranked_pool exist -- i.e. from Validation on. Checking any earlier
         # would mark a not-yet-actionable request as "seen" (advancing the
         # cursor) before it ever had context to act on.
-        _relay_and_apply(ctx, ctx["ranked_pool"], drive["floor_ts"])
+        if drive.get("defer_relay"):
+            # A Slack expansion can itself rerun Data/Cleaning. Wait until
+            # no branch is using their files before applying it.
+            drive["relay_pending"] = True
+        else:
+            _relay_and_apply(ctx, ctx["ranked_pool"], drive["floor_ts"])
 
 
 def _halt(agent_name: str, output, blockers: list, ctx: dict, drive: dict) -> None:
@@ -1320,6 +1352,7 @@ def _open_rerun(request: dict, target: str, sender: str, ctx: dict, drive: dict)
         "saved": _snapshot_files(rerun_no, _baseline_files(ctx["cleaning_result"], ctx["replication_result"])),
         "before": {key: ctx.get(key) for key in RERUN_RESULT_KEYS},
     }
+    events.rerun_opened(_current_run_id, rerun_no, target, sender, request.get("action", ""))
 
     evidence = "; ".join(e.get("evidence", "") or e.get("issue", "") for e in request.get("evidence") or [])
     entry = _log_entry("Correction", target,
@@ -1352,6 +1385,8 @@ def _undo_rerun(reason: str, ctx: dict, drive: dict, decision: str = "Rejected")
     _restore_files(rerun["saved"])
     ctx.update(rerun["before"])
     rerun["record"]["outcome"] = f"{reason}; the previous baseline was kept."
+    events.rerun_closed(_current_run_id, rerun["record"]["rerun"], rerun["target"],
+                        "reverted" if decision == "Reverted" else "undone", reason)
     entry = _log_entry("Correction", rerun["target"],
                        f"Rerun {rerun['record']['rerun']} (requested by the {rerun['sender']}): {reason}.",
                        decision, "Previous baseline restored; the requesting agent is told the result.")
@@ -1384,6 +1419,7 @@ def _close_rerun(ctx: dict, drive: dict) -> bool:
     record.update(applied=True, outcome=change,
                   improved=gap_after is not None and (gap_before is None
                                                       or gap_after < gap_before - GAP_TOLERANCE_POINTS))
+    events.rerun_closed(_current_run_id, record["rerun"], rerun["target"], "kept", change, record["improved"])
     state = {}
     for agent_name, key in (("Data Agent", "dataset_result"), ("Cleaning Agent", "cleaning_result"),
                             ("Code Discovery Agent", "code_discovery_result"),
@@ -1420,6 +1456,7 @@ def _decline(request: dict, target: str, sender: str, reason: str, ctx: dict, dr
         return None
 
     redundant = reason.startswith("redundant")
+    events.request_declined(_current_run_id, sender, target, reason, redundant)
     entry = _log_entry("Correction", sender, f"{asked[0].upper()}{asked[1:]} declined: {reason}",
                        "Rejected (redundant)" if redundant else "Rejected",
                        f"The {sender} must look for a different solution or prompt."
@@ -1440,6 +1477,90 @@ def _new_drive(floor_ts: str = None, evaluated: bool = False) -> dict:
             "evaluated": evaluated, "end_reason": "", "phase": None, "blockers": [], "floor_ts": floor_ts}
 
 
+def _drive_initial(ctx: dict, requests: list, drive: dict, sender: str):
+    """Schedule requested first-pass stages as their prerequisites become ready.
+
+    Workers receive private input snapshots. Only this coordinator publishes
+    approved results, updates state, and asks for subsequent handoffs. Identical
+    requests from joining branches share one execution; conflicting inputs halt.
+    Reruns remain serialized because they replace the same baseline files.
+    """
+    from src.agents.experiment_agent import canonical_agent
+    from src.orchestration.handoff import PREREQUISITES, RESULT_KEY
+
+    pending = [(r, sender) for r in requests]
+    running = {}
+    scheduled = {}
+    drive["defer_relay"] = True
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_AGENTS) as pool:
+            while pending or running:
+                if not running and drive.pop("relay_pending", False):
+                    _relay_and_apply(ctx, ctx["ranked_pool"], drive["floor_ts"])
+                if drive["evaluated"] and not running:
+                    return [r for r, _ in pending], sender
+
+                deferred = []
+                for req, origin in pending:
+                    target = canonical_agent(req.get("target_agent")) or str(req.get("target_agent") or "")
+                    reason = ""
+                    if _is_rerun_request(req):
+                        reason = "a rerun can be requested only after the baseline is evaluated, and not inside another rerun"
+                    elif target in scheduled:
+                        if (req.get("inputs") or {}) == scheduled[target]:
+                            continue  # identical join request, already queued/running/completed
+                        reason = f"conflicting handoff inputs for the {target}; one invocation cannot satisfy both requests"
+                    else:
+                        reason = _review_handoff(req, target, ctx, drive)
+                        missing = [p for p in PREREQUISITES.get(target, ())
+                                   if ctx.get(RESULT_KEY[p]) is None]
+                        if missing:
+                            deferred.append((req, origin))
+                            continue
+                    if reason:
+                        _decline(req, target, origin, reason, ctx, drive)
+                        return [], origin
+                    if len(running) >= MAX_PARALLEL_AGENTS:
+                        deferred.append((req, origin))
+                        continue
+                    scheduled[target] = deepcopy(req.get("inputs") or {})
+                    print(f"\n[Master Agent] Handoff approved: {origin} -> {target}. {req.get('summary', '')}")
+                    future = pool.submit(_run_stage, target, deepcopy(req), deepcopy(ctx), deepcopy(drive))
+                    running[future] = (target, origin)
+                pending = deferred
+
+                if not running:
+                    if pending:
+                        req, origin = pending[0]
+                        target = canonical_agent(req.get("target_agent")) or str(req.get("target_agent") or "")
+                        _decline(req, target, origin, _review_handoff(req, target, ctx, drive), ctx, drive)
+                    break
+
+                completed, _ = wait(running, return_when=FIRST_COMPLETED)
+                # Submission order breaks ties; completion order never chooses inputs.
+                for future in list(running):
+                    if future not in completed:
+                        continue
+                    target, origin = running.pop(future)
+                    output, blockers = future.result()
+                    if blockers:
+                        _halt(target, output, blockers, ctx, drive)
+                        return [], target  # executor drains active peers; no dependent work starts
+                    ctx[RESULT_KEY[target]] = output
+                    _after_stage(target, output, ctx, drive)
+                    sender = target
+                    if target == "Evaluation Agent":
+                        drive["evaluated"] = True
+                    pending.extend((r, target) for r in _agent_module(target).handoff(output, ctx))
+
+            if not drive["blockers"] and not drive["evaluated"]:
+                _decline({"target_agent": "", "action": "run_agent"}, "", sender,
+                         f"the {sender} requested no next agent before the baseline was evaluated", ctx, drive)
+            return [], sender
+    finally:
+        drive.pop("defer_relay", None)
+
+
 def _drive(ctx: dict, queue: list, drive: dict, sender: str = "Master Agent") -> None:
     """
     Run agents from handoff requests until no agent requests anything more,
@@ -1450,6 +1571,11 @@ def _drive(ctx: dict, queue: list, drive: dict, sender: str = "Master Agent") ->
     """
     from src.agents.experiment_agent import canonical_agent
     from src.orchestration.handoff import RESULT_KEY
+
+    if not drive["evaluated"] and not drive["rerun"]:
+        queue, sender = _drive_initial(ctx, queue, drive, sender)
+        if drive["blockers"] or not drive["evaluated"]:
+            return
 
     queue = list(queue)
     while True:
@@ -1564,7 +1690,7 @@ def _rerun_loop(ctx: dict) -> dict:
             "end_reason": drive["end_reason"]}
 
 
-def run_pipeline(topic: str) -> dict:
+def run_pipeline(topic: str, parent_paper_input: str | Path | None = None) -> dict:
     """
     Run the pipeline (see _run_stages) inside one run database record
     (src/orchestration/run_store.py): every agent attempt and the files it
@@ -1576,7 +1702,8 @@ def run_pipeline(topic: str) -> dict:
 
     _current_run_id = run_store.start_run(topic, llm_provider=LLM_PROVIDER)
     try:
-        result = _run_stages(topic)
+        result = (_run_stages(topic, parent_paper_input=parent_paper_input)
+                  if parent_paper_input is not None else _run_stages(topic))
     except BaseException:
         run_store.finish_run(_current_run_id, "crashed")
         _current_run_id = None
@@ -1593,13 +1720,46 @@ def run_pipeline(topic: str) -> dict:
     return result
 
 
-def _run_stages(topic: str) -> dict:
+def _supplied_parent_context(topic: str, path: str | Path) -> dict:
+    """Pin a user's paper and target without inventing academic verification."""
+    from src.paper_input import load_input, read_pdf
+    from src.search.paper_fulltext import excerpt, METHOD_KEYWORDS
+
+    manifest, pdf = load_input(Path(path), topic)
+    text, _ = read_pdf(pdf.read_bytes())  # validate before acknowledging the selected input
+    parent = {"title": manifest["title"], "authors": [], "year": 0, "venue": "", "doi": "",
+              "paper_url": "", "peer_reviewed": None, "validation_status": "USER_SUPPLIED",
+              "selection_source": "user_pdf", "pdf_path": str(pdf), "pdf_sha256": manifest["pdf_sha256"],
+              "scope_excerpt": excerpt(text, METHOD_KEYWORDS, max_chars=3000, head_chars=400),
+              "input_manifest_path": str(Path(path).resolve()), "input_fingerprint": manifest["input_fingerprint"],
+              "notes": "Selected by the user. Publication metadata and peer review have not been independently verified."}
+    validation = {"source": "user_pdf", "all": [parent], "verified": [], "unverified": [parent], "rejected": [],
+                  "recommended_parent_paper": parent, "ranked_pool": [parent]}
+    output = {"parent_paper": parent, "target_terms": manifest["target_terms"],
+              "input_fingerprint": manifest["input_fingerprint"], "input_mode": "parent_pdf"}
+    report = (f"User selected the Parent Paper: {parent['title']}\n"
+              f"Prediction target: {', '.join(manifest['target_terms'])}\n"
+              f"PDF SHA-256: {manifest['pdf_sha256']}\nInput fingerprint: {manifest['input_fingerprint']}\n"
+              "Intake, Research and competitive paper selection are skipped. "
+              "This accepts the user's input; it does not certify peer review or scientific validity.")
+    _write_report("Parent Paper Intake", 1, report)
+    run_store.record_stage(_current_run_id, "Parent Paper Intake", 1, "Approved", output, report)
+    entry = _log_entry("Approval", "Parent Paper Intake", report, "Approved", "Start Data and Code Discovery.")
+    _append_log([entry])
+    _print_entry(entry)
+    return {"structured": {"domain": topic, "target_terms": manifest["target_terms"], "source": "user_pdf"},
+            "target_terms": manifest["target_terms"], "papers": [parent], "validation_result": validation,
+            "parent_paper": parent, "ranked_pool": [parent], "input_fingerprint": manifest["input_fingerprint"],
+            "input_mode": "parent_pdf"}
+
+
+def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dict:
     """
     Drive the full pipeline from handoff requests (see _drive). Master Agent
     asks for the Intake Agent; from then on each agent's handoff() requests
-    the next one -- Intake -> Research -> Validation & Selection -> Data
-    Agent (Parent Paper's own dataset only) -> Cleaning Agent -> Code
-    Discovery Agent -> Replication Agent -> Evaluation Agent -> the
+    the next ones -- Intake -> Research -> Validation & Selection -> parallel
+    Data (Parent Paper's own dataset only) / Code Discovery; Data -> Cleaning;
+    both branches join at Replication -> Evaluation Agent -> the
     Evaluation and Experiment Agents' rerun requests -- and Master Agent
     checks every request before it runs the agent. Every stage is
     supervised: Master Agent checks its output, diagnoses each failure and
@@ -1639,12 +1799,22 @@ def _run_stages(topic: str) -> dict:
            "code_discovery_result": None, "replication_result": None, "evaluation_result": None,
            "experiment_result": None}
     drive = _new_drive(floor_ts=run_floor_ts)
-    _drive(ctx, [request("master_agent", "Intake Agent", {"topic": topic}, f"New project topic: {topic}")], drive)
+    if parent_paper_input is not None:
+        from src.agents import validation_agent
+        with run_store.stage_timer(_current_run_id, "Parent Paper Intake", 1, 1):
+            ctx.update(_supplied_parent_context(topic, parent_paper_input))
+        update_state({"project_topic": topic, "research_question": topic, "target_terms": ctx["target_terms"],
+                      "papers": ctx["papers"], "parent_paper": ctx["parent_paper"],
+                      "parent_paper_approved": True, "phase": "MASTER_APPROVAL"})
+        _drive(ctx, validation_agent.handoff(ctx["validation_result"], ctx), drive, sender="Parent Paper Intake")
+    else:
+        _drive(ctx, [request("master_agent", "Intake Agent", {"topic": topic}, f"New project topic: {topic}")], drive)
 
     result = {key: ctx[key] for key in ("structured", "papers", "validation_result", "parent_paper",
                                         "dataset_result", "cleaning_result", "code_discovery_result",
                                         "replication_result", "evaluation_result")}
     result.update(success=False, phase=drive["phase"], reruns=drive["history"],
+                  input_mode=ctx.get("input_mode", "topic"), input_fingerprint=ctx.get("input_fingerprint"),
                   rerun_end_reason=drive["end_reason"], experiment_results=drive["experiment_results"],
                   experiment_result=drive["experiment_results"][-1] if drive["experiment_results"] else None,
                   blockers=drive["blockers"])

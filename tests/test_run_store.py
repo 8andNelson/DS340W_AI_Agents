@@ -36,6 +36,52 @@ class TestRunStore(unittest.TestCase):
         self.assertEqual(run["project_git_commit"], "test-commit")
         self.assertEqual(run_store.list_runs()[0]["run_id"], run_id)
 
+    def test_execution_timer_closes_on_exception_and_uses_monotonic_elapsed(self):
+        run_id = run_store.start_run("timed failure")
+        with patch.object(run_store.time, "monotonic", side_effect=[100.0, 103.25]):
+            with self.assertRaisesRegex(ValueError, "failure"):
+                with run_store.stage_timer(run_id, "Data Agent", 1, 5):
+                    clock = run_store.get_run(run_id)["stage_timings"][0]
+                    self.assertIsNone(clock["finished_at"])
+                    raise ValueError("failure")
+        timing = run_store.get_run(run_id)["stage_timings"][0]
+        self.assertEqual(timing["duration_seconds"], 3.25)
+        self.assertIsNotNone(timing["finished_at"])
+        run_store.finish_stage_attempt(timing["invocation_id"], 999)
+        self.assertEqual(run_store.get_run(run_id)["stage_timings"][0]["duration_seconds"], 3.25)
+
+    def test_supervised_retries_have_separate_timers_and_exclude_diagnosis(self):
+        run_id = run_store.start_run("retry timing")
+        invocations = []
+        def run():
+            invocations.append(1)
+            if len(invocations) == 1:
+                raise ValueError("first attempt failed")
+            return {}
+        def diagnose(*args):
+            clocks = run_store.get_run(run_id)["stage_timings"]
+            self.assertTrue(all(t["finished_at"] is not None for t in clocks))
+            return {"note": "retry", "cause": "test", "guidance": []}
+        with patch.object(master_agent, "_current_run_id", run_id), \
+             patch.object(master_agent, "_diagnose", side_effect=diagnose), \
+             patch.object(run_store.time, "monotonic", side_effect=[0.0, 3.0, 10.0, 15.0]):
+            output, blockers = master_agent._supervise("Data Agent", run, lambda _: [], lambda _: "report",
+                                                       max_attempts=2)
+        self.assertFalse(blockers)
+        clocks = sorted(run_store.get_run(run_id)["stage_timings"], key=lambda t: t["attempt"])
+        self.assertEqual([t["duration_seconds"] for t in clocks], [3.0, 5.0])
+        self.assertEqual([t["attempt"] for t in clocks], [1, 2])
+        self.assertNotEqual(clocks[0]["invocation_id"], clocks[1]["invocation_id"])
+
+    def test_repeated_supervision_does_not_reuse_an_invocation_number(self):
+        run_id = run_store.start_run("repeat requests")
+        with patch.object(master_agent, "_current_run_id", run_id):
+            for _ in range(2):
+                master_agent._supervise("Data Agent", lambda: {}, lambda _: [], lambda _: "report", max_attempts=1)
+        run = run_store.get_run(run_id)
+        self.assertEqual([s["attempt"] for s in run["stages"]], [1, 2])
+        self.assertEqual(sorted(t["attempt"] for t in run["stage_timings"]), [1, 2])
+
     def test_stage_output_and_path_artifacts_are_stored(self):
         master = self._write("data/processed/master_dataset.csv", "a,b\n1,2\n")
         raw = self._write("data/raw/ds.csv", "x\n1\n")

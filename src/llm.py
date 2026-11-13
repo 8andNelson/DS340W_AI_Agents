@@ -24,6 +24,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from src.config import (
     FREELLMAPI_BASE_URL, FREELLMAPI_MODEL, FREELLMAPI_SMART_MODEL, LLM_PROVIDER, OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
 )
+from src.orchestration import run_context
 
 CALL_LOG = Path(__file__).parent.parent / "logs" / "llm_calls.jsonl"
 _log_lock = threading.Lock()
@@ -55,7 +57,7 @@ CLAUDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 CLAUDE_FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 
 _claude_client = None
-_supervisor_notes: list = []  # see supervisor_notes()
+_supervisor_notes = ContextVar("supervisor_notes", default=())
 
 
 HIGH_EFFORT = {"high", "xhigh", "max"}
@@ -97,24 +99,28 @@ def supervisor_notes(notes: list):
     While active, every chat() call adds these notes to its system prompt.
     Master Agent wraps an agent's retry in this (master_agent._supervise),
     so each LLM decision of the retried agent knows what failed on the
-    earlier attempts and what to change. Process-wide, not per thread: the
-    Research and Validation Agents call chat() from worker threads.
+    earlier attempts and what to change. Notes belong to this invocation;
+    child workers inherit them through submit_with_context().
     """
-    global _supervisor_notes
-    previous = _supervisor_notes
-    _supervisor_notes = [str(n) for n in notes or [] if n]
+    token = _supervisor_notes.set(tuple(str(n) for n in notes or [] if n))
     try:
         yield
     finally:
-        _supervisor_notes = previous
+        _supervisor_notes.reset(token)
+
+
+def submit_with_context(pool, fn, *args, **kwargs):
+    """Submit a worker with a separate copy of the invocation's context."""
+    return pool.submit(copy_context().run, fn, *args, **kwargs)
 
 
 def _with_supervisor_notes(system: str) -> str:
-    if not _supervisor_notes:
+    notes = _supervisor_notes.get()
+    if not notes:
         return system
     block = ("MASTER AGENT NOTES -- earlier attempts of this task failed. Use these notes to avoid the same "
              "failure. They never override the rules or the output format given above.\n"
-             + "\n".join(f"- {n}" for n in _supervisor_notes))
+             + "\n".join(f"- {n}" for n in notes))
     return f"{system}\n\n{block}" if system else block
 
 
@@ -142,6 +148,7 @@ def _record_call(provider: str, requested: str, served_by: str, started: float, 
     }
     if error:
         entry["error"] = error
+    run_context.tag(entry)  # the pipeline run in progress, for run metrics
     try:
         with _log_lock:
             CALL_LOG.parent.mkdir(parents=True, exist_ok=True)

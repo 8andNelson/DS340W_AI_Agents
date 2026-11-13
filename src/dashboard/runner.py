@@ -61,6 +61,8 @@ class RunError(Exception):
 
 
 def validate_topic(topic: str) -> str:
+    if not isinstance(topic, str):
+        raise RunError("Enter a research topic as text.")
     topic = " ".join((topic or "").split())
     if not topic:
         raise RunError("Enter a research topic first.")
@@ -108,7 +110,7 @@ class PipelineRunner:
                 self._log_handle = None
         return False
 
-    def start(self, topic: str, reset: bool = False) -> None:
+    def start(self, topic: str, reset: bool = False, parent_paper_input: Path | None = None) -> None:
         topic = validate_topic(topic)
         with self._lock:
             if self._poll_locked():
@@ -117,6 +119,13 @@ class PipelineRunner:
             args = list(self.command_prefix)
             if reset:
                 args.append("--reset")
+            if parent_paper_input is not None:
+                from src.paper_input import load_input, PaperInputError
+                try:
+                    load_input(parent_paper_input, topic)
+                except PaperInputError as error:
+                    raise RunError(str(error)) from error
+                args.extend(["--parent-paper-input", str(Path(parent_paper_input).resolve())])
             args.append(topic)
 
             env = dict(os.environ)

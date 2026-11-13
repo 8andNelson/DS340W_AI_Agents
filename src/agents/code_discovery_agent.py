@@ -77,7 +77,7 @@ def _scope_description(parent_paper: dict) -> str:
     if not parent_paper:
         return ""
     parts = [parent_paper.get("title", "")]
-    context = parent_paper.get("abstract") or parent_paper.get("methodology") or ""
+    context = parent_paper.get("abstract") or parent_paper.get("methodology") or parent_paper.get("scope_excerpt") or ""
     if context:
         parts.append(context[:400])
     return " -- ".join(p for p in parts if p)

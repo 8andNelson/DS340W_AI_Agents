@@ -9,17 +9,25 @@ could then read back as if it were real.
 import pytest
 import requests
 
-from src import llm
+from src import llm, memory
+from src.memory import scrub as memory_scrub
+from src.slack import slack_client
 
 from src.agents import (
     cleaning_agent, data_agent, master_agent, replication_agent,
 )
-from src.orchestration import code_discovery_cache, column_mapping, dataset_cache, run_store, state_manager
+from src.orchestration import (
+    code_discovery_cache, column_mapping, dataset_cache, run_context, run_store, state_manager,
+)
 from src.search import camoufox_fetch, page_fetch, paper_fulltext, serpapi_search, web_search
 
 
 @pytest.fixture(autouse=True)
 def isolate_persisted_files(tmp_path, monkeypatch):
+    # Tests must not post status messages or read a real team's channel.
+    # Slack-specific tests explicitly install their own token/mock client.
+    monkeypatch.setattr(slack_client, "SLACK_BOT_TOKEN", "")
+    monkeypatch.setattr(slack_client, "_client", None)
     logs = tmp_path / "logs"
     monkeypatch.setattr(master_agent, "LOG_FILE", logs / "master_agent_log.json")
     monkeypatch.setattr(master_agent, "REPORT_DIR", logs / "agent_reports")
@@ -48,6 +56,9 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "CALL_LOG", logs / "llm_calls.jsonl")
     monkeypatch.setattr(run_store, "DB_FILE", tmp_path / "database" / "project_runs.db")
     monkeypatch.setattr(run_store, "_project_git_commit", lambda: "test-commit")
+    monkeypatch.setattr(run_store, "_project_git_dirty", lambda: False)
+    # A run a test opened and never finished must not tag later tests' log lines.
+    monkeypatch.setattr(run_context, "_run", {})
     monkeypatch.setattr(master_agent, "ROUND_BACKUP_DIR", logs / "round_backups")
     # The Parent Paper's full text: no download (no open-access links) and
     # no reading of a real papers/parent/ cache, so agents fall back to the
@@ -62,3 +73,13 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     monkeypatch.setattr(web_search, "_failures", {name: 0 for name, _m in web_search.PROVIDERS})
     monkeypatch.setattr(web_search, "SEARCH_LOG", logs / "search_calls.jsonl")
     monkeypatch.setattr(page_fetch, "FETCH_LOG", logs / "page_fetch_calls.jsonl")
+    # Memory store: a temp SQLite file, never the real database/memory_local.db
+    # or a hosted store, whatever .env says; the scrubber does not read the real .env.
+    monkeypatch.setattr(memory, "MEMORY_BACKEND", "sqlite")
+    monkeypatch.setattr(memory, "LOCAL_DB", tmp_path / "database" / "memory_local.db")
+    monkeypatch.setattr(memory_scrub, "ENV_FILE", tmp_path / ".env")
+    memory_scrub._env_values.cache_clear()
+    memory.reset_client()
+    yield
+    memory.reset_client()
+    memory_scrub._env_values.cache_clear()

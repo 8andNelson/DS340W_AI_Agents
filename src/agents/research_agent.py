@@ -243,7 +243,8 @@ def run(structured_request: dict) -> list:
             except Exception as e:
                 print(f"  WARNING: Search failed for '{query}' - {e}")
                 continue
-            futures.append((query, pool.submit(_extract_papers_from_results, results, project_topic, query)))
+            futures.append((query, llm.submit_with_context(pool, _extract_papers_from_results,
+                                                         results, project_topic, query)))
 
         # Collect in query order so de-duplication is deterministic.
         extracted = []

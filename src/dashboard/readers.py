@@ -123,7 +123,8 @@ def latest_run(db_file: Path) -> dict | None:
             "SELECT agent, attempt, decision, report_text, recorded_at FROM stages "
             "WHERE run_id = ? ORDER BY id", (run["run_id"],),
         ).fetchall()
-        return {**dict(run), "stages": [dict(s) for s in stages]}
+        return {**dict(run), "stages": [dict(s) for s in stages],
+                "stage_timings": stage_timings(db_file, run["run_id"])}
     finally:
         conn.close()
 
@@ -150,6 +151,7 @@ def _parse_time(iso: str | None) -> datetime | None:
 
 def last_activity(run: dict) -> datetime | None:
     times = [_parse_time(s["recorded_at"]) for s in run.get("stages", [])] + [_parse_time(run.get("started_at"))]
+    times += [_parse_time(t.get("finished_at") or t["started_at"]) for t in run.get("stage_timings", [])]
     times = [t for t in times if t]
     return max(times) if times else None
 
@@ -162,53 +164,86 @@ def hours_since(moment: datetime | None) -> float | None:
     return (datetime.now(timezone.utc) - moment).total_seconds() / 3600
 
 
+def stage_timings(db_file: Path, run_id: str) -> list[dict]:
+    """Read invocation clocks without migrating or writing older run databases."""
+    conn = _connect_read_only(db_file)
+    if conn is None:
+        return []
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stage_timings'").fetchone():
+            return []
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM stage_timings WHERE run_id = ? ORDER BY started_at, invocation_id", (run_id,))]
+    finally:
+        conn.close()
+
+
 def agent_progress(run: dict | None, pipeline_order: list[str], console_text: str = "",
                    run_active: bool = False) -> dict:
     """
-    Per-agent status for one run, built only from what the pipeline already
-    records: each finished attempt is a row in the run database, and the
-    attempt now running is the last "[Master Agent] Running ..." console
-    line (when the dashboard has the console), else the next agent in
-    pipeline order after the last recorded attempt.
+    All active invocations, with their own starts and measured durations.
+    Legacy runs retain labeled estimates/inference when timing rows are absent.
     """
     if not run:
         return {}
     progress = {}
+    timings = run.get("stage_timings") or []
+    by_attempt = {(t["agent"], t["attempt"]): t for t in timings}
     previous_time = run.get("started_at")
     for stage in run.get("stages", []):
+        timing = by_attempt.get((stage["agent"], stage["attempt"]))
         progress[stage["agent"]] = {
             "status": _STATUS_BY_DECISION.get(stage["decision"], stage["decision"].lower()),
             "attempt": stage["attempt"], "max_attempts": None,
-            "started_at": previous_time, "finished_at": stage["recorded_at"],
+            "started_at": timing["started_at"] if timing else previous_time if not timings else None,
+            "finished_at": timing["finished_at"] if timing else stage["recorded_at"],
+            "duration_seconds": timing["duration_seconds"] if timing else None,
+            "timing_method": "invocation_monotonic" if timing else "legacy_estimate" if not timings else "unknown",
             "summary": _summary(stage["report_text"]),
         }
         previous_time = stage["recorded_at"]
+
+    if timings:
+        recorded = {(s["agent"], s["attempt"]) for s in run.get("stages", [])}
+        for timing in sorted(timings, key=lambda t: (t["attempt"], t["started_at"])):
+            name, attempt = timing["agent"], timing["attempt"]
+            if progress.get(name, {}).get("attempt", 0) > attempt:
+                continue
+            if (name, attempt) in recorded:
+                progress[name]["max_attempts"] = timing["max_attempts"]
+                continue
+            state = ("running" if timing["finished_at"] is None else "checking") if run_active else "interrupted"
+            progress[name] = {"status": state, "attempt": attempt, "max_attempts": timing["max_attempts"],
+                              "started_at": timing["started_at"], "finished_at": timing["finished_at"],
+                              "duration_seconds": timing["duration_seconds"], "timing_method": "invocation_monotonic",
+                              "summary": "Execution finished; awaiting supervisor decision." if state == "checking" else ""}
+        return progress
 
     if not run_active:
         return progress
 
     recorded = {(s["agent"], s["attempt"]) for s in run.get("stages", [])}
-    running = None
+    running = []
     matches = _RUNNING_LINE.findall(console_text or "")
     if matches:
-        name, attempt, max_attempts = matches[-1]
-        if (name, int(attempt)) not in recorded:
-            running = (name, int(attempt), int(max_attempts))
+        latest = {name: (int(attempt), int(max_attempts)) for name, attempt, max_attempts in matches}
+        running = [(name, attempt, maximum) for name, (attempt, maximum) in latest.items()
+                   if (name, attempt) not in recorded and progress.get(name, {}).get("attempt", 0) <= attempt]
     elif run.get("stages"):
         last = run["stages"][-1]
         if last["decision"] == "Retrying":
-            running = (last["agent"], last["attempt"] + 1, None)
+            running = [(last["agent"], last["attempt"] + 1, None)]
         elif last["decision"] == "Approved" and last["agent"] in pipeline_order:
             i = pipeline_order.index(last["agent"]) + 1
             if i < len(pipeline_order):
-                running = (pipeline_order[i], 1, None)
+                running = [(pipeline_order[i], 1, None)]
     elif pipeline_order:
-        running = (pipeline_order[0], 1, None)
+        running = [(pipeline_order[0], 1, None)]
 
-    if running:
-        name, attempt, max_attempts = running
+    for name, attempt, max_attempts in running:
         progress[name] = {"status": "running", "attempt": attempt, "max_attempts": max_attempts,
-                          "started_at": previous_time, "finished_at": None, "summary": ""}
+                          "started_at": None, "finished_at": None, "duration_seconds": None,
+                          "timing_method": "inferred", "summary": ""}
     return progress
 
 
@@ -221,7 +256,7 @@ def get_run(db_file: Path, run_id: str) -> dict | None:
     try:
         row = conn.execute("SELECT run_id, topic, started_at, finished_at, status, final_phase, parent_paper_title "
                            "FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-        return dict(row) if row else None
+        return {**dict(row), "stage_timings": stage_timings(db_file, run_id)} if row else None
     finally:
         conn.close()
 
@@ -288,14 +323,18 @@ def stage_attempts(db_file: Path, run_id: str) -> list[dict]:
         ).fetchall()
     finally:
         conn.close()
+    clocks = {(t["agent"], t["attempt"]): t for t in stage_timings(db_file, run_id)}
     attempts = []
     for row in rows:
         try:
             output = json.loads(row["output_json"]) if row["output_json"] else None
         except json.JSONDecodeError:
             output = None
+        timing = clocks.get((row["agent"], row["attempt"])) or {}
         attempts.append({"agent": row["agent"], "attempt": row["attempt"], "decision": row["decision"],
                          "report_text": row["report_text"] or "", "recorded_at": row["recorded_at"],
+                         "started_at": timing.get("started_at"), "finished_at": timing.get("finished_at"),
+                         "duration_seconds": timing.get("duration_seconds"),
                          "output": output})
     return attempts
 

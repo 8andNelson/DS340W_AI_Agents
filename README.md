@@ -62,6 +62,71 @@
 
   deactivate
 
+## Start modeling from a fixed Parent Paper
+
+On the dashboard Overview page, enter the topic and select **Start from my
+Parent Paper PDF**. Choose a text-based PDF (up to 50 MB), enter its printed
+title, and give the prediction-target keywords, such as `fraud`. Start the
+run normally. This skips Intake, Research, and paper selection and begins
+Data and Code Discovery in parallel. The supplied paper remains the Parent
+Paper throughout the run; Data, Replication, and Evaluation read its exact
+uploaded bytes. A missing or changed upload stops the stage instead of
+searching for a replacement paper. Scanned PDFs need OCR before upload.
+
+Reuse the same PDF, topic, title, and target for memory-on/off comparisons.
+The dashboard records a fixed input ID and PDF SHA-256. The PDF and input
+manifest live under `dashboard_files/parent_papers/` and are archived with
+each run. Papers and Documents can open the run's archived copy. The
+comparison tool groups supplied-paper runs by their exact input ID,
+including runs that crash before producing a final result. Dataset choices,
+splits, code, models, and resource limits still need to be controlled when
+testing modeling improvements. Supplying a paper selects it; it does not
+certify peer review or scientific validity.
+
+The saved input can also be reused from the command line:
+
+```powershell
+python run.py --parent-paper-input "dashboard_files/parent_papers/<input-id>.json" "machine learning for detecting credit card fraud"
+```
+
+## Agent handoffs and parallel work
+
+Agents return a list of requests from `handoff(result, context)`. Master
+Agent reviews each request, supervises retries, and schedules independent
+first-pass stages concurrently (up to three agents). After Parent Paper
+approval, Data and Code Discovery start together. Cleaning starts as soon
+as Data is approved; Replication waits for both Cleaning and Code Discovery.
+Matching requests from joining branches run once. Missing prerequisites
+wait for other requested work, and unresolved or conflicting requests halt
+the pipeline. Reruns execute serially to preserve the baseline's files.
+
+Retry notes are scoped to each invocation and explicitly inherited by
+Research and Validation workers. Stage reports, run records, and Slack
+start/finish messages still identify each agent independently. Project-state
+updates happen in the coordinator; Slack data-expansion requests wait until
+active branches finish before changing shared data files.
+
+## Agent execution timing
+
+Each agent attempt records its own invocation ID, UTC start/finish times,
+and elapsed seconds from a monotonic clock. Execution timing covers the
+agent call, including its internal workers, and stops when it returns or
+raises. Supervisor checks, reporting, artifact capture, and retry diagnosis
+are outside that duration; total run time includes this overhead.
+
+The dashboard shows every concurrent invocation, using the database even
+without console output. Finished execution is shown as Checking until the
+supervisor records its decision. An unfinished invocation in a stopped or
+crashed run is Interrupted, with an unknown final duration. Agent output
+details show the selected attempt's measured execution time.
+
+Metrics version 2 sums measured execution durations across each agent's
+attempts and reruns. Overlapping durations may sum to more than the whole
+run's elapsed time. Old metric versions remain unchanged. Historical
+completion-gap estimates are labeled and stored as `agent_seconds_estimate`;
+their `agent_seconds` is unknown. Missing finish records also stay unknown,
+so they cannot silently enter comparisons as zero or a peer's completion gap.
+
 ## Search and paper access
 
 Agents search through Brave first (Brave's own index), then SerpAPI

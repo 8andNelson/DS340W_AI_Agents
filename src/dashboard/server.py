@@ -35,10 +35,11 @@ from itertools import islice
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, request, send_file
+from src import paper_input
 
 from src.dashboard import editor, pdf_fetch, readers
 from src.dashboard.freellmapi import FreeLLMAPIManager
-from src.dashboard.runner import CONSOLE_DIR, PipelineRunner, RunError
+from src.dashboard.runner import CONSOLE_DIR, PipelineRunner, RunError, validate_topic
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 STATIC_DIR = Path(__file__).parent / "static"
@@ -218,7 +219,7 @@ def _resolve_run(runner: PipelineRunner) -> dict | None:
 
 
 def _public(run: dict | None) -> dict | None:
-    return {k: v for k, v in run.items() if k != "stages"} if run else None
+    return {k: v for k, v in run.items() if k not in ("stages", "stage_timings")} if run else None
 
 
 def _attempts(run: dict | None) -> list[dict]:
@@ -238,6 +239,10 @@ def _output(attempts: list[dict], agent: str):
 
 
 def _papers(attempts: list[dict]) -> tuple[list[dict], dict]:
+    supplied = _output(attempts, "Parent Paper Intake") or {}
+    if supplied:
+        parent = supplied.get("parent_paper") or {}
+        return [parent], parent
     validation = _output(attempts, "Validation Agent") or {}
     papers = validation.get("all") or _output(attempts, "Research Agent") or []
     return (papers if isinstance(papers, list) else []), (validation.get("recommended_parent_paper") or {})
@@ -374,6 +379,7 @@ def run_in_progress(runner: PipelineRunner) -> bool:
 
 def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager | None = None) -> Flask:
     app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
+    app.config["MAX_CONTENT_LENGTH"] = paper_input.MAX_PDF_BYTES + 1024 * 1024
     app.config["RUNNER"] = runner or PipelineRunner()
     app.config["FREELLMAPI"] = router or FreeLLMAPIManager()
 
@@ -384,6 +390,7 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
     @app.errorhandler(403)
     @app.errorhandler(404)
     @app.errorhandler(409)
+    @app.errorhandler(413)
     def _error(e):
         return jsonify({"error": getattr(e, "description", str(e))}), e.code
 
@@ -392,6 +399,21 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
         return send_file(STATIC_DIR / "index.html")
 
     # --- Running the pipeline ---
+
+    @app.post("/api/parent-paper")
+    def upload_parent_paper():
+        uploaded = request.files.get("pdf")
+        if uploaded is None or not (uploaded.filename or "").lower().endswith(".pdf"):
+            abort(400, "Choose a Parent Paper PDF.")
+        try:
+            topic = validate_topic(request.form.get("topic", ""))
+            _, manifest = paper_input.save_input(
+                REPO_ROOT / "dashboard_files" / "parent_papers",
+                uploaded.stream.read(paper_input.MAX_PDF_BYTES + 1), topic,
+                request.form.get("title", ""), request.form.get("target_terms", ""))
+        except (paper_input.PaperInputError, RunError) as error:
+            abort(400, str(error))
+        return jsonify({"parent_paper_id": manifest["input_fingerprint"], **manifest})
 
     @app.post("/api/run")
     def start_run():
@@ -410,8 +432,16 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
                        + ("It is starting now; try again when it shows Running." if router["busy"]
                           else "Select Start router first."))
         try:
-            runner.start(body.get("topic", ""), reset=bool(body.get("reset")))
-        except RunError as e:
+            options = {"reset": bool(body.get("reset"))}
+            if "parent_paper_id" in body:
+                key = body["parent_paper_id"]
+                if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key):
+                    abort(400, "Invalid Parent Paper input ID.")
+                path = REPO_ROOT / "dashboard_files" / "parent_papers" / f"{key}.json"
+                paper_input.load_input(path, validate_topic(body.get("topic", "")))
+                options["parent_paper_input"] = path
+            runner.start(body.get("topic", ""), **options)
+        except (RunError, paper_input.PaperInputError) as e:
             abort(409 if "already" in str(e) else 400, str(e))
         return jsonify(runner.info())
 
@@ -435,6 +465,11 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
         attempted = {s["agent"] for s in (run or {}).get("stages", [])}
         agents = [{**stage, "live": progress.get(stage["name"]), "has_output": stage["name"] in attempted}
                   for stage in PIPELINE]
+        if "Parent Paper Intake" in attempted:
+            agents = [{"name": "Parent Paper Intake", "phase": "MASTER_APPROVAL",
+                       "role": "Uses your fixed PDF and prediction target; paper discovery is skipped.",
+                       "live": progress.get("Parent Paper Intake"), "has_output": True},
+                      *[a for a in agents if a["name"] not in ("Intake Agent", "Research Agent", "Validation Agent")]]
         phase = ""
         if run and run["is_current"] and run.get("run_id"):
             state = readers.read_json(STATE_FILE, {})
@@ -521,10 +556,14 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
 
     @app.get("/api/papers")
     def papers():
-        papers_list, parent = _papers(_attempts(_resolve_run(current_runner())))
+        run = _resolve_run(current_runner())
+        papers_list, parent = _papers(_attempts(run))
+        artifacts = _artifacts(run)
         out = []
         for i, p in enumerate(papers_list):
             pdf = _paper_pdf_path(p)
+            supplied = next((a for a in artifacts if p.get("pdf_sha256") and
+                             a["sha256"] == p["pdf_sha256"] and a["original_path"].lower().endswith(".pdf")), None)
             out.append({
                 "index": i, "is_parent": bool(parent) and p.get("title") == parent.get("title"),
                 "title": p.get("title", ""), "authors": p.get("authors", []), "year": p.get("year"),
@@ -535,6 +574,9 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
                 "abstract": p.get("abstract", ""), "has_code": p.get("has_code"), "code_url": p.get("code_url", ""),
                 "parent_paper_score": p.get("parent_paper_score"),
                 "pdf_name": pdf.name if pdf.is_file() else "",
+                "pdf_view_url": f"/api/artifacts/{supplied['id']}/view" if supplied else "",
+                "pdf_download_url": f"/api/artifacts/{supplied['id']}/download" if supplied else "",
+                "input_fingerprint": p.get("input_fingerprint"), "selection_source": p.get("selection_source"),
             })
         return jsonify(out)
 
@@ -577,7 +619,8 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
         docs = []
         for a in _artifacts(run):
             if a["original_path"].lower().endswith(".pdf"):
-                docs.append({"name": Path(a["original_path"]).name, "origin": f"Produced by the {a['agent']}",
+                origin = "Supplied Parent Paper PDF" if a["agent"] == "Parent Paper Intake" else f"Produced by the {a['agent']}"
+                docs.append({"name": Path(a["original_path"]).name, "origin": origin,
                              "size_bytes": a["size_bytes"],
                              "view_url": f"/api/artifacts/{a['id']}/view",
                              "download_url": f"/api/artifacts/{a['id']}/download"})

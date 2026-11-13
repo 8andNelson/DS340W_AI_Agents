@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import shutil
 import sqlite3
@@ -113,9 +114,75 @@ def two_runs(repo):
 
 # --- The dashboard and the pipeline are separate programs ---
 
+def _upload_parent(client, title=None, content=None):
+    from tests.test_parent_paper_input import paper_pdf, TITLE, TOPIC
+    return client.post("/api/parent-paper", data={
+        "topic": TOPIC, "title": title or TITLE, "target_terms": "fraud",
+        "pdf": (io.BytesIO(content if content is not None else paper_pdf()), "parent.pdf"),
+    })
+
+
+def test_upload_parent_pdf_and_start_fixed_input(client, runner, repo, monkeypatch):
+    from tests.test_parent_paper_input import TOPIC
+    first = _upload_parent(client)
+    second = _upload_parent(client)
+    assert first.status_code == second.status_code == 200
+    key = first.json["parent_paper_id"]
+    assert key == second.json["parent_paper_id"]
+    calls = []
+    monkeypatch.setattr(runner, "start", lambda topic, **kwargs: calls.append((topic, kwargs)))
+    response = client.post("/api/run", json={"topic": TOPIC, "parent_paper_id": key})
+    assert response.status_code == 200
+    assert calls[0][0] == TOPIC
+    assert calls[0][1]["parent_paper_input"] == repo / "dashboard_files" / "parent_papers" / f"{key}.json"
+
+
+def test_bad_parent_upload_and_unsafe_id_do_not_start(client, runner, monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner, "start", lambda *a, **kw: calls.append(a))
+    assert _upload_parent(client, content=b"not a PDF").status_code == 400
+    assert _upload_parent(client, title="Different Paper").status_code == 400
+    assert client.post("/api/run", json={"topic": "fraud", "parent_paper_id": "../../secret"}).status_code == 400
+    assert client.post("/api/run", json={"topic": "fraud", "parent_paper_id": "a" * 64}).status_code == 400
+    assert not calls
+
+
+def test_supplied_pdf_is_shown_from_its_run_archive(client, repo):
+    from src import paper_input
+    from tests.test_parent_paper_input import TOPIC, TITLE
+    response = _upload_parent(client)
+    key = response.json["parent_paper_id"]
+    path = repo / "dashboard_files" / "parent_papers" / f"{key}.json"
+    manifest, pdf = paper_input.load_input(path)
+    run_id = run_store.start_run(TOPIC)
+    parent = {"title": TITLE, "selection_source": "user_pdf", "pdf_path": str(pdf),
+              "pdf_sha256": manifest["pdf_sha256"], "input_fingerprint": key,
+              "validation_status": "USER_SUPPLIED"}
+    run_store.record_stage(run_id, "Parent Paper Intake", 1, "Approved", {"parent_paper": parent}, "User supplied PDF")
+    run_store.finish_run(run_id, "halted", parent_paper=parent)
+    paper = client.get(f"/api/papers?run={run_id}").json[0]
+    assert paper["is_parent"] and paper["input_fingerprint"] == key
+    pdf.write_bytes(b"changed later")
+    archived = client.get(paper["pdf_view_url"])
+    assert archived.status_code == 200 and archived.data.startswith(b"%PDF")
+    assert client.get(f"/api/status?run={run_id}").json["agents"][0]["name"] == "Parent Paper Intake"
+
+
+def test_runner_passes_fixed_input_as_separate_cli_arguments(tmp_path):
+    from tests.test_parent_paper_input import saved_input, TOPIC
+    manifest, _ = saved_input(tmp_path)
+    prefix = _stand_in(tmp_path, "import json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+    runner = PipelineRunner(command_prefix=prefix, console_log=tmp_path / "console.log")
+    runner.start(TOPIC, parent_paper_input=manifest)
+    _wait_until_done(runner)
+    arguments = json.loads(runner.console_text().strip())
+    assert arguments == ["--parent-paper-input", str(manifest.resolve()), TOPIC]
+
+
 def test_dashboard_imports_no_pipeline_module():
     code = ("import sys, src.dashboard.server; "
-            "print([m for m in sys.modules if m.startswith('src.') and not m.startswith('src.dashboard')])")
+            "print([m for m in sys.modules if m.startswith('src.') and not m.startswith('src.dashboard') "
+            "and m != 'src.paper_input'])")
     out = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "[]"
 
@@ -199,7 +266,9 @@ def test_run_keeps_going_after_the_dashboard_exits(tmp_path):
     assert not marker.exists()  # the dashboard is gone, the run is still going
 
     deadline = time.time() + 15
-    while not marker.exists() and time.time() < deadline:
+    while time.time() < deadline:
+        if marker.exists() and marker.read_text() == "done":
+            break
         time.sleep(0.1)
     assert marker.read_text() == "done"
 
@@ -399,6 +468,83 @@ def test_progress_of_finished_run_has_no_running_agent():
     progress = readers.agent_progress(_run([("Intake Agent", 1, "Rejected")]), ORDER, run_active=False)
     assert list(progress) == ["Intake Agent"]
     assert progress["Intake Agent"]["status"] == "rejected"
+
+
+def test_dashboard_tracks_parallel_clocks_without_console_and_stops_only_finished_agent(client):
+    run_id = run_store.start_run("parallel dashboard")
+    data = run_store.start_stage_attempt(run_id, "Data Agent", 1, 5)
+    code = run_store.start_stage_attempt(run_id, "Code Discovery Agent", 1, 5)
+    def agents():
+        response = client.get("/api/status").json
+        return {a["name"]: a["live"] for a in response["agents"]}
+    live = agents()
+    assert live["Data Agent"]["status"] == live["Code Discovery Agent"]["status"] == "running"
+    assert live["Data Agent"]["started_at"] and live["Code Discovery Agent"]["started_at"]
+    run_store.finish_stage_attempt(data, 180)
+    live = agents()
+    assert live["Data Agent"]["status"] == "checking"
+    assert live["Data Agent"]["duration_seconds"] == 180
+    assert live["Code Discovery Agent"]["status"] == "running"
+    run_store.record_stage(run_id, "Data Agent", 1, "Approved", {}, "data done")
+    live = agents()
+    assert live["Data Agent"]["status"] == "approved"
+    assert live["Code Discovery Agent"]["status"] == "running"
+    run_store.finish_run(run_id, "crashed")
+    live = agents()
+    assert live["Code Discovery Agent"]["status"] == "interrupted"
+    assert live["Code Discovery Agent"]["duration_seconds"] is None
+    assert live["Data Agent"]["duration_seconds"] == 180
+    detail = client.get("/api/run-detail").json["attempts"][0]
+    assert detail["duration_seconds"] == 180 and detail["finished_at"]
+
+
+def test_latest_retry_replaces_only_its_own_progress(client):
+    run_id = run_store.start_run("retry dashboard")
+    first = run_store.start_stage_attempt(run_id, "Data Agent", 1, 5)
+    code = run_store.start_stage_attempt(run_id, "Code Discovery Agent", 1, 5)
+    run_store.finish_stage_attempt(first, 3)
+    run_store.record_stage(run_id, "Data Agent", 1, "Retrying", {})
+    second = run_store.start_stage_attempt(run_id, "Data Agent", 2, 5)
+    live = {a["name"]: a["live"] for a in client.get("/api/status").json["agents"]}
+    assert live["Data Agent"]["status"] == "running" and live["Data Agent"]["attempt"] == 2
+    assert live["Data Agent"]["duration_seconds"] is None
+    assert live["Code Discovery Agent"]["status"] == "running"
+
+
+def test_past_run_uses_its_own_durations(client):
+    past = run_store.start_run("past timed run")
+    clock = run_store.start_stage_attempt(past, "Data Agent", 1, 5)
+    run_store.finish_stage_attempt(clock, 123)
+    run_store.record_stage(past, "Data Agent", 1, "Approved", {})
+    run_store.finish_run(past, "success")
+    current = run_store.start_run("current run")
+    _set_times(current, "2099-01-01T00:00:00+00:00")
+    response = client.get(f"/api/status?run={past}").json
+    assert not response["active"]
+    live = next(a["live"] for a in response["agents"] if a["name"] == "Data Agent")
+    assert live["duration_seconds"] == 123 and live["timing_method"] == "invocation_monotonic"
+
+
+def test_legacy_database_is_read_without_adding_a_timing_table(repo):
+    run_id = run_store.start_run("legacy database")
+    run_store.record_stage(run_id, "Data Agent", 1, "Approved", {})
+    with sqlite3.connect(run_store.DB_FILE) as conn:
+        conn.execute("DROP TABLE stage_timings")
+    run = readers.latest_run(run_store.DB_FILE)
+    assert run["stage_timings"] == []
+    progress = readers.agent_progress(run, ORDER)
+    assert progress["Data Agent"]["timing_method"] == "legacy_estimate"
+    with sqlite3.connect(run_store.DB_FILE) as conn:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name='stage_timings'").fetchone() is None
+
+
+def test_console_fallback_retains_all_unfinished_agents():
+    run = _run([("Intake Agent", 1, "Approved")])
+    console = ("[Master Agent] Running Data Agent (attempt 1/5)...\n"
+               "[Master Agent] Running Code Discovery Agent (attempt 1/5)...\n")
+    progress = readers.agent_progress(run, ORDER, console, run_active=True)
+    assert progress["Data Agent"]["status"] == progress["Code Discovery Agent"]["status"] == "running"
+    assert progress["Data Agent"]["started_at"] is None
 
 
 # --- Paper PDFs (saved in the dashboard's own folder) ---

@@ -1,4 +1,5 @@
 import sys
+import argparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -211,12 +212,16 @@ def _print_experiment_summary(result: dict) -> None:
 def main():
     print(BANNER)
 
-    if "--reset" in sys.argv:
+    parser = argparse.ArgumentParser(description="Run the supervised research pipeline.")
+    parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--parent-paper-input", help="Saved Parent Paper input manifest from the dashboard")
+    parser.add_argument("topic", nargs="*")
+    options = parser.parse_args()
+    if options.reset:
         reset_state()
         print("\nProject state reset.\n")
-        sys.argv.remove("--reset")
 
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    args = options.topic
     if args:
         topic = " ".join(args)
     else:
@@ -228,12 +233,14 @@ def main():
         sys.exit(1)
 
     print(f"\nTopic: {topic}")
-    print("\n[Master Agent] Starting supervised pipeline "
-          "(Intake -> Research -> Validation & Selection -> Data Agent -> Cleaning Agent -> "
-          "Code Discovery Agent -> Replication Agent -> Evaluation Agent, then reruns requested by the "
-          "Evaluation and Experiment Agents)...")
-
-    result = master_agent.run_pipeline(topic)
+    if options.parent_paper_input:
+        print("\nStarting from the supplied Parent Paper; literature discovery and selection are skipped.")
+        result = master_agent.run_pipeline(topic, parent_paper_input=options.parent_paper_input)
+    else:
+        print("\n[Master Agent] Starting supervised pipeline "
+              "(Intake -> Research -> Validation & Selection -> parallel Data / Code Discovery; "
+              "Data -> Cleaning; both branches -> Replication -> Evaluation, then supervised reruns)...")
+        result = master_agent.run_pipeline(topic)
 
     if not result["success"]:
         print(f"\nPipeline halted at phase {result['phase']}. Master Agent could not get a passing "
@@ -247,12 +254,16 @@ def main():
         print(f"  ML Task:  {s.get('ml_task', 'N/A')}")
         print(f"  Keywords: {', '.join(s.get('keywords', []))}")
 
-    if result["papers"]:
+    if result["papers"] and result.get("input_mode") != "parent_pdf":
         _print_papers(result["papers"])
 
     validation_result = result["validation_result"]
-    _print_validation_summary(validation_result)
-    _print_parent_paper_recommendation(validation_result)
+    if result.get("input_mode") == "parent_pdf":
+        print(f"\n--- User-supplied Parent Paper: {result['parent_paper']['title']} ---")
+        print(f"  Fixed input: {result['input_fingerprint']}")
+    else:
+        _print_validation_summary(validation_result)
+        _print_parent_paper_recommendation(validation_result)
 
     if result["dataset_result"]:
         _print_dataset_summary(result["dataset_result"])

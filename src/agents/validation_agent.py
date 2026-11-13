@@ -677,7 +677,7 @@ def run(papers: list) -> dict:
     print(f"[Validation Agent] Layer 3: LLM independent assessment...")
     batches = [pending[i: i + ASSESSMENT_BATCH] for i in range(0, len(pending), ASSESSMENT_BATCH)]
     with ThreadPoolExecutor(max_workers=LLM_WORKERS) as pool:
-        futures = [pool.submit(_llm_validate_batch, batch) for batch in batches]
+        futures = [llm.submit_with_context(pool, _llm_validate_batch, batch) for batch in batches]
     for batch, future in zip(batches, futures):
         try:
             future.result()
@@ -732,9 +732,10 @@ def run(papers: list) -> dict:
 
 
 def handoff(result: dict, context: dict) -> list:
-    """The Validation Agent's request to Master Agent when it finishes: run
-    the Data Agent for the recommended Parent Paper."""
+    """Request independent data and implementation searches for the Parent Paper."""
     parent = (result or {}).get("recommended_parent_paper") or {}
     return [handoff_request("validation_agent", "Data Agent",
                             {"parent_paper": parent, "ranked_pool": (result or {}).get("ranked_pool") or []},
-                            f"Parent Paper recommended: '{parent.get('title', '')}'. Its dataset is needed next.")]
+                            f"Parent Paper recommended: '{parent.get('title', '')}'. Its dataset is needed next."),
+            handoff_request("validation_agent", "Code Discovery Agent", {},
+                            "Find the Parent Paper's implementation alongside dataset discovery.")]

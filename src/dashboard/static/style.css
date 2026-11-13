@@ -397,6 +397,12 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .tk-com { color: var(--tk-com); font-style: italic; }
 .tk-def { color: var(--tk-def); font-weight: 600; }
 
+.paper-toggle { margin: 14px 0; }
+#parent-pdf-fields { margin: 12px 0 18px; }
+#parent-pdf-fields input { max-width: 100%; }
+#parent-pdf-fields input[type="text"] { display: block; width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: inherit; }
+#parent-pdf-fields .label { margin-top: 12px; }
+
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 @media (max-width: 900px) {
