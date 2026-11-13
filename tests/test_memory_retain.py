@@ -251,3 +251,88 @@ def test_retain_never_raises(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(retain, "load_run", lambda run_id: 1 / 0)
     assert retain.retain_run("x")["skipped"].startswith("error: ZeroDivisionError")
     assert "could not retain run x" in capsys.readouterr().out
+
+
+# --- Rules version 2 ---
+
+def _run_with(monkeypatch, agent, output, intake=INTAKE):
+    run_id = run_store.start_run("credit card fraud detection")
+    monkeypatch.setattr(master_agent, "_current_run_id", run_id)
+    _supervise("Intake Agent", [intake])
+    _supervise(agent, [output])
+    run_store.finish_run(run_id, "halted", "EXPERIMENTATION", result={"structured": intake, "reruns": []})
+    return next(m for m in _memories(run_id, agent=agent))
+
+
+def test_cleaning_without_a_label_column_is_a_warning(monkeypatch):
+    m = _run_with(monkeypatch, "Cleaning Agent", {"label_column": "", "datasets_attempted": 1, "datasets_merged": 1})
+    assert (m["kind"], m["polarity"]) == ("failure", "negative")
+    assert m["quality_reasons"]["specific"]["reason"] == "failure signature: cleaning:no_label_column"
+
+
+def test_cleaning_with_a_label_column_is_a_solution(monkeypatch):
+    m = _run_with(monkeypatch, "Cleaning Agent", {"label_column": "isfraud", "datasets_attempted": 2,
+                                                  "datasets_merged": 1})
+    assert (m["kind"], m["polarity"]) == ("solution", "positive")
+    assert m["quality_reasons"]["outcome"] == {"value": 0.5, "reason": "1 of 2 dataset(s) merged"}
+
+
+def test_no_repository_found_is_neutral(monkeypatch):
+    m = _run_with(monkeypatch, "Code Discovery Agent", {"status": "NOT_FOUND", "repository": None})
+    assert (m["kind"], m["polarity"]) == ("solution", "neutral")
+
+
+def test_an_evaluation_that_compared_nothing_scores_at_most_half(monkeypatch):
+    inconclusive = {"status": "INCONCLUSIVE", "metrics": [{"metric": "f1", "reproduced_value": 0.7,
+                                                           "difference_points": None}],
+                    "review": {"static_findings": [], "findings": []}, "decision": {"action": "accept"}}
+    m = _run_with(monkeypatch, "Evaluation Agent", inconclusive)
+    assert m["polarity"] == "neutral"  # nothing was validated, so nothing to reuse
+    assert m["quality_reasons"]["outcome"]["value"] == 0.5
+    assert m["quality_reasons"]["outcome"]["reason"].startswith("nothing was compared")
+
+
+@pytest.mark.parametrize("overall,kind,polarity", [("IMPROVED", "solution", "positive"),
+                                                   ("NEUTRAL", "solution", "neutral"),
+                                                   ("REGRESSED", "failure", "negative")])
+def test_earlier_controlled_experiments_are_scored_by_their_result(monkeypatch, overall, kind, polarity):
+    m = _run_with(monkeypatch, "Experiment Agent", {
+        "category": "alternative_model", "what_changed": "Swapped RandomForest for HistGradientBoosting.",
+        "hypothesis": "boosting fits the imbalance better", "overall": overall, "comparison": []})
+    assert (m["kind"], m["polarity"]) == (kind, polarity)
+    assert m["title"] == "Experiment (alternative_model): Swapped RandomForest for HistGradientBoosting."
+    assert m["quality_reasons"]["rules_version"] == retain.RULES_VERSION
+
+
+# --- Rescoring under a new rules version ---
+
+def test_rescore_supersedes_changed_memories_and_retires_dropped_ones(tmp_path, monkeypatch):
+    run_id = make_run(tmp_path, monkeypatch)
+    before = {m["id"]: m for m in _memories(run_id)}
+    script_old = next(m for m in before.values() if m["agent"] == "Replication Agent" and m["kind"] == "solution")
+    intake_old = next(m for m in before.values() if m["agent"] == "Intake Agent")
+
+    # A new rules version: the script's score changes, and Intake memories are no longer made.
+    original_outcome, original_build = retain._outcome, retain.build_memories
+    monkeypatch.setattr(retain, "RULES_VERSION", retain.RULES_VERSION + 1)
+    monkeypatch.setattr(retain, "_outcome", lambda run, stage, lin: (
+        ((0.1, "new rule"), (1.0, "ok")) if stage["agent"] == "Replication Agent" else original_outcome(run, stage, lin)))
+    monkeypatch.setattr(retain, "build_memories", lambda run: (
+        [m for m in original_build(run)[0] if m["agent"] != "Intake Agent"], "test"))
+
+    dry = retain.rescore_run(run_id, dry_run=True)
+    assert len(dry["superseded"]) == 1 and len(dry["retired"]) == 1 and len(_memories(run_id)) == len(before)
+
+    report = retain.rescore_run(run_id)
+    assert report["unchanged"] == len(before) - 2
+    assert memory.get_memory(script_old["id"])["state"] == "superseded"
+    new = memory.get_memory(memory.get_memory(script_old["id"])["superseded_by"])
+    assert new["state"] == "active" and new["quality_reasons"]["outcome"]["reason"] == "new rule"
+    assert memory.get_memory(intake_old["id"])["state"] == "retired"
+    reasons = {c["new_state"]: c["reason"] for c in memory.client().local.rows("memory_state_changes")}
+    assert reasons["superseded"].startswith("rescored with retain rules version")
+    assert retain.rescore_run(run_id)["new"] == []  # applied once
+
+
+def test_rescore_needs_a_retained_run():
+    assert retain.rescore_run("never-retained")["skipped"] == "not retained yet (use retain)"

@@ -1296,13 +1296,21 @@ Deliverables (status 2026-11-13):
 - [x] `retain_run` at run end: in `run_store.finish_run`, after
       `run_metrics.compute` (not in `master_agent.py`), once per run
       (`memory_runs`).
-- [ ] Backfill of the recorded runs (12 now), with trust labels and a
-      report (10): **dry run done** (`backfill --dry-run`,
-      `reports/memory_backfill_dry_run.md`: 83 memories, every positive
-      one `kept`, 4 `low_trust` from two review-paper runs). The write to
-      the team store waits for the person's check below. Older runs'
-      lineage is derived from their stages; it is `unknown` where a rerun
-      may have replaced a result.
+- [x] Backfill of the recorded runs (12), with trust labels and a report
+      (10): written to the team's Neon store on 2026-11-13 (83 memories,
+      every positive one `kept`, 4 `low_trust` from two review-paper runs;
+      `reports/memory_backfill.md`). Older runs' lineage is derived from
+      their stages; it is `unknown` where a rerun may have replaced a result.
+- [x] Rules version 2 (`retain.RULES_VERSION`), after the review of the
+      backfill found weak cases ranked high: cleaning with no label column
+      for the target is a warning; "no repository found" is neutral; an
+      evaluation that compared no metric has outcome 0.5 and is neutral; the
+      earlier controlled experiments are scored by their own result (a
+      regression is a warning). `python -m src.memory rescore` applies a new
+      rules version without editing any memory: a changed memory gets a new
+      id and the old one is set to `superseded` (with `superseded_by`); one
+      the rules no longer make is set to `retired`. Applied on 2026-11-13:
+      18 memories replaced, each change recorded.
 
 Done when:
 - The backfill report lists the memories of each run with their score

@@ -48,6 +48,12 @@ from src.orchestration import run_store
 from src.orchestration.handoff import AGENT_PHASE
 
 NAMESPACE = uuid.UUID("6f3b2a4e-6d1c-4c8e-9b1a-3e7f0d2c5a91")  # deterministic memory ids per run and rule
+# Version of the rules below. 2 (2026-11-13): cleaning with no label column is
+# a warning; "no repository found" is neutral; an evaluation that compared
+# nothing has outcome 0.5 and is neutral; the earlier controlled experiments are scored by
+# their result (a regression is a warning). rescore_run applies a new version
+# to runs retained under an older one.
+RULES_VERSION = 2
 RERUNNABLE = ("Data Agent", "Cleaning Agent", "Code Discovery Agent", "Replication Agent", "Evaluation Agent")
 NON_BASELINE_AGENTS = ("Experiment Agent",)
 REPRODUCTION_AGENTS = ("Validation Agent", "Replication Agent", "Evaluation Agent", "Experiment Agent")
@@ -354,14 +360,34 @@ def _outcome(run: dict, stage: dict, lineage: str) -> tuple[tuple, tuple]:
                 return (1.0, f"{len(static) + len(verified)} real finding(s), and the fix was kept "
                              "(validity is success even if the gap grew)"), valid
             return (0.5, f"{len(static) + len(verified)} real finding(s); no kept fix recorded"), valid
+        if _gap(output) is None:
+            # Rules v2: an evaluation that compared nothing has not shown it judged well.
+            return (0.5, "nothing was compared: no metric stated by both the paper and the run "
+                         f"(status {output.get('status')})"), valid
         decision = (output.get("decision") or {}).get("action")
         if decision == "accept":
             note = f"; {len(unverified)} unverified claim(s) not acted on" if unverified else ""
-            return (1.0, "accepted a baseline with no verified defect" + note), valid
+            return (1.0, "accepted a measured baseline with no verified defect" + note), valid
         return (0.5, f"decision {decision or 'unknown'} without a verified finding"), valid
     if agent == "Experiment Agent":
+        if "what_changed" in output:  # the earlier design: one controlled experiment
+            result = str(output.get("overall") or "").upper()
+            value = {"IMPROVED": 1.0, "NEUTRAL": 0.5, "REGRESSED": 0.0}.get(result, 0.5)
+            return (value, f"controlled experiment result: {result or 'unknown'}"), valid
         return (0.5, "its effect is in the rerun decision memories"), valid
     return (0.5, "no outcome rule for this agent"), valid
+
+
+def _approved_warning(run: dict, agent: str, output: dict) -> tuple[str, str] | None:
+    """(cause, failure signature) when an approved output itself shows a
+    problem worth warning about (rules v2), else None."""
+    if agent == "Cleaning Agent" and (run["intake"] or {}).get("target_terms") and not output.get("label_column"):
+        return ("the merged data has no label column for the target "
+                f"{(run['intake'] or {}).get('target_terms')}", "cleaning:no_label_column")
+    if agent == "Experiment Agent" and str(output.get("overall") or "").upper() == "REGRESSED":
+        return (f"this change made the results worse: {_short(output.get('what_changed'), 200)}",
+                f"experiment:{output.get('category') or 'unknown'}:regressed")
+    return None
 
 
 def _approved_memory(run: dict, stage: dict, lineage: tuple, script: str = None) -> dict | None:
@@ -389,8 +415,25 @@ def _approved_memory(run: dict, stage: dict, lineage: tuple, script: str = None)
                        + summary, content=content, feats=feats, lineage=lin, trust=trust,
                        quality=quality, reasons={**reasons, "lineage": lin_reason, "trust_note": trust_reason},
                        outcome={"decision": "Approved", "lineage": lin, "leakage": leak})
+    warning = _approved_warning(run, agent, output)
+    if warning:
+        # Rules v2: an approved output that shows a problem is a warning, not a solution.
+        cause, signature = warning
+        quality, reasons = ranking.warning_usefulness(cause, None, signature, trust)
+        return _memory(run, stage, "approved", kind="failure", polarity="negative", agent=agent, title=title,
+                       summary=f"{cause}. {summary}", content=content, feats=feats, lineage=lin, trust=trust,
+                       quality=quality, reasons={**reasons, "lineage": lin_reason, "trust_note": trust_reason},
+                       outcome={"decision": "Approved", "lineage": lin, "problem": cause})
     quality, reasons = ranking.base_quality(outcome, approval, validity, downstream, trust)
-    polarity = "positive" if lin == "kept" else "neutral"
+    # Only a kept attempt is positive -- and only when it is something to reuse:
+    # "no repository found" is a fact about the paper (rules v2), and a
+    # controlled experiment is positive only when it improved the results.
+    reusable = not (agent == "Code Discovery Agent" and output.get("status") != "FOUND")
+    if agent == "Evaluation Agent" and _gap(output) is None and not _leakage(output):
+        reusable = False  # compared nothing and found nothing: nothing was validated
+    if agent == "Experiment Agent" and "what_changed" in output:
+        reusable = str(output.get("overall") or "").upper() == "IMPROVED"
+    polarity = "positive" if lin == "kept" and reusable else "neutral"
     return _memory(run, stage, "approved", kind="solution", polarity=polarity, agent=agent, title=title,
                    summary=summary + ("" if lin == "kept" else f" Lineage: {lin} ({lin_reason})."),
                    content=content, feats=feats, lineage=lin, trust=trust, quality=quality,
@@ -463,6 +506,13 @@ def _describe(run: dict, stage: dict, output: dict, script: str, paper: str) -> 
         return (_json(keep), f"Evaluation: {output.get('status')}, decision {(output.get('decision') or {}).get('action')}",
                 f"Overall {output.get('status')}; gap {gap if gap is not None else 'not measurable'}; "
                 f"{len(review.get('static_findings') or [])} leakage finding(s).")
+    if agent == "Experiment Agent" and "what_changed" in output:
+        # The earlier design ran one controlled experiment against the baseline.
+        keep = {k: output.get(k) for k in ("category", "hypothesis", "what_changed", "baseline_metrics",
+                                           "experiment_metrics", "comparison", "overall")}
+        return (_json(keep), f"Experiment ({output.get('category')}): {_short(output.get('what_changed'), 120)}",
+                f"Changed: {_short(output.get('what_changed'), 300)} Result: {output.get('overall')} against "
+                f"the baseline. Hypothesis: {_short(output.get('hypothesis'), 200)}")
     if agent == "Experiment Agent":
         decision = output.get("decision") or {}
         keep = {k: output.get(k) for k in ("analysis", "hypotheses", "decision", "gap_points")}
@@ -472,18 +522,27 @@ def _describe(run: dict, stage: dict, output: dict, script: str, paper: str) -> 
     return _json(output), f"{agent} output", f"Approved output of the {agent}."
 
 
+def memory_id(rule_key: str, version: int = None) -> str:
+    """The deterministic id of a memory under one rules version (version 1
+    ids have no suffix, so memories stored before versions keep theirs)."""
+    version = version or RULES_VERSION
+    return str(uuid.uuid5(NAMESPACE, rule_key if version == 1 else f"{rule_key}|rules{version}"))
+
+
 def _memory(run: dict, stage: dict | None, rule: str, **m) -> dict:
     key = f"{run['run_id']}|{rule}|{stage['id'] if stage else m.get('key', '')}|{m.get('key', '')}"
     feats = m.pop("feats")
+    m["reasons"] = {**m["reasons"], "rules_version": RULES_VERSION}
     return {
-        "id": str(uuid.uuid5(NAMESPACE, key)), "kind": m["kind"], "agent": m["agent"], "run_id": run["run_id"],
+        "id": memory_id(key), "kind": m["kind"], "agent": m["agent"], "run_id": run["run_id"],
         "stage_attempt": stage["attempt"] if stage else None,
         "invocation_id": stage.get("invocation_id") if stage else None,
         "polarity": m["polarity"], "title": _short(_portable(m["title"]), 200),
         "summary": _portable(m["summary"]), "content": _portable(m.get("content")),
         "task": feats, "tags": features.tags(feats), "outcome": _portable(m.get("outcome") or {}),
         "evidence": {"run_id": run["run_id"], "stage_id": stage["id"] if stage else None,
-                     "invocation_id": stage.get("invocation_id") if stage else None, "rule": rule},
+                     "invocation_id": stage.get("invocation_id") if stage else None, "rule": rule,
+                     "rule_key": key, "rules_version": RULES_VERSION},
         "quality": m["quality"], "quality_reasons": m["reasons"], "trust": m["trust"],
         "lineage": m.get("lineage") or "unknown",
     }
@@ -667,7 +726,8 @@ def retain_run(run_id: str, dry_run: bool = False) -> dict:
         rows = [memory.build_memory(m) for m in memories]
         shas = sorted({r["content_sha"] for r in rows if r["content_sha"]})
         existing = {}
-        for found in (c.fetch(content_shas=shas, states=None, limit=10_000) if shas else []):
+        # Duplicates are counted against memories still in use, not superseded or retired ones.
+        for found in (c.fetch(content_shas=shas, states=("active", "candidate"), limit=10_000) if shas else []):
             if found.get("run_id") != run_id:
                 existing.setdefault((found["agent"], found["content_sha"]), found)
         seen = set()
@@ -691,6 +751,95 @@ def retain_run(run_id: str, dry_run: bool = False) -> dict:
         report["skipped"] = f"error: {type(e).__name__}: {e}"
         print(f"[Memory] WARNING: could not retain run {run_id}: {e}")
     return report
+
+
+def _same(old: dict, new: dict) -> bool:
+    return all(old.get(k) == new.get(k) for k in ("kind", "polarity", "title", "summary", "content_sha")) and \
+        round(old.get("quality") or 0, 4) == round(new.get("quality") or 0, 4)
+
+
+def rescore_run(run_id: str, dry_run: bool = False) -> dict:
+    """Apply the current RULES_VERSION to a run retained under older rules.
+    Memories are never edited: a changed memory is written under the new
+    version's id and the old one is set to "superseded" (superseded_by the
+    new one); an old memory the rules no longer make is set to "retired".
+    Unchanged memories stay as they are. Every state change has a reason.
+    Uses the local copy of the run's memories (the machine that retained it)."""
+    from src import memory
+    report = {"run_id": run_id, "skipped": None, "new": [], "superseded": [], "retired": [], "unchanged": 0}
+    try:
+        c = memory.client()
+        if c is None or c.backend == "off":
+            report["skipped"] = "memory is off"
+            return report
+        if not c.local.rows("memory_runs", run_id=run_id):
+            report["skipped"] = "not retained yet (use retain)"
+            return report
+        run = load_run(run_id)
+        if run is None:
+            report["skipped"] = "no such run"
+            return report
+        existing = {m["id"]: m for m in c.local.rows("memories", run_id=run_id)}
+        memories, _ = build_memories(run)
+        matched, seen = set(), set()
+        reason = f"rescored with retain rules version {RULES_VERSION}"
+        for row in (memory.build_memory(m) for m in memories):
+            if (row["agent"], row["content_sha"]) in seen and row["content_sha"]:
+                continue
+            seen.add((row["agent"], row["content_sha"]))
+            if row["id"] in existing:  # already under the current version
+                matched.add(row["id"])
+                report["unchanged"] += 1
+                continue
+            older = [existing[i] for i in (memory_id(row["evidence"]["rule_key"], v) for v in range(RULES_VERSION - 1, 0, -1))
+                     if i in existing]
+            old = older[0] if older else None
+            if old:
+                matched.add(old["id"])
+                if old["state"] in ("active", "candidate") and _same(old, row):
+                    report["unchanged"] += 1
+                    continue
+            report["new"].append(row)
+            if old and old["state"] in ("active", "candidate"):
+                report["superseded"].append({"old": old, "new": row})
+            if not dry_run:
+                memory.put_memory(row)
+                if old and old["state"] in ("active", "candidate"):
+                    memory.set_state(old["id"], "superseded", reason, superseded_by=row["id"])
+        for old in existing.values():
+            if old["id"] not in matched and old["state"] in ("active", "candidate"):
+                report["retired"].append(old)
+                if not dry_run:
+                    memory.set_state(old["id"], "retired", f"{reason}: these rules no longer make this memory")
+    except Exception as e:
+        report["skipped"] = f"error: {type(e).__name__}: {e}"
+        print(f"[Memory] WARNING: could not rescore run {run_id}: {e}")
+    return report
+
+
+def format_rescore_report(reports: list, dry_run: bool) -> str:
+    lines = [f"# Memory rescore report, rules version {RULES_VERSION} "
+             f"({'dry run: nothing written' if dry_run else 'written'})", "", f"Made {_now()}.", ""]
+    for r in reports:
+        lines.append(f"## Run {r['run_id']}")
+        if r["skipped"]:
+            lines += [f"Skipped: {r['skipped']}", ""]
+            continue
+        lines.append(f"{r['unchanged']} unchanged, {len(r['superseded'])} replaced, "
+                     f"{len(r['new']) - len(r['superseded'])} new, {len(r['retired'])} retired.")
+        for s in r["superseded"]:
+            o, n = s["old"], s["new"]
+            lines.append(f"- {n['agent']}: {o['kind']}/{o['polarity']} {o['quality']:.2f} -> "
+                         f"{n['kind']}/{n['polarity']} {n['quality']:.2f}: {n['title']}")
+            if n["quality_reasons"].get("outcome"):
+                lines.append(f"    - outcome: {n['quality_reasons']['outcome']['reason']}")
+        for n in r["new"]:
+            if not any(s["new"] is n for s in r["superseded"]):
+                lines.append(f"- new {n['agent']}: {n['kind']}/{n['polarity']} {n['quality']:.2f}: {n['title']}")
+        for o in r["retired"]:
+            lines.append(f"- retired {o['agent']}: {o['title']}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def backfill(dry_run: bool = False) -> list:

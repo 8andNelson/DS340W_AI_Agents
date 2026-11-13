@@ -13,6 +13,8 @@ python -m src.memory <command>
   retain <run_id> [--dry-run]       make the memories of one finished run
   backfill [--dry-run] [--report F]  retain every recorded run not yet retained;
                                      --dry-run writes nothing, only the report
+  rescore [--run R] [--dry-run]      apply the current retain rules to runs retained under
+                                     older ones (old memories superseded or retired, never edited)
   review [--agent A] [--n 10]        best and worst memories per agent (plan 10 gate)
   approve <memory_id> <reason>       candidate -> active
   quarantine <memory_id> <reason>    stop a memory from being recalled (never deleted)
@@ -43,6 +45,10 @@ def _main(argv: list) -> int:
     backfill_cmd = sub.add_parser("backfill")
     backfill_cmd.add_argument("--dry-run", action="store_true")
     backfill_cmd.add_argument("--report", help="write the report to this file (default: reports/memory_backfill_<time>.md)")
+    rescore = sub.add_parser("rescore")
+    rescore.add_argument("--run", help="one run (default: every run this machine retained)")
+    rescore.add_argument("--dry-run", action="store_true")
+    rescore.add_argument("--report")
     review = sub.add_parser("review")
     review.add_argument("--agent")
     review.add_argument("--n", type=int, default=10)
@@ -67,6 +73,22 @@ def _main(argv: list) -> int:
         for r in reports:
             print(f"  {r['run_id']}: " + (r["skipped"] or f"{len(r['written'])} memories, "
                                           f"{len(r['duplicates'])} duplicate(s) ({r['lineage']})"))
+        print(("Dry run: nothing written. " if args.dry_run else "") + f"Report: {path}")
+        return 0
+    if args.command == "rescore":
+        from datetime import datetime
+        from pathlib import Path
+        from src.memory import retain
+
+        local = memory.client().local
+        run_ids = [args.run] if args.run else sorted(r["run_id"] for r in (local.rows("memory_runs") if local else []))
+        reports = [retain.rescore_run(run_id, dry_run=args.dry_run) for run_id in run_ids]
+        path = Path(args.report or memory.REPO_ROOT / "reports" / f"memory_rescore_{datetime.now():%Y%m%d_%H%M%S}.md")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(retain.format_rescore_report(reports, args.dry_run), encoding="utf-8")
+        for r in reports:
+            print(f"  {r['run_id']}: " + (r["skipped"] or f"{r['unchanged']} unchanged, {len(r['superseded'])} "
+                                          f"replaced, {len(r['retired'])} retired"))
         print(("Dry run: nothing written. " if args.dry_run else "") + f"Report: {path}")
         return 0
     if args.command == "review":
