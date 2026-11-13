@@ -1,0 +1,808 @@
+{
+ "status": "draft",
+ "labelled_by": "drafted by Claude on 2026-11-13 from the memories' contents; needs a person's check (plan 9.6)",
+ "bank": "the team's Neon store, rules version 2, 83 active memories",
+ "notes": [
+  "acceptable: right to show (one in the pack is a hit); harmful: must never be shown (here: scripts whose lineage is unknown); critical_warnings: must be shown as warnings; expect_none: nothing should be shown.",
+  "Queries copy the shape each recall point sends: generation = model family, Parent Paper and its words; repair and diagnosis = the failure text, from which the failure signature is made."
+ ],
+ "cases": [
+  {
+   "id": "gen-xgb",
+   "description": "XGBoost paper: the kept XGBoost scripts",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "xgboost"
+    ],
+    "text": "Credit card fraud detection with XGBoost and SMOTE"
+   },
+   "acceptable": [
+    "8ad32f77-5fd1-5149-aaa7-549a2d3a0b6a",
+    "6d481203-5e29-53ef-9e84-422511a7d96b"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-xgb-binary",
+   "description": "XGBoost, binary task",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "xgboost"
+    ],
+    "text": "fraud classification",
+    "task_type": "binary"
+   },
+   "acceptable": [
+    "8ad32f77-5fd1-5149-aaa7-549a2d3a0b6a",
+    "6d481203-5e29-53ef-9e84-422511a7d96b"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-rf",
+   "description": "Random forest paper",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "random_forest"
+    ],
+    "text": "Random forest for imbalanced credit card fraud"
+   },
+   "acceptable": [
+    "5757135f-06cb-5487-b85b-99e900af3bed",
+    "6d481203-5e29-53ef-9e84-422511a7d96b",
+    "56f273e2-a26a-549c-92b0-f5af396ed09e"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-lr",
+   "description": "Logistic regression paper",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "logistic_regression"
+    ],
+    "text": "logistic regression baseline fraud"
+   },
+   "acceptable": [
+    "56f273e2-a26a-549c-92b0-f5af396ed09e"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-nb",
+   "description": "Naive Bayes paper",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "naive_bayes"
+    ],
+    "text": "Gaussian naive Bayes fraud detection"
+   },
+   "acceptable": [
+    "6d481203-5e29-53ef-9e84-422511a7d96b",
+    "56f273e2-a26a-549c-92b0-f5af396ed09e"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-mlp",
+   "description": "MLP paper",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "mlp"
+    ],
+    "text": "multilayer perceptron fraud detection"
+   },
+   "acceptable": [
+    "56f273e2-a26a-549c-92b0-f5af396ed09e"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-rf-xgb",
+   "description": "Paper comparing random forest and XGBoost",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "random_forest",
+     "xgboost"
+    ],
+    "text": "comparison of random forest and XGBoost"
+   },
+   "acceptable": [
+    "6d481203-5e29-53ef-9e84-422511a7d96b",
+    "5757135f-06cb-5487-b85b-99e900af3bed",
+    "8ad32f77-5fd1-5149-aaa7-549a2d3a0b6a"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-same-paper-rf",
+   "description": "Same Parent Paper as a kept random forest script",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "random_forest"
+    ],
+    "text": "Handling imbalanced data for credit card fraudulent detection",
+    "parent_paper": {
+     "doi": "10.1007/978-3-031-73068-9_18"
+    }
+   },
+   "acceptable": [
+    "5757135f-06cb-5487-b85b-99e900af3bed"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-same-paper-xgb",
+   "description": "Same Parent Paper as a kept XGBoost script",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "xgboost"
+    ],
+    "text": "Comparative analysis of machine learning algorithms and data balancing techniques",
+    "parent_paper": {
+     "doi": "10.1016/j.procs.2024.10.294"
+    }
+   },
+   "acceptable": [
+    "8ad32f77-5fd1-5149-aaa7-549a2d3a0b6a"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-same-paper-ensemble",
+   "description": "Same Parent Paper as the kept ensemble script",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "naive_bayes",
+     "random_forest",
+     "xgboost"
+    ],
+    "text": "Robust detection of credit card fraud by optimized supervised models",
+    "parent_paper": {
+     "doi": "10.1109/access.2024.3380823"
+    }
+   },
+   "acceptable": [
+    "6d481203-5e29-53ef-9e84-422511a7d96b"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-same-paper-multi",
+   "description": "Same Parent Paper as the logistic regression / MLP script",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "logistic_regression",
+     "mlp"
+    ],
+    "text": "fraud detection with several classifiers",
+    "parent_paper": {
+     "doi": "10.1007/978-3-032-14197-2_31"
+    }
+   },
+   "acceptable": [
+    "56f273e2-a26a-549c-92b0-f5af396ed09e"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "gen-lightgbm",
+   "description": "LightGBM: no script of that family exists",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "lightgbm"
+    ],
+    "text": "LightGBM gradient boosting fraud"
+   },
+   "acceptable": [],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": true
+  },
+  {
+   "id": "gen-lstm-regression",
+   "description": "LSTM regression: unrelated task",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "neural_network"
+    ],
+    "text": "LSTM time series forecasting",
+    "task_type": "regression"
+   },
+   "acceptable": [],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": true
+  },
+  {
+   "id": "gen-cnn-ct",
+   "description": "CNN on lung CT images: unrelated task",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "neural_network"
+    ],
+    "text": "convolutional neural network pulmonary nodule CT"
+   },
+   "acceptable": [],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": true
+  },
+  {
+   "id": "gen-svm",
+   "description": "SVM paper: no SVM script exists",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [
+     "svm"
+    ],
+    "text": "support vector machine classifier"
+   },
+   "acceptable": [],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": true
+  },
+  {
+   "id": "gen-unknown-family",
+   "description": "Paper whose model family is not known: only the paper's words",
+   "recall_point": "Replication Agent: generate",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent"
+   ],
+   "query": {
+    "model_family": [],
+    "text": "credit card fraud detection reconstructed baseline random forest"
+   },
+   "acceptable": [
+    "5757135f-06cb-5487-b85b-99e900af3bed",
+    "6d481203-5e29-53ef-9e84-422511a7d96b",
+    "56f273e2-a26a-549c-92b0-f5af396ed09e"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "rep-blocked-generate",
+   "description": "The LLM could not write a script: the same failure, and its fix",
+   "recall_point": "Replication Agent: repair",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "failure": "status BLOCKED: LLM could not generate a baseline script from the paper.",
+   "query": {},
+   "acceptable": [
+    "444b4a73-2e1e-5bb1-bf26-2b7dab476be6",
+    "3f04ef9e-ede9-5b19-a7d7-6d3ed74cd77b",
+    "a8e91e1c-f130-512f-9686-10ca0d4910a3"
+   ],
+   "critical_warnings": [
+    "444b4a73-2e1e-5bb1-bf26-2b7dab476be6"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "rep-blocked-revise",
+   "description": "The LLM could not revise the script",
+   "recall_point": "Replication Agent: repair",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "failure": "status BLOCKED: LLM could not revise the baseline script.",
+   "query": {},
+   "acceptable": [
+    "5a2fa56d-9429-546f-8c66-2ab3efffde26",
+    "1391ee76-54f4-5224-b4da-d3401d18060f"
+   ],
+   "critical_warnings": [
+    "5a2fa56d-9429-546f-8c66-2ab3efffde26"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "rep-winerror-5",
+   "description": "Windows access denied while cleaning a cloned repository",
+   "recall_point": "Replication Agent: repair",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "failure": "PermissionError: [WinError 5] Access is denied: 'C:\\x\\repo\\.git\\objects\\pack\\pack-1.idx'",
+   "query": {},
+   "acceptable": [
+    "4135f8ba-0568-51fd-b412-7f26f6c265d7"
+   ],
+   "critical_warnings": [
+    "4135f8ba-0568-51fd-b412-7f26f6c265d7"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "rep-winerror-32",
+   "description": "Another WinError number with the same words",
+   "recall_point": "Replication Agent: repair",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "failure": "[WinError 32] Access is denied: 'C:\\other\\path\\file.pack'",
+   "query": {},
+   "acceptable": [
+    "4135f8ba-0568-51fd-b412-7f26f6c265d7"
+   ],
+   "critical_warnings": [],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "rep-no-dependency-file",
+   "description": "Cloned repository with no requirements file",
+   "recall_point": "Replication Agent: repair",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "failure": "status BLOCKED: No recognized dependency file found; skipping install.",
+   "query": {},
+   "acceptable": [
+    "a2630342-eda9-537b-b3f0-37587962ac8a"
+   ],
+   "critical_warnings": [
+    "a2630342-eda9-537b-b3f0-37587962ac8a"
+   ],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "rep-keyerror",
+   "description": "KeyError on a label column: no such case recorded",
+   "recall_point": "Replication Agent: repair",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "failure": "Traceback (most recent call last):\nKeyError: 'Class'",
+   "query": {},
+   "acceptable": [],
+   "critical_warnings": [],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": true
+  },
+  {
+   "id": "rep-valueerror",
+   "description": "ValueError converting strings: no such case recorded",
+   "recall_point": "Replication Agent: repair",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "failure": "ValueError: could not convert string to float: 'abc'",
+   "query": {},
+   "acceptable": [],
+   "critical_warnings": [],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": true
+  },
+  {
+   "id": "rep-timeout",
+   "description": "Script timed out: no such case recorded",
+   "recall_point": "Replication Agent: repair",
+   "agent": "Replication Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "failure": "subprocess.TimeoutExpired: Command '['python', 'train.py']' timed out after 1200 seconds",
+   "query": {},
+   "acceptable": [],
+   "critical_warnings": [],
+   "harmful": [
+    "4aecdd3f-9757-5226-8e34-db2044278f79",
+    "66771a0a-0ed1-5ec6-ba77-7df72c404d05",
+    "ab12234d-fe10-5504-b565-8be7a2b1a4b5"
+   ],
+   "expect_none": true
+  },
+  {
+   "id": "diag-data-own-dataset",
+   "description": "Data Agent could not find the paper's own dataset",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Data Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "status NOT_FOUND: The Parent Paper's own dataset ('not stated') could not be found, downloaded, or did not fit the target; searching other sources for a substitute.",
+   "query": {},
+   "acceptable": [
+    "b6c55fe2-a215-5775-bad9-2410ee91ccec",
+    "ffd6f606-bb4e-5018-a540-d56826953015",
+    "906dbf9b-76e9-53fb-ac70-c903b2067d5e",
+    "b5fe871e-99f2-5a24-a17a-456b121365e5",
+    "a7ecb568-035d-5b7c-b851-343a3ef9de78",
+    "76432c39-e6d6-58ac-b726-1333b44287c8"
+   ],
+   "critical_warnings": [],
+   "harmful": [
+    "0fee9050-62af-5ecf-b0ee-59bcf93a36e3"
+   ],
+   "expect_none": false
+  },
+  {
+   "id": "diag-data-own-dataset-other-name",
+   "description": "Same failure, another dataset name",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Data Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "status NOT_FOUND: The Parent Paper's own dataset ('PaySim mobile money') could not be found, downloaded, or did not fit the target; searching other sources for a substitute.",
+   "query": {},
+   "acceptable": [
+    "b6c55fe2-a215-5775-bad9-2410ee91ccec",
+    "ffd6f606-bb4e-5018-a540-d56826953015",
+    "906dbf9b-76e9-53fb-ac70-c903b2067d5e",
+    "b5fe871e-99f2-5a24-a17a-456b121365e5",
+    "a7ecb568-035d-5b7c-b851-343a3ef9de78",
+    "76432c39-e6d6-58ac-b726-1333b44287c8"
+   ],
+   "critical_warnings": [],
+   "harmful": [],
+   "expect_none": false
+  },
+  {
+   "id": "diag-data-stated-dataset",
+   "description": "Data Agent could not verify the paper's stated dataset",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Data Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "status NOT_FOUND: Parent Paper's stated dataset ('IEEE-CIS Fraud Detection') could not be verified, was not in scope, or has fewer than 1 entries.",
+   "query": {},
+   "acceptable": [
+    "a67565d7-789c-5909-8e2d-3b395e72afff",
+    "4b7eaed7-f1bd-50e7-a827-4a9a5262df2b"
+   ],
+   "critical_warnings": [],
+   "harmful": [],
+   "expect_none": false
+  },
+  {
+   "id": "diag-replication-generate",
+   "description": "Replication Agent could not generate a script",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "status BLOCKED: LLM could not generate a baseline script from the paper.",
+   "query": {},
+   "acceptable": [
+    "444b4a73-2e1e-5bb1-bf26-2b7dab476be6",
+    "3f04ef9e-ede9-5b19-a7d7-6d3ed74cd77b",
+    "a8e91e1c-f130-512f-9686-10ca0d4910a3"
+   ],
+   "critical_warnings": [
+    "444b4a73-2e1e-5bb1-bf26-2b7dab476be6"
+   ],
+   "harmful": [],
+   "expect_none": false
+  },
+  {
+   "id": "diag-replication-revise",
+   "description": "Replication Agent could not revise its script",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Replication Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "status BLOCKED: LLM could not revise the baseline script.",
+   "query": {},
+   "acceptable": [
+    "5a2fa56d-9429-546f-8c66-2ab3efffde26",
+    "1391ee76-54f4-5224-b4da-d3401d18060f"
+   ],
+   "critical_warnings": [],
+   "harmful": [],
+   "expect_none": false
+  },
+  {
+   "id": "diag-intake-router-down",
+   "description": "Intake Agent: the local LLM router refused the connection",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Intake Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "HTTPConnectionPool(host='localhost', port=3001): Max retries exceeded with url: /v1/chat/completions (Caused by NewConnectionError(\"Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it\"))",
+   "query": {},
+   "acceptable": [
+    "768e3917-5510-5bc6-8e92-fd1e8ccdc918"
+   ],
+   "critical_warnings": [
+    "768e3917-5510-5bc6-8e92-fd1e8ccdc918"
+   ],
+   "harmful": [],
+   "expect_none": false
+  },
+  {
+   "id": "diag-research-few-papers",
+   "description": "Research Agent found too few papers (its stored failure has no error or check text, only the diagnosis)",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Research Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "Research Agent: only 2 qualifying papers were found; at least 5 are required.",
+   "query": {},
+   "acceptable": [
+    "0fee9050-62af-5ecf-b0ee-59bcf93a36e3",
+    "6cf3cdd6-9f62-5919-a64e-b6252ae827c4"
+   ],
+   "critical_warnings": [],
+   "harmful": [],
+   "expect_none": false
+  },
+  {
+   "id": "diag-validation-none",
+   "description": "Validation Agent failure: nothing recorded",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Validation Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "No qualifying Parent Paper: every candidate failed the peer-review check.",
+   "query": {},
+   "acceptable": [],
+   "critical_warnings": [],
+   "harmful": [],
+   "expect_none": true
+  },
+  {
+   "id": "diag-evaluation-none",
+   "description": "Evaluation Agent failure: nothing recorded",
+   "recall_point": "Master Agent: diagnose",
+   "agent": "Master Agent",
+   "search_agents": [
+    "Evaluation Agent",
+    "Master Agent"
+   ],
+   "kinds": [
+    "failure",
+    "decision"
+   ],
+   "failure": "Evaluation Agent raised an exception: ZeroDivisionError: division by zero",
+   "query": {},
+   "acceptable": [],
+   "critical_warnings": [],
+   "harmful": [],
+   "expect_none": true
+  }
+ ]
+}

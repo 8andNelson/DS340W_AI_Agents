@@ -235,7 +235,7 @@ def start_run(topic: str, llm_provider: str = "") -> str | None:
                 (run_id, topic, _now(), llm_provider, _project_git_commit()),
             )
         run_context.set_run(run_id, git_dirty=_project_git_dirty(), python_version=platform.python_version(),
-                            os=platform.platform())
+                            os=platform.platform(), **_memory_snapshot())
         return run_id
     except sqlite3.Error as e:
         _warn("start a run record", e)
@@ -364,6 +364,14 @@ def finish_run(run_id: str | None, status: str, final_phase: str = "",
         events.run_finished(run_id, status)
     except Exception as e:
         _warn(f"record the end of run {run_id} in the memory store", e)
+    # Turn the run's records into memories (src/memory/retain.py; not with
+    # MEMORY_MODE read or off); fail-soft. Before the metrics, so they can
+    # count the memories this run made.
+    try:
+        from src.memory import retain
+        retain.retain_run(run_id)
+    except Exception as e:
+        _warn(f"retain the memories of run {run_id}", e)
     # Measure the run (success, halted or crashed) from what was just recorded.
     # Fail-soft: `python -m src.orchestration.run_metrics compute <run_id>`
     # can make the same measurements later.
@@ -372,14 +380,26 @@ def finish_run(run_id: str | None, status: str, final_phase: str = "",
         run_metrics.compute(run_id)
     except Exception as e:
         _warn(f"compute the metrics of run {run_id}", e)
-    # Turn the run's records into memories (src/memory/retain.py); fail-soft.
-    try:
-        from src.memory import retain
-        retain.retain_run(run_id)
-    except Exception as e:
-        _warn(f"retain the memories of run {run_id}", e)
     run_context.clear(run_id)
     _sync_memory()
+
+
+def _memory_snapshot() -> dict:
+    """The memory this run can see: memories created before now (recall's
+    snapshot) and how many are active per agent. Fail-soft: {} on error."""
+    try:
+        from src import memory
+        from src.config import MEMORY_MODE
+        info = {"memory_snapshot": _now(), "memory_mode": MEMORY_MODE, "memory_backend": memory.backend_name()}
+        if MEMORY_MODE in ("read", "read_write") and memory.backend_name() != "off":
+            sizes = {}
+            for m in memory.find_memories(states=("active",), limit=100_000):
+                sizes[m["agent"]] = sizes.get(m["agent"], 0) + 1
+            info["memory_bank_size"] = sizes
+        return info
+    except Exception as e:
+        _warn("read the memory bank at the start of the run", e)
+        return {}
 
 
 def _sync_memory() -> None:

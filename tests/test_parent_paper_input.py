@@ -5,7 +5,7 @@ import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
 
-from src import paper_input
+from src import config, paper_input
 from src.agents import master_agent
 from src.orchestration import run_metrics, run_store
 from src.search import paper_fulltext
@@ -124,7 +124,7 @@ def test_metrics_group_by_exact_input_across_memory_modes(tmp_path, monkeypatch)
     path, manifest = saved_input(tmp_path)
     conditions = []
     for mode in ("off", "read_write"):
-        monkeypatch.setattr(run_metrics, "MEMORY_MODE", mode)
+        monkeypatch.setattr(config, "MEMORY_MODE", mode)  # read when the run starts
         run_id = run_store.start_run(TOPIC)
         ctx = master_agent._supplied_parent_context(TOPIC, path)
         # Same archived intake record used for a crash before a final result exists.
@@ -136,3 +136,4 @@ def test_metrics_group_by_exact_input_across_memory_modes(tmp_path, monkeypatch)
     assert conditions[0]["comparison_group"] == conditions[1]["comparison_group"] == f"parent_pdf:{manifest['input_fingerprint']}"
     assert conditions[0]["parent_paper_title"] == TITLE
     assert run_metrics._task(conditions[0]) == run_metrics._task(conditions[1])
+    assert [c["memory_mode"] for c in conditions] == ["off", "read_write"]

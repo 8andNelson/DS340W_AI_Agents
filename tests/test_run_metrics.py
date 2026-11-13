@@ -93,7 +93,7 @@ def test_legacy_agent_estimates_are_separate_and_old_metric_versions_are_preserv
     assert _value(old_display, "agent_seconds_estimate", "Data Agent") == 99
     run_store.finish_run(run_id, "halted")
     conditions, metrics = _metrics(run_id)
-    assert conditions["metrics_version"] == 2
+    assert conditions["metrics_version"] == run_metrics.METRICS_VERSION
     assert conditions["timing_method"] == "legacy_completion_gaps"
     assert _value(metrics, "agent_seconds", "Data Agent") is None
     assert _value(metrics, "agent_seconds_estimate", "Data Agent") is not None
@@ -181,7 +181,8 @@ def test_finished_run_is_measured_with_all_metric_groups(script_dir, monkeypatch
     assert json.loads(conditions["served_models"]) == {"groq/llama": 2}
     assert json.loads(conditions["log_matching"]) == {"llm": "time_span", "search": "run_id",
                                                      "page_fetch": "run_id", "master_log": "time_span"}
-    assert conditions["memory_mode"] == "pre_memory" and conditions["memory_exposure"] == "none"
+    assert conditions["memory_mode"] == "read_write" and conditions["memory_exposure"] == "none"
+    assert conditions["memory_bank_snapshot"] and json.loads(conditions["memory_bank_size"]) == {}
     assert conditions["python_version"] and conditions["os"]
     # Result quality
     assert _value(metrics, "run_status") == "success"
@@ -227,10 +228,11 @@ def test_finished_run_is_measured_with_all_metric_groups(script_dir, monkeypatch
     assert _value(metrics, "page_fetches") == 1 and _value(metrics, "browser_fetches") == 1
     assert _value(metrics, "run_seconds") >= 0
     assert ("Data Agent", "agent_seconds") in metrics
-    # Memory use: recorded as absent, never left out
+    # Memory use: measured, with the reason when none was supplied; later milestones' metrics stay NULL
     assert _value(metrics, "memory_exposure") == "none"
-    assert _value(metrics, "memories_used") is None
-    assert "not implemented" in metrics[("run", "memories_used")]["missing_reason"]
+    assert _value(metrics, "memory_exposure_reason") == "no recall point was reached"
+    assert _value(metrics, "memories_used") == 0 and _value(metrics, "recall_precision") is None
+    assert "milestone M6" in metrics[("run", "memories_helped")]["missing_reason"]
 
 
 def test_crashed_run_keeps_unknown_values_unknown():

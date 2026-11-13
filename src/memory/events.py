@@ -82,14 +82,17 @@ def _record(event_type: str, run_id: str | None, **fields) -> str | None:
 # --- Events (called by Master Agent and the run store) ---
 
 def attempt(run_id, invocation_id, agent: str, attempt_no: int, decision: str,
-            failed_checks: list = None, error: str = None) -> str | None:
+            failed_checks: list = None, error: str = None, memory: dict = None) -> str | None:
     """One supervised agent attempt and Master Agent's decision on it
-    (Approved / Retrying / Rejected)."""
+    (Approved / Retrying / Rejected); memory: the attempt's memory use
+    (recalls, cases shown and used, requests), when it recalled any."""
     payload = {}
     if failed_checks:
         payload["failed_checks"] = [_short(c) for c in failed_checks][:20]
     if error:
         payload["error"] = _short(error)
+    if memory:
+        payload["memory"] = memory
     return _record("attempt", run_id, invocation_id=invocation_id, agent=agent, attempt=attempt_no,
                    decision=decision, payload=payload or None)
 

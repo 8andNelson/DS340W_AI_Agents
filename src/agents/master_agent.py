@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.memory import events
-from src.orchestration import run_store
+from src.orchestration import run_context, run_store
 from src.slack import slack_client, message_formatter
 
 MIN_QUALIFYING = 5
@@ -673,8 +673,13 @@ def _diagnose(agent_name: str, attempt: int, failure: str, report_text: str, ear
         "with at most 5 short instructions."
     )
     failure_line = " ".join(failure.split())[-FAILURE_NOTE_CHARS:]
+    # Past cases: earlier failures of this agent and Master Agent diagnoses
+    # with the same failure signature, and whether the retry then passed.
+    from src.memory import recall
+    past = recall.context_for("Master Agent", {}, text=failure[-1500:], search_agents=[agent_name, "Master Agent"],
+                              kinds=("failure", "decision"), failure=failure)
     try:
-        answer = llm.parse_json(llm.chat(prompt, timeout=120, agent="master_agent"), default={}) or {}
+        answer = llm.parse_json(llm.chat(prompt, timeout=120, agent="master_agent", memory=past), default={}) or {}
     except Exception as e:  # a failed diagnosis must not stop the retry
         answer = {"cause": f"Master Agent could not diagnose this failure ({type(e).__name__}: {e})."}
     cause = str(answer.get("cause") or "").strip() or "No cause identified."
@@ -723,9 +728,11 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
 
         invocation_id = None
         error = None
+        inv = run_context.start_invocation(agent_name, attempt)  # memory use is recorded per attempt
         try:
             with llm.supervisor_notes(notes), \
                     run_store.stage_timer(_current_run_id, agent_name, attempt, last) as invocation_id:
+                inv["invocation_id"] = invocation_id
                 output = run_fn()
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
@@ -759,7 +766,9 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
                 _append_log([approval])
                 with _stage_record_lock:
                     run_store.record_stage(_current_run_id, agent_name, attempt, "Approved", output, report_text)
-                events.attempt(_current_run_id, invocation_id, agent_name, attempt, "Approved")
+                events.attempt(_current_run_id, invocation_id, agent_name, attempt, "Approved",
+                               memory=_memory_check(agent_name, inv))
+                run_context.end_invocation()
                 return output, []
             failure = "\n".join(b["issue"] for b in blockers)
 
@@ -776,7 +785,8 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             with _stage_record_lock:
                 run_store.record_stage(_current_run_id, agent_name, attempt, "Retrying", output, report_text)
             events.attempt(_current_run_id, invocation_id, agent_name, attempt, "Retrying",
-                           failed_checks=[b["issue"] for b in blockers], error=error)
+                           failed_checks=[b["issue"] for b in blockers], error=error,
+                           memory=_memory_check(agent_name, inv))
             retry_note = _log_entry(
                 "Correction", agent_name,
                 f"{agent_name} failed attempt {attempt}. Diagnosis: {diagnosis['cause']} "
@@ -792,7 +802,8 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             with _stage_record_lock:
                 run_store.record_stage(_current_run_id, agent_name, attempt, "Rejected", output, report_text)
             events.attempt(_current_run_id, invocation_id, agent_name, attempt, "Rejected",
-                           failed_checks=[b["issue"] for b in blockers], error=error)
+                           failed_checks=[b["issue"] for b in blockers], error=error,
+                           memory=_memory_check(agent_name, inv))
             final = _log_entry(
                 "Correction", agent_name,
                 f"{agent_name} still failing after {max_attempts} error(s), each diagnosed and retried. "
@@ -803,7 +814,26 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             _print_entry(final)
             _append_log([final])
 
+    run_context.end_invocation()
     return output, blockers
+
+
+def _memory_check(agent_name: str, inv: dict) -> dict | None:
+    """Master Agent's check of an attempt's memory use: past cases the agent
+    named but was never shown were dropped by the recall code; here they are
+    logged as a Correction so the audit trail shows it. Returns the attempt's
+    memory summary for its event (None when no recall happened)."""
+    used = inv["memory"]
+    if not used["recalls"] and not used["shown"]:
+        return None
+    if used["invalid_refs"]:
+        entry = _log_entry("Correction", agent_name,
+                           f"{agent_name} named past case(s) {', '.join(used['invalid_refs'])} that it was not shown "
+                           f"(attempt {inv['attempt']}).", "Ignored",
+                           "Only past cases that were shown count as used.")
+        _print_entry(entry)
+        _append_log([entry])
+    return {**used, "shown": list(used["shown"]), "used": list(used["used"])}
 
 
 def _max_ts(a: str | None, b: str | None) -> str | None:

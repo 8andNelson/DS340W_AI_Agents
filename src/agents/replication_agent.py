@@ -526,6 +526,18 @@ def _parse_generation(content: str) -> dict:
     }
 
 
+def _memory_context(parent_paper: dict, cleaning_result: dict = None, text: str = "", failure: str = None):
+    """Past cases for one of this agent's LLM calls (src/memory/recall.py):
+    good and bad baseline scripts for the same model family and task, and --
+    with a failure -- earlier failures and Master Agent diagnoses with the
+    same failure signature. None when agents do not use memory."""
+    from src.memory import features, recall
+    task = features.task_features({"parent_paper": parent_paper or {}, "cleaning": cleaning_result,
+                                   "replication": {"source": "reconstructed"}}, "Replication Agent")
+    agents = ["Replication Agent", "Master Agent"] if failure else ["Replication Agent"]
+    return recall.context_for("Replication Agent", task, text=text, search_agents=agents, failure=failure)
+
+
 def _revise_baseline_script(code: str, instructions: list, parent_paper: dict, paper: dict,
                             dataset_profile: str) -> dict:
     """One LLM call fixing the defects an Evaluation Agent review found in
@@ -566,7 +578,8 @@ Then the full revised script:
 <the script>
 ```"""
     try:
-        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent")
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent",
+                           memory=_memory_context(parent_paper, text=" ".join(instructions or [])))
     except Exception as e:
         print(f"[Replication Agent] Revision call failed: {e}")
         return {}
@@ -603,7 +616,10 @@ Then the full script:
 ```"""
 
     try:
-        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent")
+        context = _memory_context(parent_paper, cleaning_result,
+                                  text=f"{parent_paper.get('title', '')} {parent_paper.get('methodology', '')}")
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent",
+                           memory=context)
     except Exception as e:
         print(f"[Replication Agent] Script generation call failed: {e}")
         return {}
@@ -644,7 +660,8 @@ Respond with the full fixed script in one fenced block and nothing else:
 ```"""
 
     try:
-        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent")
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent",
+                           memory=_memory_context(parent_paper, text=(stderr or "")[-1500:], failure=stderr))
     except Exception as e:
         print(f"[Replication Agent] Repair call failed: {e}")
         return ""

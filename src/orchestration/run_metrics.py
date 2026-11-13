@@ -43,17 +43,21 @@ from src.config import MEMORY_BACKEND, MEMORY_CONTRIBUTOR
 from src.orchestration import run_context, run_store
 from src.orchestration.handoff import AGENT_PHASE
 
-METRICS_VERSION = 2
+# 3: memory use is measured (agents recall from milestone M5): memory mode,
+# actual exposure, cases shown and used, requests, prompt size, memories made.
+METRICS_VERSION = 3
 
 # A run still marked "running" with no recorded activity for this long is
 # measured as crashed (its process ended without closing the record).
 STALE_AFTER = timedelta(hours=6)
 
-# Until the memory backend exists (milestone M2 on), every run has no
-# cross-run memory. "pre_memory" keeps these runs apart from the "off"
-# control group of a later memory comparison (plan section 11.7, rule 8).
-MEMORY_MODE = "pre_memory"
-MEMORY_ABSENT = "memory is not implemented in this code version (pre_memory run)"
+# Runs measured under metrics versions 1-2 had no cross-run memory:
+# "pre_memory" keeps them apart from the "off" control group of a memory
+# comparison (plan section 11.7, rule 8). A run measured after its process
+# ended has no recorded memory settings: "unknown", never a control.
+PRE_MEMORY = "pre_memory"
+NOT_YET = {"memories_helped": "use-based learning is milestone M6", "memories_hurt": "use-based learning is milestone M6",
+           "fast_mode_used": "fast mode is milestone M6", "tuning_actions": "pipeline tuning is milestone M8"}
 
 # The workflow states, in order; final_phase_reached is the 1-based index.
 PHASE_ORDER = list(dict.fromkeys(AGENT_PHASE.values()))
@@ -111,6 +115,9 @@ METRICS = {
     "browser_fetches": ("count", "lower_better", "result links opened with the local browser"),
     # Memory use
     "memory_exposure": ("none/partial/full", "neutral", "memory actually supplied to the agents"),
+    "memory_exposure_reason": ("text", "neutral", "why no memory was supplied"),
+    "recall_errors": ("count", "lower_better", "recalls that failed (store unreachable)"),
+    "recall_empty": ("count", "neutral", "recalls that found no matching past case"),
     "memories_recalled": ("count", "neutral", "memories shown to agents"),
     "memories_used": ("count", "neutral", "memories the agents reported using (self-report)"),
     "recall_precision": ("share", "higher_better", "memories used / memories shown"),
@@ -434,14 +441,15 @@ def _measure(run: dict, status: str, stages: list, next_start: str | None, notes
         "git_dirty": None if info.get("git_dirty") is None else int(info["git_dirty"]),
         "llm_provider": run["llm_provider"] or None,
         "served_models": json.dumps(served) if lines["llm"] is not None else None,
-        "memory_mode": MEMORY_MODE,
-        "memory_backend": MEMORY_BACKEND if info else None,  # known only while the run's process is measuring it
-        "memory_reuse": None,
-        "memory_tuning": None,
-        "memory_curator": None,
-        "memory_exposure": "none",
-        "memory_bank_size": None,
-        "memory_bank_snapshot": None,
+        # Recorded at the run's start (run_store._memory_snapshot); unknown if measured later.
+        "memory_mode": info.get("memory_mode") or "unknown",
+        "memory_backend": info.get("memory_backend") or (MEMORY_BACKEND if info else None),
+        "memory_reuse": None,    # fast mode: milestone M6
+        "memory_tuning": None,   # pipeline tuning: milestone M8
+        "memory_curator": None,  # lessons: milestone M6
+        "memory_exposure": None,  # set below from the run's recorded memory use
+        "memory_bank_size": json.dumps(info["memory_bank_size"]) if "memory_bank_size" in info else None,
+        "memory_bank_snapshot": info.get("memory_snapshot"),
         "comparison_group": f"parent_pdf:{input_fingerprint}" if input_fingerprint else None,
         "seeds": json.dumps({"split_seed": (cleaning or {}).get("split_seed"),
                              "script_seeds": script_seeds(script) if script is not None else None}),
@@ -650,12 +658,65 @@ def _measure(run: dict, status: str, stages: list, next_start: str | None, notes
         sheet.num("browser_fetches", sum((e.get("provider") or "direct") != "direct" for e in lines["page_fetch"]))
 
     # --- Memory use ---
-    sheet.text("memory_exposure", "none")
-    for metric in MEMORY_METRICS:
-        sheet.num(metric, None, reason=MEMORY_ABSENT)
+    _memory_metrics(sheet, conditions, run_id)
 
     conditions["notes"] = json.dumps(notes) if notes else None
     return {"conditions": conditions, "metrics": sheet.rows}
+
+
+def _memory_metrics(sheet: "_Sheet", conditions: dict, run_id: str) -> None:
+    """Memory use, from the run's own records in the memory store: the
+    attempt events' memory summaries and the memory_usage rows. Exposure is
+    what agents actually received, apart from the assigned memory_mode
+    (plan 11.3): none, partial (only some recalls found cases) or full."""
+    mode = conditions["memory_mode"]
+    try:
+        from src import memory
+        store = memory.client().local if memory.client() else None
+    except Exception:
+        store = None
+    if store is None:
+        reason = "the memory store is off"
+        conditions["memory_exposure"] = "none"
+        sheet.text("memory_exposure", "none")
+        for metric in MEMORY_METRICS:
+            sheet.num(metric, None, reason=NOT_YET.get(metric, reason))
+        return
+
+    summaries = [(e.get("payload") or {}).get("memory") for e in store.rows("memory_events", run_id=run_id,
+                                                                               event_type="attempt")]
+    summaries = [s for s in summaries if s]
+    usage = store.rows("memory_usage", run_id=run_id)
+    recalls = sum(s.get("recalls", 0) for s in summaries)
+    with_cases = sum(s.get("recalls_with_cases", 0) for s in summaries)
+    errors = sum(s.get("recall_errors", 0) for s in summaries)
+    if mode == "off":
+        exposure, why = "none", "memory mode off"
+    elif not recalls and not usage:
+        exposure, why = "none", ("store unreachable" if errors else "no recall point was reached")
+    elif not usage:
+        exposure, why = "none", "no matching past case"
+    else:
+        exposure, why = ("full" if with_cases >= recalls else "partial"), ""
+    conditions["memory_exposure"] = exposure
+    sheet.text("memory_exposure", exposure)
+    if why:
+        sheet.text("memory_exposure_reason", why)
+    sheet.num("recall_errors", errors)
+    sheet.num("recall_empty", recalls - with_cases)
+    shown, used = len(usage), sum(bool(u.get("used")) for u in usage)
+    sheet.num("memories_recalled", shown)
+    sheet.num("memories_used", used)
+    sheet.num("recall_precision", used / shown if shown else None, reason="no past case was shown")
+    sheet.num("memory_requests", sum(s.get("requests", 0) for s in summaries))
+    sheet.num("memory_prompt_chars", sum(s.get("prompt_chars", 0) for s in summaries))
+    sheet.num("memories_retained", len(store.rows("memories", run_id=run_id)))
+    for agent in sorted({u.get("agent") for u in usage if u.get("agent")}):
+        mine = [u for u in usage if u.get("agent") == agent]
+        sheet.num("memories_recalled", len(mine), scope=agent)
+        sheet.num("memories_used", sum(bool(u.get("used")) for u in mine), scope=agent)
+    for metric, reason in NOT_YET.items():
+        sheet.num(metric, None, reason=reason)
 
 
 def _write(measured: dict) -> bool:
@@ -708,13 +769,15 @@ def compute(run_id: str) -> dict | None:
 
 
 def backfill() -> dict:
-    """Measure every recorded run that has no measurements yet."""
+    """Measure every recorded run that has no measurements at all. A run
+    measured under an older METRICS_VERSION keeps those measurements; it is
+    not measured again after its process ended (the conditions recorded at
+    its start, such as the memory mode, would be missing)."""
     with run_store._connect() as conn:
         run_ids = [r[0] for r in conn.execute("SELECT run_id FROM runs ORDER BY started_at")]
-    outcome = {}
-    for run_id in run_ids:
-        outcome[run_id] = _compute(run_id)[1]
-    return outcome
+        measured = {r[0] for r in conn.execute("SELECT DISTINCT run_id FROM run_conditions")}
+    return {run_id: ("already measured" if run_id in measured else _compute(run_id)[1])
+            for run_id in run_ids}
 
 
 # --- Reading and comparing ---

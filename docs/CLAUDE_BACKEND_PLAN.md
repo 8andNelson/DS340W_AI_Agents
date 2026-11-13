@@ -1328,18 +1328,41 @@ same model family before it writes, repairs or revises a script, and can
 ask for more memory itself. Master Agent's diagnosis gets past diagnoses
 of the same failure.
 
-Deliverables:
-- [ ] Retrieval test set of at least 30 labelled queries, made **before**
-      any ranking tuning, and `python -m src.memory benchmark` (9.6).
-- [ ] Recall with relevance, quality and freshness; current run
-      excluded; snapshot applied; only `active` memories (9.2).
-- [ ] `MemoryPack.as_prompt()` with the prompt rules (7.3).
-- [ ] `llm.chat(..., memory=)` and the `memory_request` loop, at most 2
-      per call (7.2).
-- [ ] Prefetch in the Replication Agent (generation, repair, revision)
-      and in `_diagnose` (7.4).
-- [ ] `memory_used` in answers; Master Agent checks the ids were shown;
-      `record_usage` with `supplied_digest`; `memory_exposure` (6.3, 11.3).
+Deliverables (status 2026-11-13):
+- [x] Retrieval test set (`tests/memory_retrieval_cases.json`): 33 queries
+      in the shape each recall point sends (16 generation, 8 repair, 9
+      diagnosis; 9 with no correct answer), and `python -m src.memory
+      benchmark` (read-only). **Labels are a draft by Claude from the
+      memories' contents; a person must check them** (9.6). First run,
+      before any tuning: 96% of 24 queries showed an acceptable memory, no
+      harmful memory, no critical warning missed, all 9 no-match queries
+      showed nothing -- gate passed on the draft labels. The one miss: a
+      Research Agent failure stored with no error or check text has no
+      failure signature to match.
+- [x] Recall (`src/memory/recall.py`): relevance x (0.5 + 0.5 quality) x
+      freshness; relevance is a weighted feature match normalised over the
+      query's features; only `active`, positive (good) or negative
+      (warning) memories; the current run excluded; the run's snapshot
+      (`memory_snapshot`, recorded at run start) applied.
+- [x] The pack (`MemoryContext.block`, the plan's `MemoryPack.as_prompt`):
+      the rules of 7.3, cases labelled `[M1]`..., score reasons, task
+      features, content within `MEMORY_PACK_CHARS`.
+- [x] `llm.chat(..., memory=)` and the `memory_request` loop, at most
+      `MEMORY_MAX_REQUESTS_PER_CALL` (2); a further request is returned
+      as the answer (a bad answer for the agent's own parsing).
+- [x] Prefetch in the Replication Agent (generation, repair, revision)
+      and in `_diagnose`.
+- [x] `memory_used` (JSON key, or a `# MEMORY_USED:` line for code-only
+      answers); labels never shown are dropped, and Master Agent logs them
+      as a Correction (`_memory_check`); `record_usage` with
+      `supplied_digest`; counters `times_recalled` / `times_used`; each
+      attempt's memory summary in its event; `MEMORY_MODE` (`read_write`,
+      `read`, `off`); `memory_exposure` and the memory metrics in run
+      metrics version 3 (old runs keep their `pre_memory` versions).
+- [ ] A live pipeline run (LLM and search quota). The pack built from the
+      team's Neon store for an XGBoost fraud paper was checked on
+      2026-11-13 (two past XGBoost scripts, with scores and reasons); the
+      full run is not done yet.
 
 Done when:
 - The retrieval test passes its gate (9.6).

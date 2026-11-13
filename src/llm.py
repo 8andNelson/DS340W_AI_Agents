@@ -64,7 +64,7 @@ HIGH_EFFORT = {"high", "xhigh", "max"}
 
 
 def chat(prompt: str, system: str = "", timeout: int = 60, model: str = None, effort: str = None,
-         agent: str = None) -> str:
+         agent: str = None, memory=None) -> str:
     """Send one user prompt (plus optional system prompt) and return the
     response text. model overrides the active provider's configured model.
     effort (low|medium|high|xhigh|max) sets Claude's effort; on FreeLLMAPI,
@@ -72,7 +72,31 @@ def chat(prompt: str, system: str = "", timeout: int = 60, model: str = None, ef
     "research_agent") selects that agent's primary/backup models from
     FREELLMAPI_AGENT_MODELS on FreeLLMAPI; other providers ignore it.
     While Master Agent notes are active (supervisor_notes), they are added
-    to the system prompt."""
+    to the system prompt.
+
+    memory (a src.memory.recall.MemoryContext, per call -- never process
+    state) adds past cases to the prompt as reference data. If the model
+    answers with only a {"memory_request": ...} object, the request is
+    answered and the call is sent again, at most the context's
+    max_requests times; then the model is told to answer. What was shown
+    and used is recorded when the answer arrives."""
+    block = memory.block() if memory is not None else ""
+    if not block:
+        return _chat_once(prompt, system, timeout, model, effort, agent)
+    from src.memory.recall import memory_request
+    prompt = f"{prompt}\n\n{block}"
+    content = _chat_once(prompt, system, timeout, model, effort, agent)
+    while memory.requests < memory.max_requests:
+        request = memory_request(content)
+        if request is None:
+            break
+        prompt = f"{prompt}\n\nYour reply: {content.strip()}\n\n{memory.request(request)}"
+        content = _chat_once(prompt, system, timeout, model, effort, agent)
+    memory.finish(content)
+    return content
+
+
+def _chat_once(prompt: str, system: str, timeout: int, model: str, effort: str, agent: str) -> str:
     system = _with_supervisor_notes(system)
     if LLM_PROVIDER == "openrouter":
         if not OPENROUTER_API_KEY:

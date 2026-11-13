@@ -9,7 +9,7 @@ could then read back as if it were real.
 import pytest
 import requests
 
-from src import llm, memory
+from src import config, llm, memory
 from src.memory import scrub as memory_scrub
 from src.slack import slack_client
 
@@ -76,6 +76,7 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     # Memory store: a temp SQLite file, never the real database/memory_local.db
     # or a hosted store, whatever .env says; the scrubber does not read the real .env.
     monkeypatch.setattr(memory, "MEMORY_BACKEND", "sqlite")
+    monkeypatch.setattr(config, "MEMORY_MODE", "read_write")
     monkeypatch.setattr(memory, "LOCAL_DB", tmp_path / "database" / "memory_local.db")
     monkeypatch.setattr(memory_scrub, "ENV_FILE", tmp_path / ".env")
     memory_scrub._env_values.cache_clear()

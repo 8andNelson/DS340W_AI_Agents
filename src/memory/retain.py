@@ -694,23 +694,33 @@ def build_memories(run: dict) -> tuple[list, str]:
 
 def _run_row(run: dict) -> dict:
     from src import memory
-    from src.orchestration.run_metrics import MEMORY_MODE
+    from src.orchestration import run_context
+    usage = memory.client().local.rows("memory_usage", run_id=run["run_id"])
+    # The mode recorded at the run's start; a run retained after its process
+    # ended (backfill) has none recorded.
+    mode = run_context.info(run["run_id"]).get("memory_mode") or "unknown"
     return {"run_id": run["run_id"], "contributor": memory.MEMORY_CONTRIBUTOR or None, "topic": run["topic"],
             "status": run["status"], "final_phase": run["final_phase"], "git_commit": run["git_commit"] or None,
-            "memory_mode": MEMORY_MODE, "memories_recalled": None, "memories_used": None,
+            "memory_mode": mode, "memories_recalled": len(usage), "memories_used": sum(bool(u.get("used")) for u in usage),
             "trust": "low_trust" if _review_paper(run) else "normal",
             "started_at": run["started_at"], "finished_at": run["finished_at"]}
 
 
 def retain_run(run_id: str, dry_run: bool = False) -> dict:
     """Make and store the memories of one finished run (once). With dry_run,
-    build them and report, writing nothing. Never raises."""
+    build them and report, writing nothing. With MEMORY_MODE "read" (a
+    fixed bank for a controlled test) or "off", nothing is retained.
+    Never raises."""
     from src import memory
+    from src.config import MEMORY_MODE
     report = {"run_id": run_id, "skipped": None, "written": [], "duplicates": [], "lineage": ""}
     try:
         c = memory.client()
         if c is None or c.backend == "off":
             report["skipped"] = "memory is off"
+            return report
+        if MEMORY_MODE != "read_write" and not dry_run:
+            report["skipped"] = f"MEMORY_MODE={MEMORY_MODE}: the memory bank is not changed"
             return report
         if c.local.rows("memory_runs", run_id=run_id):
             report["skipped"] = "already retained"

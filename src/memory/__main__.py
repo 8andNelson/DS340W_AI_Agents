@@ -16,6 +16,7 @@ python -m src.memory <command>
   rescore [--run R] [--dry-run]      apply the current retain rules to runs retained under
                                      older ones (old memories superseded or retired, never edited)
   review [--agent A] [--n 10]        best and worst memories per agent (plan 10 gate)
+  benchmark [--cases F]              the retrieval test set and its release gate (plan 9.6)
   approve <memory_id> <reason>       candidate -> active
   quarantine <memory_id> <reason>    stop a memory from being recalled (never deleted)
 """
@@ -45,6 +46,7 @@ def _main(argv: list) -> int:
     backfill_cmd = sub.add_parser("backfill")
     backfill_cmd.add_argument("--dry-run", action="store_true")
     backfill_cmd.add_argument("--report", help="write the report to this file (default: reports/memory_backfill_<time>.md)")
+    sub.add_parser("benchmark").add_argument("--cases", help="default: tests/memory_retrieval_cases.json")
     rescore = sub.add_parser("rescore")
     rescore.add_argument("--run", help="one run (default: every run this machine retained)")
     rescore.add_argument("--dry-run", action="store_true")
@@ -75,6 +77,11 @@ def _main(argv: list) -> int:
                                           f"{len(r['duplicates'])} duplicate(s) ({r['lineage']})"))
         print(("Dry run: nothing written. " if args.dry_run else "") + f"Report: {path}")
         return 0
+    if args.command == "benchmark":
+        from src.memory import benchmark
+        report = benchmark.run(args.cases or benchmark.CASES_FILE)
+        print(benchmark.format_report(report))
+        return 0 if report["gate_passed"] else 1
     if args.command == "rescore":
         from datetime import datetime
         from pathlib import Path

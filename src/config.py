@@ -25,6 +25,12 @@ MEMORY_CONTRIBUTOR = os.getenv("MEMORY_CONTRIBUTOR", "").strip()
 # connection string -- never the admin one.
 MEMORY_BACKEND = os.getenv("MEMORY_BACKEND", "sqlite").strip().lower()
 MEMORY_DATABASE_URL = os.getenv("MEMORY_DATABASE_URL", "").strip()
+# Whether agents use memory: "read_write" (recall, and retain each run's
+# memories; the default), "read" (recall only: the bank stays fixed, for a
+# controlled test) or "off" (no recall, no retain -- the control group).
+MEMORY_MODE = os.getenv("MEMORY_MODE", "read_write").strip().lower()
+MEMORY_PACK_CHARS = int(os.getenv("MEMORY_PACK_CHARS", "12000"))  # size budget of one memory pack in a prompt
+MEMORY_MAX_REQUESTS_PER_CALL = int(os.getenv("MEMORY_MAX_REQUESTS_PER_CALL", "2"))  # model memory requests per LLM call
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
