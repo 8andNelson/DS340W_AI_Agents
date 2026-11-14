@@ -54,7 +54,7 @@ function slug(name) { return name.toLowerCase().replace(/ /g, "_"); }
 const STATUS_LABELS = {
   running: "Running", starting: "Starting", success: "Finished", halted: "Halted", crashed: "Crashed",
   stopped: "Stopped", unknown: "Unknown", approved: "Approved", retrying: "Retrying", rejected: "Rejected",
-  failed: "Failed", checking: "Checking", interrupted: "Interrupted",
+  failed: "Failed", checking: "Checking", interrupted: "Interrupted", skipped: "Turned off",
 };
 const statusLabel = (s) => STATUS_LABELS[s] || (s ? s[0].toUpperCase() + s.slice(1) : "");
 
@@ -1053,6 +1053,41 @@ $("#router-start").addEventListener("click", () => routerAction("start"));
 $("#router-stop").addEventListener("click", () => routerAction("stop"));
 
 // --- Start ---
+
+// --- Optional agents: on/off switches for the next run ---
+
+function renderSwitches(agents) {
+  $("#agent-switches").innerHTML = agents.map((a) => `
+    <button type="button" class="switch" role="switch" aria-checked="${a.on}" data-agent="${esc(a.name)}"
+      ${a.available ? "" : "disabled"} title="${esc(a.note || (a.on ? "On: click to turn off" : "Off: click to turn on"))}">
+      <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
+      <span class="switch-name">${esc(a.name)}</span>
+      <span class="switch-state">${a.on ? "On" : "Off"}</span>
+    </button>`).join("");
+  const blocked = agents.filter((a) => a.note).map((a) => `${a.name}: ${a.note}`);
+  $("#agent-switches-note").textContent = ["Changes apply to the next run you start.", ...blocked].join(" ");
+}
+
+async function loadSwitches() {
+  try { renderSwitches((await api("/api/agent-switches")).agents); } catch (err) {
+    $("#agent-switches-note").textContent = `Agent switches unavailable: ${err.message}`;
+  }
+}
+
+$("#agent-switches").addEventListener("click", async (e) => {
+  const button = e.target.closest("button.switch");
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  try {
+    const on = button.getAttribute("aria-checked") !== "true";
+    renderSwitches((await postJson("/api/agent-switches", { name: button.dataset.agent, on })).agents);
+  } catch (err) {
+    $("#agent-switches-note").textContent = err.message;
+    button.disabled = false;
+  }
+});
+
+loadSwitches();
 
 async function tick() {
   await pollStatus();

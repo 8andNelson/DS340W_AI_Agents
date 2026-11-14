@@ -89,6 +89,7 @@ class PipelineRunner:
         self._process = None
         self._log_handle = None
         self.topic = ""
+        self.agents_off = []
         self.started_at = None
         self.finished_at = None
         self.stopped_by_user = False
@@ -110,7 +111,8 @@ class PipelineRunner:
                 self._log_handle = None
         return False
 
-    def start(self, topic: str, reset: bool = False, parent_paper_input: Path | None = None) -> None:
+    def start(self, topic: str, reset: bool = False, parent_paper_input: Path | None = None,
+              agents_off: list | None = None) -> None:
         topic = validate_topic(topic)
         with self._lock:
             if self._poll_locked():
@@ -119,6 +121,9 @@ class PipelineRunner:
             args = list(self.command_prefix)
             if reset:
                 args.append("--reset")
+            # Always passed, so a run started here follows the dashboard's
+            # switches rather than AGENTS_OFF in .env.
+            args.extend(["--agents-off", ",".join(agents_off or [])])
             if parent_paper_input is not None:
                 from src.paper_input import load_input, PaperInputError
                 try:
@@ -155,6 +160,7 @@ class PipelineRunner:
                 raise RunError(f"Could not start the pipeline: {error}") from error
 
             self.topic = topic
+            self.agents_off = list(agents_off or [])
             self.started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self.finished_at = None
             self.stopped_by_user = False
@@ -183,6 +189,7 @@ class PipelineRunner:
                 "finished_at": self.finished_at,
                 "exit_code": exit_code,
                 "stopped_by_user": self.stopped_by_user,
+                "agents_off": self.agents_off,
             }
 
     def read_console(self, offset: int = 0, max_bytes: int = 200_000, path: Path | None = None) -> dict:

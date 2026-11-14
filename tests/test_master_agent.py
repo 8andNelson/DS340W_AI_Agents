@@ -1130,6 +1130,77 @@ class TestCheckAgentRequests(MasterAgentTestCase):
         fetch.assert_called_once_with(oldest_ts="800.0")
 
 
+class TestAgentsTurnedOff(MasterAgentTestCase):
+    """Optional agents a person turns off (run.py --agents-off, AGENTS_OFF,
+    the dashboard's switches) are skipped and logged, never failed."""
+
+    _run = TestDataAgentPipelineWiring._run
+
+    def _run_with(self, agents_off: str):
+        data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
+        with patch("src.config.AGENTS_OFF", agents_off), \
+             patch("src.agents.report_agent.run", wraps=__import__("src.agents.report_agent",
+                                                                   fromlist=["run"]).run) as report_run, \
+             patch("src.agents.presentation_agent.run", wraps=__import__("src.agents.presentation_agent",
+                                                                         fromlist=["run"]).run) as slides_run, \
+             patch("src.agents.experiment_agent.run", return_value=make_experiment_result()) as experiment_run:
+            result, *_ = self._run(data_result)
+        return result, report_run, slides_run, experiment_run
+
+    def _skipped(self) -> list:
+        return [e["target"] for e in self._log_entries() if e["decision"] == "Skipped"]
+
+    def test_turning_off_the_report_also_turns_off_the_slides(self):
+        result, report_run, slides_run, _ = self._run_with("report")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["phase"], "EXPERIMENTATION")
+        self.assertEqual(result["agents_off"], ["Presentation Agent", "Report Agent"])
+        self.assertIsNone(result["report_result"])
+        self.assertIsNone(result["presentation_result"])
+        report_run.assert_not_called()
+        slides_run.assert_not_called()
+        self.assertEqual(sorted(self._skipped()), ["Presentation Agent", "Report Agent"])
+
+    def test_turning_off_only_the_slides_keeps_the_report(self):
+        result, report_run, slides_run, _ = self._run_with("presentation")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["phase"], "REPORT_GENERATION")
+        self.assertTrue(Path(result["report_result"]["report_path"]).is_file())
+        self.assertIsNone(result["presentation_result"])
+        self.assertEqual(result["skipped_agents"], ["Presentation Agent"])
+        slides_run.assert_not_called()
+
+    def test_turning_off_the_experiment_agent_ends_the_rerun_loop(self):
+        result, report_run, _, experiment_run = self._run_with("Experiment Agent")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["phase"], "COMPLETE")
+        experiment_run.assert_not_called()
+        self.assertEqual(result["rerun_end_reason"], "the Experiment Agent is turned off for this run")
+        report_run.assert_called_once()
+
+    def test_all_agents_run_when_none_is_turned_off(self):
+        result, report_run, slides_run, experiment_run = self._run_with("")
+        self.assertEqual(result["phase"], "COMPLETE")
+        self.assertEqual(result["agents_off"], [])
+        self.assertEqual(self._skipped(), [])
+
+    def test_a_required_agent_cannot_be_turned_off(self):
+        with self.assertRaisesRegex(ValueError, "cannot be turned off: data"):
+            master_agent.run_pipeline("topic", agents_off="data")
+        self.assertIsNone(master_agent._current_run_id)
+
+
+class TestParseAgentsOff(unittest.TestCase):
+    def test_names_are_matched_loosely_and_the_report_takes_the_slides(self):
+        from src.orchestration.handoff import parse_agents_off
+        self.assertEqual(parse_agents_off(" experiment , Presentation agent "),
+                         {"Experiment Agent", "Presentation Agent"})
+        self.assertEqual(parse_agents_off(["report_agent"]), {"Report Agent", "Presentation Agent"})
+        self.assertEqual(parse_agents_off(""), set())
+        with self.assertRaises(ValueError):
+            parse_agents_off("Evaluation Agent")
+
+
 class TestMaxTs(unittest.TestCase):
     def test_returns_the_other_when_one_is_none(self):
         self.assertEqual(master_agent._max_ts(None, "5.0"), "5.0")

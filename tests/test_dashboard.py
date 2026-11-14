@@ -7,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "STATE_FILE", state_manager.STATE_FILE)  # conftest's temp state file
     monkeypatch.setattr(server, "MASTER_LOG", tmp_path / "logs" / "master_agent_log.json")
     monkeypatch.setattr(server, "RUN_DB", run_store.DB_FILE)  # conftest's temp run database
+    monkeypatch.setattr(server, "SWITCHES_FILE", tmp_path / "dashboard_files" / "agent_switches.json")
     # The real .env may select FreeLLMAPI; these tests are not about the router
     # (tests/test_dashboard_freellmapi.py is).
     monkeypatch.setenv("LLM_PROVIDER", "openrouter")
@@ -176,7 +178,8 @@ def test_runner_passes_fixed_input_as_separate_cli_arguments(tmp_path):
     runner.start(TOPIC, parent_paper_input=manifest)
     _wait_until_done(runner)
     arguments = json.loads(runner.console_text().strip())
-    assert arguments == ["--parent-paper-input", str(manifest.resolve()), TOPIC]
+    # --agents-off is always passed (empty: every agent on), so .env's AGENTS_OFF does not apply.
+    assert arguments == ["--agents-off", "", "--parent-paper-input", str(manifest.resolve()), TOPIC]
 
 
 def test_dashboard_imports_no_pipeline_module():
@@ -769,3 +772,48 @@ def test_vscode_is_started_as_code_exe_not_the_batch_file(tmp_path, monkeypatch)
     _write(install / "Code.exe", "")
     monkeypatch.setattr(editor.shutil, "which", lambda name: str(install / "bin" / "code.cmd"))
     assert editor.find_vscode() == (install / "Code.exe").resolve()
+
+
+# --- Optional agents: on/off switches ---
+
+def test_the_dashboard_offers_exactly_the_agents_the_pipeline_can_turn_off():
+    from src.orchestration.handoff import OPTIONAL_AGENTS
+    assert server.OPTIONAL_AGENTS == OPTIONAL_AGENTS
+
+
+def test_agents_are_on_until_switched_off_and_the_slides_need_the_report(client, repo):
+    assert all(a["on"] and a["available"] for a in client.get("/api/agent-switches").get_json()["agents"])
+    agents = {a["name"]: a for a in client.post("/api/agent-switches", json={"name": "Report Agent", "on": False})
+              .get_json()["agents"]}
+    assert agents["Report Agent"]["on"] is False
+    assert agents["Presentation Agent"] == {"name": "Presentation Agent", "on": False, "available": False,
+                                            "note": "Needs the Report Agent, which is off."}
+    assert server._agents_off() == ["Report Agent", "Presentation Agent"]
+    # The choice is kept for the next run (and the next dashboard start).
+    assert json.loads((repo / "dashboard_files" / "agent_switches.json").read_text())["Report Agent"] is False
+    client.post("/api/agent-switches", json={"name": "Report Agent", "on": True})
+    assert server._agents_off() == []
+
+
+def test_only_optional_agents_can_be_switched(client):
+    assert client.post("/api/agent-switches", json={"name": "Data Agent", "on": False}).status_code == 400
+    assert client.post("/api/agent-switches", json={"name": "Report Agent", "on": "no"}).status_code == 400
+
+
+def test_a_dashboard_run_is_started_with_the_switched_off_agents(repo):
+    command = _stand_in(repo, "import sys\nprint(sys.argv[1:])\n", name="print_args.py")
+    runner = PipelineRunner(command_prefix=command, console_dir=repo / "dashboard_files" / "consoles")
+    runner.start("credit card fraud", agents_off=["Report Agent", "Presentation Agent"])
+    _wait_until_done(runner)
+    assert "['--agents-off', 'Report Agent,Presentation Agent', 'credit card fraud']" in runner.console_text()
+    assert runner.info()["agents_off"] == ["Report Agent", "Presentation Agent"]
+
+
+def test_an_agent_turned_off_in_a_run_shows_as_turned_off(client, repo):
+    run_id = run_store.start_run("switched run")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _write(repo / "logs" / "master_agent_log.json", json.dumps([
+        {"action": "Approval", "target": "Report Agent", "decision": "Skipped", "timestamp": now}]))
+    live = {a["name"]: a["live"] for a in client.get(f"/api/status?run={run_id}").get_json()["agents"]}
+    assert live["Report Agent"] == {"status": "skipped", "summary": "Turned off for this run."}
+    assert live["Presentation Agent"] is None

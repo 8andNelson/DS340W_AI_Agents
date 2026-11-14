@@ -443,3 +443,22 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .badge.neutral, .badge.candidate, .badge.superseded, .badge.retired { background: var(--surface-2); color: var(--muted); }
 .badge.quarantined { background: var(--bad-soft); color: var(--bad); }
 @media (max-width: 900px) { .mem-layout { grid-template-columns: 1fr; } }
+
+/* Optional agents: on/off switches */
+.agent-switches-block { margin-top: 14px; }
+.agent-switches { display: flex; flex-wrap: wrap; gap: 8px; }
+.switch { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px 6px 8px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; font-size: 13px;
+  cursor: pointer; }
+.switch:hover:not(:disabled) { background: var(--surface-2); }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch:disabled { opacity: .55; cursor: default; }
+.switch-track { position: relative; width: 30px; height: 18px; border-radius: 999px; background: var(--border);
+  transition: background .15s; flex: none; }
+.switch-knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .25); transition: transform .15s; }
+.switch[aria-checked="true"] .switch-track { background: var(--ok); }
+.switch[aria-checked="true"] .switch-knob { transform: translateX(12px); }
+.switch-state { font-size: 11.5px; font-weight: 600; color: var(--muted); min-width: 22px; }
+.switch[aria-checked="true"] .switch-state { color: var(--ok); }
+.badge.skipped { background: var(--surface-2); color: var(--muted); }

@@ -215,6 +215,9 @@ def main():
     parser = argparse.ArgumentParser(description="Run the supervised research pipeline.")
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--parent-paper-input", help="Saved Parent Paper input manifest from the dashboard")
+    parser.add_argument("--agents-off", default=None,
+                        help="Optional agents to skip, comma-separated: experiment, report, presentation "
+                             "(default: AGENTS_OFF in .env)")
     parser.add_argument("topic", nargs="*")
     options = parser.parse_args()
     if options.reset:
@@ -232,15 +235,24 @@ def main():
         print("Error: No research topic provided.")
         sys.exit(1)
 
+    from src.config import AGENTS_OFF
+    from src.orchestration.handoff import parse_agents_off
+    try:
+        parse_agents_off(options.agents_off if options.agents_off is not None else AGENTS_OFF)
+    except ValueError as error:
+        print(f"Error: {error}")
+        sys.exit(2)
+
     print(f"\nTopic: {topic}")
     if options.parent_paper_input:
         print("\nStarting from the supplied Parent Paper; literature discovery and selection are skipped.")
-        result = master_agent.run_pipeline(topic, parent_paper_input=options.parent_paper_input)
+        result = master_agent.run_pipeline(topic, parent_paper_input=options.parent_paper_input,
+                                           agents_off=options.agents_off)
     else:
         print("\n[Master Agent] Starting supervised pipeline "
               "(Intake -> Research -> Validation & Selection -> parallel Data / Code Discovery; "
               "Data -> Cleaning; both branches -> Replication -> Evaluation, then supervised reruns)...")
-        result = master_agent.run_pipeline(topic)
+        result = master_agent.run_pipeline(topic, agents_off=options.agents_off)
 
     if not result["success"]:
         print(f"\nPipeline halted at phase {result['phase']}. Master Agent could not get a passing "

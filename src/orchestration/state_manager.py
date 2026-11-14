@@ -22,6 +22,7 @@ DEFAULT_STATE = {
                         # one entry appended per Experiment Agent run
     "report_status": "",
     "presentation_status": "",
+    "agents_off": [],                # optional agents turned off for the run (handoff.OPTIONAL_AGENTS)
     "slack_last_checked_ts": None,  # cursor for master_agent.check_agent_requests
 }
 

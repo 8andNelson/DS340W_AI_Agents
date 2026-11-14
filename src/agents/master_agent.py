@@ -81,6 +81,8 @@ SLACK_SUMMARY_MAX_CHARS = 600
 # Module-level, like Slack, so every _supervise call -- including the ones
 # check_agent_requests makes -- records its attempt without extra plumbing.
 _current_run_id = None
+# Optional agents turned off for the run in progress (see run_pipeline).
+_agents_off = frozenset()
 _log_lock = threading.Lock()
 _stage_record_lock = threading.Lock()
 MAX_PARALLEL_AGENTS = 3
@@ -1296,6 +1298,25 @@ def _review_rerun_request(request: dict, history: list, ctx: dict) -> str:
     return ""
 
 
+def _log_agents_off() -> None:
+    """At the start of a run: one logged (and posted) entry per agent a
+    person turned off. A turned-off agent is skipped, not failed."""
+    entries = [_log_entry("Approval", agent, f"The {agent} is turned off for this run (run.py --agents-off, "
+                          "AGENTS_OFF or the dashboard's switch), so Master Agent will not run it.", "Skipped",
+                          "Continue without it.") for agent in sorted(_agents_off)]
+    for entry in entries:
+        _print_entry(entry)
+    _append_log(entries)
+
+
+def _skip_turned_off(target: str, sender: str, drive: dict) -> None:
+    """A request for a turned-off agent: skip it instead of running it."""
+    print(f"\n[Master Agent] Handoff {sender} -> {target} skipped: the {target} is turned off for this run.")
+    skipped = drive.setdefault("skipped", [])
+    if target not in skipped:
+        skipped.append(target)
+
+
 def _loop_end_reason(drive: dict) -> str:
     """Why Master Agent ends the rerun loop now, or "" to go on."""
     history = drive["history"]
@@ -1752,6 +1773,11 @@ def _drive(ctx: dict, queue: list, drive: dict, sender: str = "Master Agent") ->
 
         request = queue.pop(0)
         target = canonical_agent(request.get("target_agent")) or str(request.get("target_agent") or "")
+        if target in _agents_off and not _is_rerun_request(request):
+            _skip_turned_off(target, sender, drive)
+            if target == "Experiment Agent" and not drive["end_reason"]:
+                drive["end_reason"] = "the Experiment Agent is turned off for this run"
+            continue
         if drive["evaluated"] and not drive["rerun"]:
             drive["end_reason"] = _loop_end_reason(drive)
             if drive["end_reason"]:
@@ -1847,16 +1873,22 @@ def _rerun_loop(ctx: dict) -> dict:
             "end_reason": drive["end_reason"]}
 
 
-def run_pipeline(topic: str, parent_paper_input: str | Path | None = None) -> dict:
+def run_pipeline(topic: str, parent_paper_input: str | Path | None = None, agents_off=None) -> dict:
     """
     Run the pipeline (see _run_stages) inside one run database record
     (src/orchestration/run_store.py): every agent attempt and the files it
     produced are stored as they happen, and the run is closed with its final
     status even if a stage raises.
-    """
-    global _current_run_id
-    from src.config import LLM_PROVIDER
 
+    agents_off: optional agents to skip in this run (names or a comma list;
+    handoff.OPTIONAL_AGENTS). None uses AGENTS_OFF from .env. A name that is
+    not an optional agent raises ValueError before the run starts.
+    """
+    global _current_run_id, _agents_off
+    from src.config import AGENTS_OFF, LLM_PROVIDER
+    from src.orchestration.handoff import parse_agents_off
+
+    _agents_off = frozenset(parse_agents_off(AGENTS_OFF if agents_off is None else agents_off))
     _current_run_id = run_store.start_run(topic, llm_provider=LLM_PROVIDER)
     try:
         result = (_run_stages(topic, parent_paper_input=parent_paper_input)
@@ -1864,8 +1896,10 @@ def run_pipeline(topic: str, parent_paper_input: str | Path | None = None) -> di
     except BaseException:
         run_store.finish_run(_current_run_id, "crashed")
         _current_run_id = None
+        _agents_off = frozenset()
         raise
 
+    _agents_off = frozenset()
     if _current_run_id:
         print(f"\n[Run Store] Run {_current_run_id} saved to {run_store.DB_FILE}")
     run_store.finish_run(
@@ -1942,6 +1976,8 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
           "experiment_result": dict | None,     # the last one
           "report_result": dict | None,         # the Report Agent's report (Milestone 13)
           "presentation_result": dict | None,   # the Presentation Agent's slides (Milestone 14)
+          "agents_off": list,                   # optional agents turned off for this run
+          "skipped_agents": list,               # those of them Master Agent was asked to run and skipped
           "blockers": [...],   # non-empty only when success is False
         }
     """
@@ -1958,6 +1994,9 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
            "code_discovery_result": None, "replication_result": None, "evaluation_result": None,
            "experiment_result": None}
     drive = _new_drive(floor_ts=run_floor_ts)
+    update_state({"agents_off": sorted(_agents_off)})
+    if _agents_off:
+        _log_agents_off()
     if parent_paper_input is not None:
         from src.agents import validation_agent
         with run_store.stage_timer(_current_run_id, "Parent Paper Intake", 1, 1):
@@ -1976,7 +2015,8 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
                   input_mode=ctx.get("input_mode", "topic"), input_fingerprint=ctx.get("input_fingerprint"),
                   rerun_end_reason=drive["end_reason"], experiment_results=drive["experiment_results"],
                   experiment_result=drive["experiment_results"][-1] if drive["experiment_results"] else None,
-                  report_result=None, presentation_result=None, blockers=drive["blockers"])
+                  report_result=None, presentation_result=None, agents_off=sorted(_agents_off),
+                  skipped_agents=drive.get("skipped", []), blockers=drive["blockers"])
     if drive["blockers"]:
         return result
 
@@ -2004,10 +2044,14 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
     _drive(ctx, [request("master_agent", "Report Agent", report_inputs,
                          "The rerun loop ended; write the final report from the recorded results.")],
            report_drive)
-    result.update(report_result=ctx.get("report_result"), presentation_result=ctx.get("presentation_result"))
+    result.update(report_result=ctx.get("report_result"), presentation_result=ctx.get("presentation_result"),
+                  skipped_agents=drive.get("skipped", []) + report_drive.get("skipped", []))
     if report_drive["blockers"]:
         result.update(success=False, phase=report_drive["phase"], blockers=report_drive["blockers"])
         return result
-    update_state({"phase": "COMPLETE"})
-    result["phase"] = "COMPLETE"
+    # COMPLETE only when every stage ran; with agents turned off, the phase
+    # is the last one reached.
+    result["phase"] = ("COMPLETE" if result["presentation_result"] else
+                       "REPORT_GENERATION" if result["report_result"] else "EXPERIMENTATION")
+    update_state({"phase": result["phase"]})
     return result

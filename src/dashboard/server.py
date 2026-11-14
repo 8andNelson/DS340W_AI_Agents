@@ -55,6 +55,7 @@ DASHBOARD_FILES = REPO_ROOT / "dashboard_files"
 PDF_DIR = DASHBOARD_FILES / "pdfs"
 SCRIPT_COPY_DIR = DASHBOARD_FILES / "scripts"  # recorded versions opened in VS Code
 CONSOLE_INDEX = CONSOLE_DIR / "index.json"     # run_id -> console file of a dashboard-started run
+SWITCHES_FILE = DASHBOARD_FILES / "agent_switches.json"  # which optional agents are on, for the next run
 
 # Recorded files are read from disk only inside these folders.
 FILE_ROOTS = [REPO_ROOT / d for d in
@@ -71,8 +72,8 @@ TABLE_SUFFIXES = {".csv", ".tsv"}
 # is treated as a run that was killed before it could record its end.
 STALE_RUN_HOURS = 6
 
-# Pipeline order and the workflow phase each agent belongs to. Report and
-# Presentation are listed so the user can see the full plan; not built yet.
+# Pipeline order and the workflow phase each agent belongs to. "optional":
+# the agent can be turned off for a run (the switches on the Overview page).
 PIPELINE = [
     {"name": "Intake Agent", "phase": "TOPIC_ANALYSIS",
      "role": "Turns the topic into keywords, a domain and the prediction target."},
@@ -90,13 +91,18 @@ PIPELINE = [
      "role": "Runs (or reconstructs) the implementation to set a baseline."},
     {"name": "Evaluation Agent", "phase": "BASELINE_EVALUATION",
      "role": "Compares the reproduced metrics with the paper's published results."},
-    {"name": "Experiment Agent", "phase": "EXPERIMENTATION",
-     "role": "Runs one controlled, single-variable experiment against the baseline."},
-    {"name": "Report Agent", "phase": "REPORT_GENERATION",
-     "role": "Writes the final research report.", "planned": True},
-    {"name": "Presentation Agent", "phase": "PRESENTATION_GENERATION",
-     "role": "Builds the presentation slides.", "planned": True},
+    {"name": "Experiment Agent", "phase": "EXPERIMENTATION", "optional": True,
+     "role": "Reads the gap to the paper's score and asks Master Agent to rerun an earlier agent, or stops."},
+    {"name": "Report Agent", "phase": "REPORT_GENERATION", "optional": True,
+     "role": "Writes the final research report from the run's recorded results."},
+    {"name": "Presentation Agent", "phase": "PRESENTATION_GENERATION", "optional": True,
+     "role": "Builds the presentation slides (.pptx) from the report."},
 ]
+# The agents a person may turn off -- the same list as the pipeline's
+# handoff.OPTIONAL_AGENTS (the dashboard does not import pipeline code;
+# tests/test_dashboard.py checks that the two lists match).
+OPTIONAL_AGENTS = tuple(s["name"] for s in PIPELINE if s.get("optional"))
+NEEDS = {"Presentation Agent": "Report Agent"}  # the slides are built from the report
 PIPELINE_ORDER = [s["name"] for s in PIPELINE if not s.get("planned")]
 
 
@@ -145,6 +151,42 @@ def _parse_time(iso: str | None) -> datetime | None:
 
 
 # --- Which run is shown ---
+
+def _agent_switches() -> dict:
+    """{optional agent: on?}. Every agent is on until a person turns it off."""
+    saved = readers.read_json(SWITCHES_FILE, {})
+    saved = saved if isinstance(saved, dict) else {}
+    return {name: saved.get(name) is not False for name in OPTIONAL_AGENTS}
+
+
+def _switches_view() -> list:
+    on = _agent_switches()
+    out = []
+    for name in OPTIONAL_AGENTS:
+        needed = NEEDS.get(name)
+        blocked = bool(needed and not on[needed])
+        out.append({"name": name, "on": on[name] and not blocked, "available": not blocked,
+                    "note": f"Needs the {needed}, which is off." if blocked else ""})
+    return out
+
+
+def _agents_off() -> list:
+    """The agents a dashboard-started run is told to skip."""
+    return [s["name"] for s in _switches_view() if not s["on"]]
+
+
+def _run_log_entries(run: dict | None) -> list:
+    """The Master Agent log entries of one run (matched by the run's time span)."""
+    if not run:
+        return []
+    start = _parse_time(run.get("started_at"))
+    end = _parse_time(run.get("finished_at")) or datetime.now(timezone.utc)
+    entries = readers.read_json(MASTER_LOG, [])
+    if not isinstance(entries, list) or start is None:
+        return []
+    # The log has no run id; a decision belongs to the run whose time span holds it.
+    return [e for e in entries if (t := _parse_time(e.get("timestamp"))) and start <= t <= end]
+
 
 def _run_overview(runner: PipelineRunner) -> tuple[dict, dict | None, bool]:
     """(runner info, latest run from the run database, whether a run is active now)."""
@@ -433,7 +475,7 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
                        + ("It is starting now; try again when it shows Running." if router["busy"]
                           else "Select Start router first."))
         try:
-            options = {"reset": bool(body.get("reset"))}
+            options = {"reset": bool(body.get("reset")), "agents_off": _agents_off()}
             if "parent_paper_id" in body:
                 key = body["parent_paper_id"]
                 if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key):
@@ -445,6 +487,21 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
         except (RunError, paper_input.PaperInputError) as e:
             abort(409 if "already" in str(e) else 400, str(e))
         return jsonify(runner.info())
+
+    @app.get("/api/agent-switches")
+    def agent_switches():
+        return jsonify({"agents": _switches_view()})
+
+    @app.post("/api/agent-switches")
+    def set_agent_switch():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or body.get("name") not in OPTIONAL_AGENTS or not isinstance(body.get("on"), bool):
+            abort(400, f"Send {{\"name\": one of {', '.join(OPTIONAL_AGENTS)}, \"on\": true or false}}.")
+        switches = _agent_switches()
+        switches[body["name"]] = body["on"]
+        SWITCHES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SWITCHES_FILE.write_text(json.dumps(switches, indent=2), encoding="utf-8")
+        return jsonify({"agents": _switches_view()})
 
     @app.post("/api/stop")
     def stop_run():
@@ -464,7 +521,11 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
         console = runner.console_text() if is_runner_run else ""
         progress = readers.agent_progress(run, PIPELINE_ORDER, console, run_active=bool(run and run["active"]))
         attempted = {s["agent"] for s in (run or {}).get("stages", [])}
-        agents = [{**stage, "live": progress.get(stage["name"]), "has_output": stage["name"] in attempted}
+        turned_off = {e.get("target") for e in _run_log_entries(run) if e.get("decision") == "Skipped"}
+        agents = [{**stage, "live": progress.get(stage["name"]) or (
+                       {"status": "skipped", "summary": "Turned off for this run."}
+                       if stage["name"] in turned_off else None),
+                   "has_output": stage["name"] in attempted}
                   for stage in PIPELINE]
         if "Parent Paper Intake" in attempted:
             agents = [{"name": "Parent Paper Intake", "phase": "MASTER_APPROVAL",
@@ -578,14 +639,7 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
         run = _resolve_run(current_runner())
         if not run:
             return jsonify([])
-        start = _parse_time(run.get("started_at"))
-        end = _parse_time(run.get("finished_at")) or datetime.now(timezone.utc)
-        entries = readers.read_json(MASTER_LOG, [])
-        if not isinstance(entries, list) or start is None:
-            return jsonify([])
-        # The log has no run id; a decision belongs to the run whose time span holds it.
-        mine = [e for e in entries if (t := _parse_time(e.get("timestamp"))) and start <= t <= end]
-        return jsonify(list(reversed(mine)))
+        return jsonify(list(reversed(_run_log_entries(run))))
 
     # --- Papers ---
 

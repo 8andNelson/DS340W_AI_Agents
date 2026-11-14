@@ -29,6 +29,9 @@ MEMORY_DATABASE_URL = os.getenv("MEMORY_DATABASE_URL", "").strip()
 # memories; the default), "read" (recall only: the bank stays fixed, for a
 # controlled test) or "off" (no recall, no retain -- the control group).
 MEMORY_MODE = os.getenv("MEMORY_MODE", "read_write").strip().lower()
+# Optional agents turned off for every run, e.g. "report,presentation"
+# (src/orchestration/handoff.py OPTIONAL_AGENTS; run.py --agents-off overrides).
+AGENTS_OFF = os.getenv("AGENTS_OFF", "")
 MEMORY_PACK_CHARS = int(os.getenv("MEMORY_PACK_CHARS", "12000"))  # size budget of one memory pack in a prompt
 MEMORY_MAX_REQUESTS_PER_CALL = int(os.getenv("MEMORY_MAX_REQUESTS_PER_CALL", "2"))  # model memory requests per LLM call
 _on = ("true", "1", "yes")
