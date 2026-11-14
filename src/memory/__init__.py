@@ -97,6 +97,9 @@ class MemoryClient:
             self.local.apply(op)
         elif self.backend == "postgres":
             self.local.apply_and_enqueue(op)
+        if op.get("table") in ("memories", "memory_usage"):
+            from src.memory import recall
+            recall.clear_cache()  # recall's short candidate cache must not hide this change
 
     def fetch(self, **filters) -> list[dict]:
         if self.backend == "off":

@@ -1430,14 +1430,35 @@ Done when:
 **Key goal:** every agent uses memory at its own decision points, not
 only the coding agent.
 
-Deliverables:
-- [ ] Recall points for Intake, Research, Validation, Data, Cleaning,
-      Code Discovery, Evaluation and Experiment (7.4). Deterministic
-      agents get structured hints only; no LLM call is added only to use
-      memory.
-- [ ] Slack line per stage when memory was used, and a Master Agent note
-      for each tuning action.
-- [ ] Hooks for the Report and Presentation Agents when they are built.
+Deliverables (status 2026-11-14):
+- [x] Recall points (`recall.for_agent`), each on a call the agent already
+      makes -- no LLM call was added for memory: Intake (its topic),
+      Research (topic and query, each parallel query), Validation (the
+      candidate titles), Data (`plan_data_needs`: the Parent Paper, its
+      dataset, the target terms), Cleaning (the column-mapping proposal:
+      the two dataset links), Code Discovery (the paper's title and scope),
+      Evaluation (the analyst review: paper, data, script) and Experiment
+      (its decision: paper, data, script; it also sees Evaluation Agent
+      memories). Pure extraction calls (metric values, entry counts) get no
+      memory: numbers come from this run's sources only.
+- [x] Every agent names its used cases on one separate `MEMORY_USED:` line,
+      which `llm.chat` removes before the agent's own parser sees the answer
+      (several agents must get a pure JSON list).
+- [x] Relevance gains a `topic` feature (word overlap with the memory's
+      topic), and words that appear in nearly every topic of this project
+      ("machine", "learning", "detecting", ...) are ignored. Found by the
+      retrieval test: before this change it failed for the new Intake and
+      Research queries (an unrelated topic matched every fraud framing).
+- [x] A short candidate cache (120 s) so parallel recalls share one fetch;
+      cleared by any write to memories and at the start of every run.
+- [x] Slack line per attempt that was shown past cases
+      (`message_formatter.format_memory_use`). The Master Agent note for
+      tuning actions comes with tuning (M8).
+- [ ] Hooks for the Report and Presentation Agents: they do not exist yet;
+      `recall.for_agent("Report Agent", ...)` is the hook to use.
+- Retrieval test set: 50 queries (17 new, every agent); gate passed
+  (97% of 38, no harmful, no critical warning missed, 0 of 12 no-match
+  queries showed anything). Labels are still a draft.
 
 Done when:
 - Each agent's prompt has a memory pack when matching memories exist.
@@ -1449,19 +1470,40 @@ Done when:
 **Key goal:** a fair measurement of whether memory helps, which can be
 an experiment in the final report.
 
-Deliverables:
-- [ ] Written test plan before the first run
-      (`reports/comparisons/<group>.json`): topics, conditions, repeats,
-      primary metrics, exclusion rules (11.8).
-- [ ] `MEMORY_SNAPSHOT` and `MEMORY_COMPARISON_GROUP`; frozen snapshot;
-      held-out topics; test runs do not feed each other (11.8, 13).
-- [ ] At least 3 runs per topic and condition (`off`, `read`, optional
-      no-warnings), in alternating order, with the same commit and provider.
-- [ ] `compare` output grouped by assigned condition, with actual
-      exposure, n, spread, test (n ≥ 3), and confounders (11.7).
-- [ ] Optional: pipeline tuning (`MEMORY_TUNING`, 7.6), tested as its own
-      condition; embeddings only if the retrieval test shows missed
-      paraphrases (9.5).
+Deliverables (status 2026-11-14):
+- [x] Test harness (`src/orchestration/comparison.py`): `plan` writes
+      `reports/comparisons/<name>.json` once (refused if it exists) with the
+      topics, conditions, repeats, the run order, primary metrics,
+      exclusion rules, the code commit and LLM provider, the frozen memory
+      snapshot and the held-out topics; progress goes to a separate
+      `<name>.status.json`.
+- [x] Frozen snapshot and held-out topics: `MEMORY_COMPARISON_GROUP` (set
+      per run by the runner) loads the plan at run start; recall then sees
+      only memories created before the plan's snapshot and none from a run
+      on a test topic (`recall.visible`). The plan's own field replaces the
+      planned `MEMORY_SNAPSHOT` variable, so a run cannot be given another
+      snapshot by mistake. In `read` mode test runs retain nothing, so they
+      cannot feed each other.
+- [x] Runner: `run <name> [--all]` runs each planned run as
+      `python run.py "<topic>"` with its condition in the environment
+      (`MEMORY_MODE`, `MEMORY_WARNINGS`, `MEMORY_COMPARISON_GROUP`), in the
+      plan's alternating order; refused on another commit, uncommitted
+      tracked changes (unless `--allow-dirty`), another LLM provider, the
+      FreeLLMAPI router down, or another active run. A run whose recorded
+      memory mode or group differs from its assignment is marked invalid
+      and run again.
+- [x] Report: `report <name>` compares only the group's valid runs, grouped
+      by ASSIGNED condition (`assigned_condition`), with each run's actual
+      exposure, n, spread, the permutation test when each group has at
+      least 3 runs, and the differing conditions; `kind` is "controlled"
+      only for a `test:` group. Fixed on the way: runs sharing a supplied
+      Parent Paper PDF (`parent_pdf:` group) were reported as "controlled".
+- [x] Conditions `off`, `read`, and optionally `read_no_warnings`
+      (`MEMORY_WARNINGS=false`: good cases only).
+- [ ] The runs themselves: at least 3 per topic and condition. Not started;
+      it needs the person's go-ahead (LLM and Brave quota, several hours).
+- [ ] Optional: pipeline tuning (`MEMORY_TUNING`, 7.6); embeddings are not
+      needed (the retrieval test shows no missed paraphrases).
 
 Done when:
 - The comparison table exists for all planned runs, including failed

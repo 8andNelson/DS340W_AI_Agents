@@ -826,6 +826,11 @@ def _memory_check(agent_name: str, inv: dict) -> dict | None:
     used = inv["memory"]
     if not used["recalls"] and not used["shown"]:
         return None
+    if used["shown"]:
+        from src import memory
+        titles = [(memory.get_memory(i) or {}).get("title") or i[:8] for i in dict.fromkeys(used["used"])]
+        slack_client.post_message(message_formatter.format_memory_use(
+            agent_name, inv["attempt"], len(set(used["shown"])), titles))
     if used["invalid_refs"]:
         entry = _log_entry("Correction", agent_name,
                            f"{agent_name} named past case(s) {', '.join(used['invalid_refs'])} that it was not shown "

@@ -93,7 +93,9 @@ def chat(prompt: str, system: str = "", timeout: int = 60, model: str = None, ef
         prompt = f"{prompt}\n\nYour reply: {content.strip()}\n\n{memory.request(request)}"
         content = _chat_once(prompt, system, timeout, model, effort, agent)
     memory.finish(content)
-    return content
+    # The agent's own parser gets exactly the format it asked for.
+    from src.memory.recall import strip_used_lines
+    return strip_used_lines(content)
 
 
 def _chat_once(prompt: str, system: str, timeout: int, model: str, effort: str, agent: str) -> str:

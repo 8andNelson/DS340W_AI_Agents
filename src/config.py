@@ -35,6 +35,10 @@ _on = ("true", "1", "yes")
 MEMORY_REUSE = os.getenv("MEMORY_REUSE", "true").strip().lower() in _on      # fast mode: adapt a good past script
 MEMORY_CURATOR = os.getenv("MEMORY_CURATOR", "true").strip().lower() in _on  # one LLM call per run writes lessons
 MEMORY_RERANK = os.getenv("MEMORY_RERANK", "true").strip().lower() in _on    # reorder a retry's pack for its feedback
+MEMORY_WARNINGS = os.getenv("MEMORY_WARNINGS", "true").strip().lower() in _on  # false: good cases only (a test condition)
+# The controlled test this run belongs to (src/orchestration/comparison.py sets
+# it per run): its plan fixes the memory snapshot and the held-out topics.
+MEMORY_COMPARISON_GROUP = os.getenv("MEMORY_COMPARISON_GROUP", "").strip()
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 

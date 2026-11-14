@@ -22,8 +22,11 @@ Return a JSON object with:
 Return ONLY valid JSON with no explanation or markdown."""
 
 
-def _call_openrouter(prompt: str) -> str:
-    return llm.chat(prompt, system=SYSTEM_PROMPT, timeout=120, agent="intake_agent")
+def _call_openrouter(prompt: str, topic: str = "") -> str:
+    # Past cases (src/memory/recall.py): how earlier runs framed similar topics.
+    from src.memory import recall
+    return llm.chat(prompt, system=SYSTEM_PROMPT, timeout=120, agent="intake_agent",
+                    memory=recall.for_agent("Intake Agent", text=topic, topic=topic) if topic else None)
 
 
 def _extract_json(text: str) -> dict:
@@ -43,7 +46,7 @@ def _extract_json(text: str) -> dict:
 def run(topic: str) -> dict:
     """Process a raw user topic into a structured research request."""
     prompt = INTAKE_PROMPT.format(topic=topic)
-    raw = _call_openrouter(prompt)
+    raw = _call_openrouter(prompt, topic)
     structured = _extract_json(raw)
 
     # Guarantee expected keys are present

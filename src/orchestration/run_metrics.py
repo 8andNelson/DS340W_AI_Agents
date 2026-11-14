@@ -161,7 +161,7 @@ _REPAIR_NOTE = re.compile(r"Repair attempts:\s*(\d+)")
 
 # run_conditions columns compare can group by, and the ones it checks for
 # differences between groups (possible confounders).
-GROUP_FIELDS = ("memory_mode", "memory_exposure", "llm_provider", "git_commit", "code_source", "contributor",
+GROUP_FIELDS = ("memory_mode", "assigned_condition", "memory_exposure", "llm_provider", "git_commit", "code_source", "contributor",
                 "comparison_group", "status")
 CONFOUNDER_FIELDS = ("git_commit", "git_dirty", "llm_provider", "top_served_model", "rows_used", "sampled",
                      "dataset_identities", "code_source", "model_family", "memory_mode", "memory_exposure",
@@ -451,7 +451,8 @@ def _measure(run: dict, status: str, stages: list, next_start: str | None, notes
         "memory_exposure": None,  # set below from the run's recorded memory use
         "memory_bank_size": json.dumps(info["memory_bank_size"]) if "memory_bank_size" in info else None,
         "memory_bank_snapshot": info.get("memory_snapshot"),
-        "comparison_group": f"parent_pdf:{input_fingerprint}" if input_fingerprint else None,
+        # A planned test's group (recorded at the run's start) wins; else the supplied Parent Paper's input.
+        "comparison_group": info.get("comparison_group") or (f"parent_pdf:{input_fingerprint}" if input_fingerprint else None),
         "seeds": json.dumps({"split_seed": (cleaning or {}).get("split_seed"),
                              "script_seeds": script_seeds(script) if script is not None else None}),
         "python_version": info.get("python_version"),
@@ -894,9 +895,12 @@ def compare_runs(runs: list, group_by: str = "memory_mode", metrics: tuple = DEF
     for r in runs:
         tasks.setdefault("all tasks" if all_tasks else _task(r["conditions"]), []).append(r)
 
+    # Only a planned test (src/orchestration/comparison.py, "test:<name>") is a
+    # controlled comparison; runs sharing a supplied Parent Paper PDF
+    # ("parent_pdf:...") are the same task, not a controlled test.
     kind = "descriptive"
     groups_seen = {r["conditions"].get("comparison_group") for r in runs}
-    if len(groups_seen) == 1 and None not in groups_seen:
+    if len(groups_seen) == 1 and str(next(iter(groups_seen)) or "").startswith("test:"):
         kind = "controlled"
 
     blocks = []

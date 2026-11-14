@@ -17,7 +17,7 @@ from src.agents import (
     cleaning_agent, data_agent, master_agent, replication_agent,
 )
 from src.orchestration import (
-    code_discovery_cache, column_mapping, dataset_cache, run_context, run_store, state_manager,
+    code_discovery_cache, column_mapping, comparison, dataset_cache, run_context, run_store, state_manager,
 )
 from src.search import camoufox_fetch, page_fetch, paper_fulltext, serpapi_search, web_search
 
@@ -77,6 +77,9 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     # or a hosted store, whatever .env says; the scrubber does not read the real .env.
     monkeypatch.setattr(memory, "MEMORY_BACKEND", "sqlite")
     monkeypatch.setattr(config, "MEMORY_MODE", "read_write")
+    monkeypatch.setattr(config, "MEMORY_WARNINGS", True)
+    monkeypatch.setattr(config, "MEMORY_COMPARISON_GROUP", "")  # no controlled test, whatever .env says
+    monkeypatch.setattr(comparison, "COMPARISONS_DIR", tmp_path / "reports" / "comparisons")
     monkeypatch.setattr(memory, "LOCAL_DB", tmp_path / "database" / "memory_local.db")
     monkeypatch.setattr(memory_scrub, "ENV_FILE", tmp_path / ".env")
     memory_scrub._env_values.cache_clear()

@@ -33,6 +33,16 @@ def format_finished(agent_name: str, status: str, summary: str, next_step: str =
     return "\n".join(lines)
 
 
+def format_memory_use(agent_name: str, attempt: int, shown: int, used_titles: list) -> str:
+    """One line per attempt that was shown past cases from the team's
+    memory (src/memory/recall.py): how many, and which ones the agent said
+    it used ("used" is the agent's own report)."""
+    used = "; ".join(t[:80] for t in used_titles[:3]) or "none"
+    return "\n".join([f"[{agent_name}]", "MEMORY: past cases from earlier runs",
+                      f"ATTEMPT: {attempt}", f"SHOWN: {shown}",
+                      f"USED (agent's report): {len(used_titles)} -- {used}"])
+
+
 def format_run_started(topic: str) -> str:
     """Posted once at the very start of each master_agent.run_pipeline()
     call. Two purposes: gives a human scrolling the shared channel a clear

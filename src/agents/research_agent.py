@@ -122,7 +122,9 @@ For each included result return a JSON object. Use only information visible in t
 Return a JSON array. If no results qualify, return [].
 Return ONLY valid JSON. No explanation or markdown."""
 
-    content = llm.chat(prompt, timeout=300, agent="research_agent")
+    from src.memory import recall
+    content = llm.chat(prompt, timeout=300, agent="research_agent",
+                       memory=recall.for_agent("Research Agent", text=f"{topic} {query}", topic=topic))
 
     try:
         extracted = json.loads(content)

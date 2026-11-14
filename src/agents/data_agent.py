@@ -243,7 +243,10 @@ Return ONE JSON object:
 Return ONLY valid JSON. No explanation or markdown."""
 
     try:
-        content = llm.chat(prompt, timeout=300, agent="data_agent")
+        from src.memory import recall
+        context = recall.for_agent("Data Agent", text=f"{parent_paper.get('title', '')} {parent_paper.get('dataset', '')}",
+                                   parent_paper=parent_paper, intake={"target_terms": target_terms or []})
+        content = llm.chat(prompt, timeout=300, agent="data_agent", memory=context)
         try:
             answer = json.loads(content)
         except json.JSONDecodeError:

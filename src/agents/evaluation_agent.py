@@ -495,9 +495,12 @@ def review(parent_paper: dict, paper: dict, replication_result: dict, metrics: l
 
     raw, reviewed_by, review_error = {}, "", ""
     try:
+        from src.memory import recall
+        context = recall.for_agent("Evaluation Agent", text=parent_paper.get("title", ""), parent_paper=parent_paper,
+                                   cleaning=cleaning_result, dataset=dataset_result, script=script)
         content = llm.chat(_review_prompt(parent_paper, paper, replication_result, script, stdout, stderr,
                                           metrics, facts, static, history),
-                           timeout=REVIEW_TIMEOUT_SECONDS, effort="high", agent="evaluation_agent")
+                           timeout=REVIEW_TIMEOUT_SECONDS, effort="high", agent="evaluation_agent", memory=context)
         raw = llm.parse_json(content, default={})
         raw = raw if isinstance(raw, dict) else {}
         reviewed_by = llm.last_served_by()

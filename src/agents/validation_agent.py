@@ -170,7 +170,10 @@ Rules:
 
 Return ONLY a valid JSON array. No explanation or markdown."""
 
-    content = llm.chat(prompt, timeout=300, agent="validation_agent")
+    from src.memory import recall
+    titles = " ".join(str(p.get("title") or "") for p in papers)
+    content = llm.chat(prompt, timeout=300, agent="validation_agent",
+                       memory=recall.for_agent("Validation Agent", text=titles[:2000]))
 
     try:
         assessments = json.loads(content)

@@ -122,7 +122,11 @@ Return ONLY a JSON array:
 Return [] if no column maps."""
 
     try:
-        content = llm.chat(prompt, timeout=300, agent="cleaning_agent")
+        from src.memory import recall
+        content = llm.chat(prompt, timeout=300, agent="cleaning_agent",
+                           memory=recall.for_agent("Cleaning Agent", text=f"{anchor_link} {df_link}",
+                                                   dataset={"selected_datasets": [{"name": anchor_link},
+                                                                                  {"name": df_link}]}))
     except Exception as e:
         print(f"[Cleaning Agent] Column-mapping proposal call failed: {e}")
         return []

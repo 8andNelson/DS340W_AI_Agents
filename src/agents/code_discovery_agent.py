@@ -197,7 +197,10 @@ For each candidate repository, return a JSON object:
 Return a JSON array of candidate repositories, best match first. If none are found, return an empty array [].
 Return ONLY valid JSON. No explanation or markdown."""
 
-    content = llm.chat(prompt, timeout=300, agent="code_discovery_agent")
+    from src.memory import recall
+    content = llm.chat(prompt, timeout=300, agent="code_discovery_agent",
+                       memory=recall.for_agent("Code Discovery Agent", text=f"{paper_title} {scope_description}"[:2000],
+                                               parent_paper={"title": paper_title}))
 
     try:
         candidates = json.loads(content)

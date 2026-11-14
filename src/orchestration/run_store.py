@@ -395,13 +395,23 @@ def _memory_snapshot() -> dict:
     snapshot) and how many are active per agent. Fail-soft: {} on error."""
     try:
         from src import memory
-        from src.config import MEMORY_CURATOR, MEMORY_MODE, MEMORY_REUSE
+        from src.config import MEMORY_CURATOR, MEMORY_MODE, MEMORY_REUSE, MEMORY_WARNINGS
+        from src.memory import recall
+        from src.orchestration import comparison
+        recall.clear_cache()  # a new run sees the bank as it is now
         info = {"memory_snapshot": _now(), "memory_mode": MEMORY_MODE, "memory_backend": memory.backend_name(),
-                "memory_reuse": MEMORY_REUSE, "memory_curator": MEMORY_CURATOR}
+                "memory_reuse": MEMORY_REUSE, "memory_curator": MEMORY_CURATOR, "memory_warnings": MEMORY_WARNINGS}
+        plan = comparison.active_plan()
+        if plan:
+            # A controlled test (plan 11.8): every run of it sees the same frozen
+            # bank, without memories from runs on the test topics.
+            info.update(memory_snapshot=plan["memory_snapshot"], comparison_group=plan["comparison_group"],
+                        memory_holdout_topics=plan["held_out_topics"])
         if MEMORY_MODE in ("read", "read_write") and memory.backend_name() != "off":
             sizes = {}
             for m in memory.find_memories(states=("active",), limit=100_000):
-                sizes[m["agent"]] = sizes.get(m["agent"], 0) + 1
+                if recall.visible(m, info):
+                    sizes[m["agent"]] = sizes.get(m["agent"], 0) + 1
             info["memory_bank_size"] = sizes
         return info
     except Exception as e:

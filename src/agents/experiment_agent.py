@@ -270,9 +270,13 @@ def run(parent_paper: dict, replication_result: dict, evaluation_result: dict, c
 
     raw, proposed_by, notes = {}, "", []
     try:
+        from src.memory import recall
+        context = recall.for_agent("Experiment Agent", text=f"{parent_paper.get('title', '')} gap {gap}",
+                                   parent_paper=parent_paper, cleaning=cleaning_result, dataset=dataset_result,
+                                   script=script, search_agents=["Experiment Agent", "Evaluation Agent"])
         content = llm.chat(_prompt(parent_paper, paper, replication_result, script, stdout, evaluation_result,
                                    code_discovery_result, gap, history, feedback),
-                           timeout=PROPOSAL_TIMEOUT_SECONDS, effort="high", agent="experiment_agent")
+                           timeout=PROPOSAL_TIMEOUT_SECONDS, effort="high", agent="experiment_agent", memory=context)
         raw = llm.parse_json(content, default={})
         raw = raw if isinstance(raw, dict) else {}
         proposed_by = llm.last_served_by()
