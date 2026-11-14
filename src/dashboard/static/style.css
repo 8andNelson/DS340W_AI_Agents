@@ -424,3 +424,22 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before { animation: none !important; transition: none !important; }
 }
+
+/* Compare runs and Memory views */
+.cmp-controls { flex-wrap: wrap; align-items: center; gap: 14px; }
+.cmp-controls select, .cmp-controls input[type=search] { margin-left: 6px; padding: 4px 6px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--surface); color: var(--text); }
+.cmp-block { margin-top: 18px; }
+.cmp-block h2 { font-size: 15px; margin: 0 0 8px; }
+.cmp-note { color: var(--warn); }
+.mem-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; }
+.mem-layout tr[data-memory] { cursor: pointer; }
+.mem-layout tr.selected td { background: var(--accent-soft); }
+.mem-detail { padding: 16px; overflow: auto; max-height: 640px; }
+.mem-detail pre { white-space: pre-wrap; word-break: break-word; background: var(--code-bg); padding: 10px; border-radius: 6px;
+  font-size: 12px; max-height: 280px; overflow: auto; }
+.badge.positive { background: var(--ok-soft); color: var(--ok); }
+.badge.negative { background: var(--bad-soft); color: var(--bad); }
+.badge.neutral, .badge.candidate, .badge.superseded, .badge.retired { background: var(--surface-2); color: var(--muted); }
+.badge.quarantined { background: var(--bad-soft); color: var(--bad); }
+@media (max-width: 900px) { .mem-layout { grid-template-columns: 1fr; } }

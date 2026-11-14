@@ -182,7 +182,14 @@ def test_runner_passes_fixed_input_as_separate_cli_arguments(tmp_path):
 def test_dashboard_imports_no_pipeline_module():
     code = ("import sys, src.dashboard.server; "
             "print([m for m in sys.modules if m.startswith('src.') and not m.startswith('src.dashboard') "
-            "and m != 'src.paper_input'])")
+            "and m not in ('src.paper_input', 'src.analysis')])")
+    out = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]"
+
+
+def test_the_shared_analysis_module_imports_nothing_from_the_project():
+    # src.analysis is shared by the pipeline and the dashboard, so it must stay pure.
+    code = "import sys, src.analysis; print([m for m in sys.modules if m.startswith('src.') and m != 'src.analysis'])"
     out = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "[]"
 

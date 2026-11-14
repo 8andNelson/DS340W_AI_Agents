@@ -37,7 +37,7 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file
 from src import paper_input
 
-from src.dashboard import editor, pdf_fetch, readers
+from src.dashboard import editor, insights, pdf_fetch, readers
 from src.dashboard.freellmapi import FreeLLMAPIManager
 from src.dashboard.runner import CONSOLE_DIR, PipelineRunner, RunError, validate_topic
 
@@ -48,6 +48,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 STATE_FILE = REPO_ROOT / "logs" / "project_state.json"
 MASTER_LOG = REPO_ROOT / "logs" / "master_agent_log.json"
 RUN_DB = REPO_ROOT / "database" / "project_runs.db"
+MEMORY_DB = REPO_ROOT / "database" / "memory_local.db"  # the memory store's local mirror (read-only here)
 
 # The dashboard's own files
 DASHBOARD_FILES = REPO_ROOT / "dashboard_files"
@@ -501,6 +502,40 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
             else:
                 r["is_current"] = r["run_id"] is None
         return jsonify(listed)
+
+    # --- Compare runs and Memory (read-only; src/dashboard/insights.py) ---
+
+    @app.get("/api/compare")
+    def compare_runs():
+        metrics = [m for m in (request.args.get("metrics") or "").split(",") if m.strip()]
+        try:
+            return jsonify(insights.compare(RUN_DB, group_by=request.args.get("group_by") or "memory_mode",
+                                            topic=request.args.get("topic") or "",
+                                            group=request.args.get("group") or "",
+                                            all_tasks=request.args.get("all_tasks") == "1", metrics=metrics))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            return jsonify({"error": f"Run measurements unavailable: {e}"}), 503
+
+    @app.get("/api/memories")
+    def memories():
+        if request.args.get("refresh") == "1":
+            insights.clear_cache()
+        try:
+            return jsonify(insights.list_memories(MEMORY_DB, agent=request.args.get("agent") or "",
+                                                  state=request.args.get("state", "active"),
+                                                  search=request.args.get("q") or ""))
+        except Exception as e:
+            return jsonify({"error": f"Memory store unavailable: {e}"}), 503
+
+    @app.get("/api/memories/<memory_id>")
+    def memory(memory_id):
+        try:
+            found = insights.memory_detail(MEMORY_DB, memory_id)
+        except Exception as e:
+            return jsonify({"error": f"Memory store unavailable: {e}"}), 503
+        return jsonify(found) if found else (jsonify({"error": "No such memory"}), 404)
 
     # --- FreeLLMAPI router (Docker) ---
 

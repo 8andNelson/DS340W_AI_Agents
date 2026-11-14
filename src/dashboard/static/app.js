@@ -106,7 +106,11 @@ const loaders = {
   documents: loadDocuments,
   activity: loadActivity,
   runs: loadRuns,
+  compare: loadCompare,
+  memory: loadMemory,
 };
+// Views that cover every run, not the run being viewed.
+const GLOBAL_VIEWS = ["runs", "compare", "memory"];
 
 function route() {
   const [view, query] = (location.hash || "#overview").slice(1).split("?");
@@ -117,10 +121,10 @@ function route() {
   document.querySelectorAll(".view").forEach((el) => { el.hidden = el.id !== `view-${currentView}`; });
   document.querySelectorAll("#nav a").forEach((a) => {
     a.classList.toggle("active", a.dataset.view === currentView);
-    // Every page stays on the run being viewed; Run history is not per run.
-    a.href = a.dataset.view === "runs" ? "#runs" : hashFor(a.dataset.view, viewRun);
+    // Every page stays on the run being viewed; Run history, Compare runs and Memory are not per run.
+    a.href = GLOBAL_VIEWS.includes(a.dataset.view) ? `#${a.dataset.view}` : hashFor(a.dataset.view, viewRun);
   });
-  $("#past-banner").hidden = !viewRun || currentView === "runs";
+  $("#past-banner").hidden = !viewRun || GLOBAL_VIEWS.includes(currentView);
   $("#run-card-back").hidden = !viewRun;
   if (runChanged) resetRunScopedState();
   loaders[currentView]();
@@ -892,6 +896,124 @@ $("#run-list").addEventListener("click", (e) => {
   const btn = e.target.closest("[data-open-run]");
   if (btn) openRun(btn.dataset.openRun || null);
 });
+
+// --- Compare runs (read-only; the same numbers as `run_metrics compare`) ---
+
+const fmtVal = (v) => (v == null ? "—" : typeof v === "number" ? (Number.isInteger(v) ? String(v) : v.toPrecision(4)) : esc(v));
+let compareFieldsLoaded = false;
+
+async function loadCompare() {
+  const params = new URLSearchParams({
+    group_by: $("#cmp-group-by").value || "memory_mode", topic: $("#cmp-topic").value.trim(),
+    group: $("#cmp-group").value, all_tasks: $("#cmp-all-tasks").checked ? "1" : "",
+  });
+  let data;
+  try { data = await api(`/api/compare?${params}`); } catch (err) {
+    $("#cmp-blocks").innerHTML = `<div class="empty">${esc(err.message)}</div>`; return;
+  }
+  if (!compareFieldsLoaded) {
+    $("#cmp-group-by").innerHTML = data.group_fields.map((f) =>
+      `<option value="${esc(f)}" ${f === data.group_by ? "selected" : ""}>${esc(f.replace(/_/g, " "))}</option>`).join("");
+    $("#cmp-group").innerHTML = `<option value="">All runs</option>` +
+      data.groups_available.map((g) => `<option value="${esc(g)}">${esc(g.replace(/^test:/, ""))}</option>`).join("");
+    compareFieldsLoaded = true;
+  }
+  $("#cmp-kind").textContent = data.kind === "controlled"
+    ? "A controlled test: runs grouped by the condition they were assigned before they started."
+    : "Descriptive: these runs were not a planned test, so differences cannot show what caused them.";
+  const shown = data.runs.length ? Object.keys(data.runs[0].values) : [];
+  $("#cmp-runs").innerHTML = data.runs.length ? `
+    <thead><tr><th>Run</th><th>Status</th><th>${esc(data.group_by.replace(/_/g, " "))}</th><th>Memory exposure</th>
+      ${shown.map((m) => `<th>${esc(m.replace(/_/g, " "))}</th>`).join("")}</tr></thead>
+    <tbody>${data.runs.map((r) => `<tr>
+      <td><a href="${hashFor("overview", r.run_id)}">${esc(r.run_id)}</a><div class="muted small">${esc(r.topic || "")}</div></td>
+      <td><span class="badge ${esc(r.status)}">${esc(r.status)}</span></td><td>${esc(r.group ?? "—")}</td>
+      <td>${esc(r.memory_exposure ?? "—")}</td>${shown.map((m) => `<td>${fmtVal(r.values[m])}</td>`).join("")}</tr>`).join("")}</tbody>`
+    : `<tbody><tr><td class="muted">No measured runs match.</td></tr></tbody>`;
+  $("#cmp-blocks").innerHTML = data.blocks.map((b) => `
+    <div class="card cmp-block"><div style="padding:14px">
+      <h2>Task: ${esc(b.task)} <span class="muted small">(${b.runs} run(s))</span></h2>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Metric</th>${Object.entries(b.groups).map(([g, info]) =>
+          `<th>${esc(g)} <span class="muted small">${info.runs} run(s)${info.too_few_runs ? ", too few runs: no conclusion" : ""}</span></th>`).join("")}</tr></thead>
+        <tbody>${data.metrics.map((m) => `<tr><td>${esc(m.replace(/_/g, " "))}</td>${Object.values(b.groups).map((info) => {
+          const s = info.metrics[m];
+          return `<td>${s.n ? `median ${fmtVal(s.median)} <span class="muted small">mean ${fmtVal(s.mean)}, range ${fmtVal(s.min)} to ${fmtVal(s.max)}, n=${s.n}/${s.runs}</span>` : `<span class="muted">n=0/${s.runs}</span>`}</td>`;
+        }).join("")}</tr>`).join("")}</tbody></table></div>
+      ${Object.keys(b.tests).length ? `<p class="small"><strong>Tests</strong> (two-sided permutation test on the mean; Cliff's delta, first group vs second): ${
+        Object.entries(b.tests).map(([m, t]) => `${esc(m)}: p=${t.p_value.toFixed(4)}, delta=${t.cliffs_delta.toFixed(2)}, n=${t.n.join("/")}`).join("; ")}</p>`
+        : Object.keys(b.groups).length === 2 ? `<p class="small muted">No test: each group needs at least 3 runs with a value.</p>` : ""}
+      ${Object.keys(b.confounders).length ? `<p class="small cmp-note"><strong>Conditions that differ</strong> (possible confounders): ${
+        Object.entries(b.confounders).map(([f, v]) => `${esc(f)}: ${Object.entries(v).map(([g, vals]) => `${esc(g)} = ${esc(vals.join(", ").slice(0, 120))}`).join("; ")}`).join(" | ")}</p>` : ""}
+    </div></div>`).join("") || `<div class="empty">Nothing to compare.</div>`;
+}
+
+["#cmp-group-by", "#cmp-group", "#cmp-all-tasks"].forEach((s) => $(s).addEventListener("change", loadCompare));
+$("#cmp-topic").addEventListener("change", loadCompare);
+
+// --- Memory (read-only) ---
+
+let memoryAgentsLoaded = false;
+let memorySelected = null;
+
+async function loadMemory(refresh = false) {
+  const params = new URLSearchParams({ agent: $("#mem-agent").value, state: $("#mem-state").value,
+                                       q: $("#mem-search").value.trim(), refresh: refresh ? "1" : "" });
+  let data;
+  try { data = await api(`/api/memories?${params}`); } catch (err) {
+    $("#mem-table").innerHTML = `<tbody><tr><td>${esc(err.message)}</td></tr></tbody>`; return;
+  }
+  if (!memoryAgentsLoaded) {
+    $("#mem-agent").innerHTML = `<option value="">All agents</option>` +
+      data.agents.map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
+    memoryAgentsLoaded = true;
+  }
+  const states = Object.entries(data.states).map(([s, n]) => `${n} ${s}`).join(", ");
+  $("#mem-source").textContent = `From ${data.source}: ${data.total} memories (${states}). Showing ${data.memories.length}.`;
+  const best = new Set(Object.values(data.by_agent).flatMap((a) => a.best));
+  const worst = new Set(Object.values(data.by_agent).flatMap((a) => a.worst));
+  $("#mem-table").innerHTML = data.memories.length ? `
+    <thead><tr><th>Score</th><th>Agent</th><th>Kind</th><th>Title</th></tr></thead>
+    <tbody>${data.memories.map((m) => `<tr data-memory="${esc(m.id)}" class="${m.id === memorySelected ? "selected" : ""}">
+      <td><strong>${m.effective_quality.toFixed(2)}</strong>${best.has(m.id) ? ` <span class="badge ok">best</span>` : ""}${worst.has(m.id) ? ` <span class="badge failed">worst</span>` : ""}</td>
+      <td>${esc(m.agent)}</td><td><span class="badge ${esc(m.polarity)}">${esc(m.kind)}</span></td>
+      <td>${esc(m.title)}<div class="muted small">lineage ${esc(m.lineage)}, ${esc(m.state)}${m.times_helped || m.times_hurt ? `, helped ${m.times_helped}, hurt ${m.times_hurt}` : ""}</div></td></tr>`).join("")}</tbody>`
+    : `<tbody><tr><td class="muted">No memories match.</td></tr></tbody>`;
+}
+
+async function showMemory(id) {
+  memorySelected = id;
+  document.querySelectorAll("#mem-table tr[data-memory]").forEach((tr) => tr.classList.toggle("selected", tr.dataset.memory === id));
+  let m;
+  try { m = await api(`/api/memories/${encodeURIComponent(id)}`); } catch (err) {
+    $("#mem-detail").innerHTML = `<div class="empty">${esc(err.message)}</div>`; return;
+  }
+  const reasons = Object.entries(m.quality_reasons || {}).filter(([, v]) => v && typeof v === "object" && "value" in v);
+  $("#mem-detail").innerHTML = `
+    <h2 style="margin-top:0;font-size:15px">${esc(m.title)}</h2>
+    <p class="small"><span class="badge ${esc(m.polarity)}">${esc(m.kind)} / ${esc(m.polarity)}</span>
+      <span class="badge ${esc(m.state)}">${esc(m.state)}</span> lineage ${esc(m.lineage)}, trust ${esc(m.trust)}, ${esc(m.agent)}</p>
+    <p>${esc(m.summary)}</p>
+    <p class="small"><strong>Effective quality ${m.effective_quality.toFixed(2)}</strong> (base ${Number(m.quality || 0).toFixed(2)};
+      helped ${m.times_helped}, hurt ${m.times_hurt}). ${esc((m.quality_reasons || {}).formula || "")}</p>
+    ${reasons.length ? `<table class="table small"><tbody>${reasons.map(([k, v]) =>
+      `<tr><td>${esc(k)}</td><td>${fmtVal(v.value)}</td><td>${esc(v.reason || "")}</td></tr>`).join("")}</tbody></table>` : ""}
+    <p class="small muted">Shown to agents ${m.use.shown} time(s), used ${m.use.used} (the agents' own report), followed by
+      ${m.use.helped} good and ${m.use.hurt} bad outcome(s). From run ${esc(m.run_id || "none")}; source: ${esc(m.source)}.</p>
+    ${m.state_changes.length ? `<p class="small"><strong>State changes</strong></p><ul class="small">${m.state_changes.map((c) =>
+      `<li>${esc(fmtTime(c.created_at))}: ${esc(c.old_state || "none")} to ${esc(c.new_state)} by ${esc(c.actor || "unknown")}: ${esc(c.reason || "")}</li>`).join("")}</ul>` : ""}
+    <p class="small"><strong>Task features</strong></p><pre>${esc(JSON.stringify(m.task || {}, null, 1))}</pre>
+    <p class="small"><strong>Evidence</strong></p><pre>${esc(JSON.stringify(m.evidence || {}, null, 1))}</pre>
+    ${m.content ? `<p class="small"><strong>Content</strong></p><pre>${esc(m.content)}</pre>` : ""}`;
+}
+
+$("#mem-table").addEventListener("click", (e) => {
+  const row = e.target.closest("tr[data-memory]");
+  if (row) showMemory(row.dataset.memory);
+});
+["#mem-agent", "#mem-state"].forEach((s) => $(s).addEventListener("change", () => loadMemory()));
+$("#mem-search").addEventListener("change", () => loadMemory());
+$("#mem-refresh").addEventListener("click", () => loadMemory(true));
 
 // --- Model router (FreeLLMAPI in Docker) ---
 

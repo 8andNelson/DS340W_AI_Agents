@@ -37,6 +37,8 @@
       <a href="#documents" data-view="documents">Documents</a>
       <a href="#activity" data-view="activity">Master Agent log</a>
       <a href="#runs" data-view="runs" class="nav-runs">Run history</a>
+      <a href="#compare" data-view="compare">Compare runs</a>
+      <a href="#memory" data-view="memory">Memory</a>
     </nav>
     <div class="sidebar-foot">
       <div class="phase" id="phase-label"></div>
@@ -199,6 +201,48 @@
         <p class="muted">Every pipeline run. Open one to see its papers, datasets, scripts, documents and decisions on every page.</p>
       </header>
       <div class="run-list" id="run-list"></div>
+    </section>
+
+    <!-- Compare runs (read-only) -->
+    <section class="view" id="view-compare" hidden>
+      <header class="view-head">
+        <h1>Compare runs</h1>
+        <p class="muted">Measured runs, grouped by task (same topic and Parent Paper) and by one condition. The same
+          numbers as <code>python -m src.orchestration.run_metrics compare</code>. Only a planned test is a controlled
+          comparison; any other grouping describes differences and cannot show what caused them.</p>
+      </header>
+      <div class="filters cmp-controls">
+        <label class="small">Group by <select id="cmp-group-by"></select></label>
+        <label class="small">Test <select id="cmp-group"><option value="">All runs</option></select></label>
+        <label class="small">Topic words <input id="cmp-topic" type="search" placeholder="e.g. fraud"></label>
+        <label class="small"><input type="checkbox" id="cmp-all-tasks"> Put different tasks together</label>
+      </div>
+      <div id="cmp-kind" class="muted small"></div>
+      <div class="card table-card"><div class="table-wrap"><table class="table" id="cmp-runs"></table></div></div>
+      <div id="cmp-blocks"></div>
+    </section>
+
+    <!-- Memory (read-only) -->
+    <section class="view" id="view-memory" hidden>
+      <header class="view-head">
+        <h1>Memory</h1>
+        <p class="muted">The team's shared agent memory, ranked by effective quality (base score moved by the outcomes
+          of earlier use). Read-only: to approve or quarantine a memory use <code>python -m src.memory approve|quarantine</code>.</p>
+      </header>
+      <div class="filters cmp-controls">
+        <label class="small">Agent <select id="mem-agent"><option value="">All agents</option></select></label>
+        <label class="small">State <select id="mem-state">
+          <option value="active">Active</option><option value="candidate">Candidate</option>
+          <option value="superseded">Superseded</option><option value="retired">Retired</option>
+          <option value="quarantined">Quarantined</option><option value="">All states</option></select></label>
+        <label class="small">Search <input id="mem-search" type="search" placeholder="words in title or summary"></label>
+        <button class="btn sm" id="mem-refresh">Refresh</button>
+      </div>
+      <div id="mem-source" class="muted small"></div>
+      <div class="mem-layout">
+        <div class="card table-card"><div class="table-wrap tall"><table class="table" id="mem-table"></table></div></div>
+        <div class="card mem-detail" id="mem-detail"><div class="empty">Choose a memory to see its evidence and score.</div></div>
+      </div>
     </section>
   </main>
 

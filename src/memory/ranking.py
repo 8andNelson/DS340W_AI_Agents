@@ -37,16 +37,8 @@ TRUST_SCORE = {"normal": 1.0, "seed": 0.7, "low_trust": 0.5}
 MAX_GAP_POINTS = 20.0
 
 
-def effective_quality(memory: dict) -> float:
-    """The score recall ranks by: the base quality, moved toward how often
-    the memory was followed by a good outcome (plan 9.3)."""
-    base = float(memory.get("quality") or 0)
-    helped, hurt = int(memory.get("times_helped") or 0), int(memory.get("times_hurt") or 0)
-    judged = helped + hurt
-    if not judged:
-        return round(base, 4)
-    weight = 1 / (1 + judged / 3)
-    return round(weight * base + (1 - weight) * (helped + 1) / (judged + 2), 4)
+# Shared with the dashboard's Memory view (src/analysis.py).
+from src.analysis import effective_quality  # noqa: E402,F401
 
 
 def approval_score(failures_before: int) -> float:

@@ -1516,14 +1516,38 @@ Done when:
 **Key goal:** people can see what memory did and how runs compare, and
 the final report uses only recorded values.
 
-Deliverables:
-- [ ] Dashboard **Compare runs** view (read-only, 11.9).
-- [ ] Dashboard **Memory** view: best and worst per agent, search, one
-      memory with its evidence, state and score reasons (14).
-- [ ] Rating button, only if the team approves it (17, question 3).
-- [ ] Report Agent: "Memory used" section (reused scripts named as
-      adapted from run X) and the M8 comparison, read only from
-      `run_metrics` (11.8, 14).
+Deliverables (status 2026-11-14):
+- [x] Shared analysis (`src/analysis.py`, standard library only, imports
+      nothing from the project): the comparison (`compare_runs`, grouping,
+      statistics, permutation test, Cliff's delta, confounders), reading
+      `run_metrics` rows, and `effective_quality`. `run_metrics` and
+      `memory.ranking` re-export them, and the dashboard uses the same
+      code, so the two cannot drift. The dashboard may import only
+      `src.paper_input` and `src.analysis` (tests/test_dashboard.py).
+- [x] Dashboard **Compare runs** view (read-only, 11.9;
+      `src/dashboard/insights.py`, `/api/compare`): group by any condition,
+      a filter by test (`test:` group) or topic words, "put different
+      tasks together", the per-run table, per-task statistics, tests and
+      differing conditions. The view says "descriptive" unless it is a
+      planned test. Checked live: the same blocks as the CLI for all 12
+      measured runs.
+- [x] Dashboard **Memory** view (`/api/memories`, `/api/memories/<id>`):
+      ranked by effective quality, best and worst per agent, filter by
+      agent and state, search, and one memory with its content, task
+      features, evidence, score reasons, state changes and use (shown,
+      used, good and bad outcomes). It reads the hosted store when
+      `MEMORY_BACKEND=postgres` over a `READ ONLY` connection, and else (or
+      when the hosted store is not reachable, which it says) the local
+      mirror opened `mode=ro`. It never writes; approve and quarantine stay
+      in the CLI. Checked live: 101 memories from Neon.
+- [ ] Rating button, only if the team approves it (17, question 3). Not
+      built.
+- [x] Report helpers for the Report Agent (`src/memory/report.py`; the
+      Report Agent itself is project Milestone 13): `memory_used(run_id)`
+      (each memory shown, used or not, the outcome that followed, and a
+      fast-mode script named as adapted from its source run),
+      `comparison(name)` (each value with the run id / metric rows it
+      comes from) and `render_markdown`, a report section.
 
 Done when:
 - The dashboard and the `compare` CLI show the same values for the same
