@@ -372,6 +372,12 @@ def finish_run(run_id: str | None, status: str, final_phase: str = "",
         retain.retain_run(run_id)
     except Exception as e:
         _warn(f"retain the memories of run {run_id}", e)
+    # Record what followed each past case this run used (src/memory/learning.py).
+    try:
+        from src.memory import learning
+        learning.learn_run(run_id)
+    except Exception as e:
+        _warn(f"learn from the memory use of run {run_id}", e)
     # Measure the run (success, halted or crashed) from what was just recorded.
     # Fail-soft: `python -m src.orchestration.run_metrics compute <run_id>`
     # can make the same measurements later.
@@ -389,8 +395,9 @@ def _memory_snapshot() -> dict:
     snapshot) and how many are active per agent. Fail-soft: {} on error."""
     try:
         from src import memory
-        from src.config import MEMORY_MODE
-        info = {"memory_snapshot": _now(), "memory_mode": MEMORY_MODE, "memory_backend": memory.backend_name()}
+        from src.config import MEMORY_CURATOR, MEMORY_MODE, MEMORY_REUSE
+        info = {"memory_snapshot": _now(), "memory_mode": MEMORY_MODE, "memory_backend": memory.backend_name(),
+                "memory_reuse": MEMORY_REUSE, "memory_curator": MEMORY_CURATOR}
         if MEMORY_MODE in ("read", "read_write") and memory.backend_name() != "off":
             sizes = {}
             for m in memory.find_memories(states=("active",), limit=100_000):

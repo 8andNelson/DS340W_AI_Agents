@@ -757,6 +757,9 @@ def retain_run(run_id: str, dry_run: bool = False) -> dict:
         if not dry_run:
             c.write({"op_id": str(uuid.uuid4()), "type": "insert", "table": "memory_runs",
                      "rows": [_run_row(run)]})
+            # Lessons from the new memories (one LLM call; candidates until confirmed).
+            from src.memory import curator
+            report["curator"] = curator.curate_run(run_id, report["written"])
     except Exception as e:
         report["skipped"] = f"error: {type(e).__name__}: {e}"
         print(f"[Memory] WARNING: could not retain run {run_id}: {e}")

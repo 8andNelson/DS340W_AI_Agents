@@ -23,12 +23,30 @@ Failures (warnings) are not ranked by low quality: a warning is useful
 when it has a clear cause and the next attempt passed with the fix.
     usefulness = 0.4 cause + 0.3 fixed + 0.2 specific + 0.1 trust
 
-Use-based learning (section 9.3) is milestone M6; this is the base score.
+Learning from use (section 9.3, milestone M6): after a memory was used,
+the run's outcome is recorded (src/memory/learning.py: times_helped or
+times_hurt). effective_quality() blends the base score with that record;
+the more outcomes are known, the more they count:
+    use_score         = (helped + 1) / (helped + hurt + 2)     # 0.5 with no outcome
+    quality_effective = w * quality + (1 - w) * use_score,   w = 1 / (1 + (helped + hurt) / 3)
+Only judged outcomes count ("used" alone is the model's self-report).
 """
 WEIGHTS = {"outcome": 0.35, "approval": 0.20, "validity": 0.20, "downstream": 0.15, "trust": 0.10}
 WARNING_WEIGHTS = {"cause": 0.4, "fixed": 0.3, "specific": 0.2, "trust": 0.1}
 TRUST_SCORE = {"normal": 1.0, "seed": 0.7, "low_trust": 0.5}
 MAX_GAP_POINTS = 20.0
+
+
+def effective_quality(memory: dict) -> float:
+    """The score recall ranks by: the base quality, moved toward how often
+    the memory was followed by a good outcome (plan 9.3)."""
+    base = float(memory.get("quality") or 0)
+    helped, hurt = int(memory.get("times_helped") or 0), int(memory.get("times_hurt") or 0)
+    judged = helped + hurt
+    if not judged:
+        return round(base, 4)
+    weight = 1 / (1 + judged / 3)
+    return round(weight * base + (1 - weight) * (helped + 1) / (judged + 2), 4)
 
 
 def approval_score(failures_before: int) -> float:

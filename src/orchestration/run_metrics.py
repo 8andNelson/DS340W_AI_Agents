@@ -45,7 +45,9 @@ from src.orchestration.handoff import AGENT_PHASE
 
 # 3: memory use is measured (agents recall from milestone M5): memory mode,
 # actual exposure, cases shown and used, requests, prompt size, memories made.
-METRICS_VERSION = 3
+# 4: learning (milestone M6): outcomes of used memories (helped / hurt),
+# fast mode, and the reuse and curator settings.
+METRICS_VERSION = 4
 
 # A run still marked "running" with no recorded activity for this long is
 # measured as crashed (its process ended without closing the record).
@@ -56,8 +58,7 @@ STALE_AFTER = timedelta(hours=6)
 # comparison (plan section 11.7, rule 8). A run measured after its process
 # ended has no recorded memory settings: "unknown", never a control.
 PRE_MEMORY = "pre_memory"
-NOT_YET = {"memories_helped": "use-based learning is milestone M6", "memories_hurt": "use-based learning is milestone M6",
-           "fast_mode_used": "fast mode is milestone M6", "tuning_actions": "pipeline tuning is milestone M8"}
+NOT_YET = {"tuning_actions": "pipeline tuning is milestone M8"}
 
 # The workflow states, in order; final_phase_reached is the 1-based index.
 PHASE_ORDER = list(dict.fromkeys(AGENT_PHASE.values()))
@@ -444,9 +445,9 @@ def _measure(run: dict, status: str, stages: list, next_start: str | None, notes
         # Recorded at the run's start (run_store._memory_snapshot); unknown if measured later.
         "memory_mode": info.get("memory_mode") or "unknown",
         "memory_backend": info.get("memory_backend") or (MEMORY_BACKEND if info else None),
-        "memory_reuse": None,    # fast mode: milestone M6
+        "memory_reuse": None if info.get("memory_reuse") is None else int(info["memory_reuse"]),
         "memory_tuning": None,   # pipeline tuning: milestone M8
-        "memory_curator": None,  # lessons: milestone M6
+        "memory_curator": None if info.get("memory_curator") is None else int(info["memory_curator"]),
         "memory_exposure": None,  # set below from the run's recorded memory use
         "memory_bank_size": json.dumps(info["memory_bank_size"]) if "memory_bank_size" in info else None,
         "memory_bank_snapshot": info.get("memory_snapshot"),
@@ -658,13 +659,14 @@ def _measure(run: dict, status: str, stages: list, next_start: str | None, notes
         sheet.num("browser_fetches", sum((e.get("provider") or "direct") != "direct" for e in lines["page_fetch"]))
 
     # --- Memory use ---
-    _memory_metrics(sheet, conditions, run_id)
+    _memory_metrics(sheet, conditions, run_id,
+                    [o for s, o in outputs if s["agent"] == "Replication Agent" and isinstance(o, dict)])
 
     conditions["notes"] = json.dumps(notes) if notes else None
     return {"conditions": conditions, "metrics": sheet.rows}
 
 
-def _memory_metrics(sheet: "_Sheet", conditions: dict, run_id: str) -> None:
+def _memory_metrics(sheet: "_Sheet", conditions: dict, run_id: str, replication_outputs: list = ()) -> None:
     """Memory use, from the run's own records in the memory store: the
     attempt events' memory summaries and the memory_usage rows. Exposure is
     what agents actually received, apart from the assigned memory_mode
@@ -711,6 +713,11 @@ def _memory_metrics(sheet: "_Sheet", conditions: dict, run_id: str) -> None:
     sheet.num("memory_requests", sum(s.get("requests", 0) for s in summaries))
     sheet.num("memory_prompt_chars", sum(s.get("prompt_chars", 0) for s in summaries))
     sheet.num("memories_retained", len(store.rows("memories", run_id=run_id)))
+    judged = [u for u in usage if u.get("used")]
+    sheet.num("memories_helped", sum(u.get("helped") is True for u in judged))
+    sheet.num("memories_hurt", sum(u.get("helped") is False for u in judged))
+    fast = [o.get("fast_mode_from") for o in replication_outputs if o.get("fast_mode_from")]
+    sheet.num("fast_mode_used", int(bool(fast)), scope="Replication Agent")
     for agent in sorted({u.get("agent") for u in usage if u.get("agent")}):
         mine = [u for u in usage if u.get("agent") == agent]
         sheet.num("memories_recalled", len(mine), scope=agent)

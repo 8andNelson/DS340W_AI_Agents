@@ -13,6 +13,14 @@ A backend applies write "ops" and answers reads. An op is a JSON-safe dict:
    "state": <state>, "superseded_by": <id or None>}
       Change a memory's state (plan 8.4); the change itself is recorded by a
       separate insert into memory_state_changes.
+  {"op_id": <uuid>, "type": "usage_outcome", "table": "memory_usage", "key": {"id": <usage id>},
+   "memory_id": <id>, "helped": true|false}
+      Record what followed a memory's use (plan 9.3), once: the usage row's
+      helped is set only while it is still empty, and only then does the
+      memory's times_helped or times_hurt go up -- in one transaction.
+  {"op_id": <uuid>, "type": "set_quality", "table": "memories", "key": {"id": <id>},
+   "quality": <0..1>, "quality_reasons": {...}}
+      Change a memory's score and its reasons (a contradiction, plan 8.4).
 
 apply(op) applies an op exactly once: its op_id is recorded in
 applied_ops in the same transaction, so an op resent after a lost
@@ -57,6 +65,18 @@ def check_op(op: dict) -> None:
             raise ValueError("a set_state op changes one memory, by id")
         if op.get("state") not in schema.STATES:
             raise ValueError(f"state must be one of {', '.join(schema.STATES)}")
+    elif op.get("type") == "usage_outcome":
+        if op.get("table") != "memory_usage" or not (op.get("key") or {}).get("id") or not op.get("memory_id"):
+            raise ValueError("a usage_outcome op needs the usage id and its memory id")
+        if not isinstance(op.get("helped"), bool):
+            raise ValueError("helped must be true or false")
+    elif op.get("type") == "set_quality":
+        if op.get("table") != "memories" or not (op.get("key") or {}).get("id"):
+            raise ValueError("a set_quality op changes one memory, by id")
+        if not isinstance(op.get("quality"), (int, float)) or not 0 <= op["quality"] <= 1:
+            raise ValueError("quality must be between 0 and 1")
+        if not isinstance(op.get("quality_reasons"), dict):
+            raise ValueError("a set_quality op needs its quality_reasons")
     else:
         raise ValueError(f"unknown op type: {op.get('type')}")
 

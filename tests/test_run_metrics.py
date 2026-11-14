@@ -232,7 +232,9 @@ def test_finished_run_is_measured_with_all_metric_groups(script_dir, monkeypatch
     assert _value(metrics, "memory_exposure") == "none"
     assert _value(metrics, "memory_exposure_reason") == "no recall point was reached"
     assert _value(metrics, "memories_used") == 0 and _value(metrics, "recall_precision") is None
-    assert "milestone M6" in metrics[("run", "memories_helped")]["missing_reason"]
+    assert _value(metrics, "memories_helped") == 0 and _value(metrics, "memories_hurt") == 0
+    assert _value(metrics, "fast_mode_used", "Replication Agent") == 0
+    assert "milestone M8" in metrics[("run", "tuning_actions")]["missing_reason"]
 
 
 def test_crashed_run_keeps_unknown_values_unknown():

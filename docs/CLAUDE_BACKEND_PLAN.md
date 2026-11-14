@@ -1378,13 +1378,43 @@ Done when:
 memories followed by bad outcomes fall, across runs. Good past solutions
 can be reused safely.
 
-Deliverables:
-- [ ] Use score and `quality_effective` at run end (9.3).
-- [ ] ReviseRank on retries and reruns, with the permutation check (9.4).
-- [ ] Curator lessons, quote-checked, starting as `candidate` (8.3, 8.4).
-- [ ] Fast mode for the Replication Agent, only from `kept` solutions,
-      with all checks still run (7.5).
-- [ ] Contradiction linking (8.4).
+Deliverables (status 2026-11-14):
+- [x] Use score and `quality_effective` (`src/memory/learning.py`,
+      `ranking.effective_quality`): at run end, each used case gets an
+      outcome -- helped (attempt approved, lineage `kept`, its output not
+      itself a warning), hurt (attempt failed or rerun undone), or not
+      judged (lineage unknown or superseded); a diagnosis is judged by the
+      failed agent's next attempt. Applied once (`usage_outcome` op sets
+      `memory_usage.helped` only while empty and moves `times_helped` /
+      `times_hurt` in the same transaction). Only judged outcomes count;
+      human ratings (9.3) wait for the rating button (M9). Recall, the
+      pack and `review` use the effective score.
+- [x] ReviseRank (`MemoryContext._revise_rank`, `MEMORY_RERANK`): only when
+      Master Agent's notes carry feedback (a retry or rerun); the answer
+      must be a permutation of the shown cases, else the order stays; good
+      cases stay before warnings.
+- [x] Curator lessons (`src/memory/curator.py`, `MEMORY_CURATOR`): one LLM
+      call per retained run; at most 5 lessons, each quote checked against
+      its cited memory; stored as `candidate` (never recalled). Activation:
+      a person (`approve`) or a second, independent run that supports it
+      with a verified quote (`seen_count` reaches 2; a run cannot support
+      its own lesson).
+- [x] Fast mode (`MemoryContext.fast_mode_case`, `MEMORY_REUSE`): only a
+      kept solution with content, effective quality >= 0.8, the same model
+      families and, where known, the same task type and row bucket. If the
+      adapted script fails its first run, the memory is marked hurt at
+      once (before any repair can make the attempt pass); the normal repair
+      loop still runs. Recorded as `fast_mode_from` in the replication
+      result.
+- [x] Contradiction linking: a verified contradiction lowers both scores by
+      0.2 (`set_quality` op) and records `contradicted_by`; the pack shows
+      them as CONFLICTING CASES.
+- [x] Run metrics version 4: `memories_helped`, `memories_hurt`,
+      `fast_mode_used`, `memory_reuse`, `memory_curator`.
+- No schema change: the new ops use columns the `memory_agent` role may
+  already update (checked on Neon, 2026-11-14).
+- Not done: the curator over the 12 backfilled runs (needs the LLM router);
+  a live run.
 
 Done when:
 - After two runs on the same topic, the memory followed by a good

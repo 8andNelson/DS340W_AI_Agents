@@ -123,6 +123,7 @@ _RESULT_DEFAULTS = {
     "paper_text_status": "",       # "FULL_TEXT" | "ABSTRACT_ONLY" -- what the agent could read
     "revision_round": 0,           # 0 = first baseline; n = revised on an Evaluation Agent request
     "revision_instructions": [],
+    "fast_mode_from": None,        # memory id of a past script adapted in fast mode (src/memory/recall.py)
     "warnings": [],
     "notes": "",
 }
@@ -618,12 +619,26 @@ Then the full script:
     try:
         context = _memory_context(parent_paper, cleaning_result,
                                   text=f"{parent_paper.get('title', '')} {parent_paper.get('methodology', '')}")
+        # Fast mode (plan 7.5): a kept past script for the same model family and
+        # task is adapted rather than written anew. Every check still runs.
+        case = context.fast_mode_case() if context else None
+        if case:
+            print(f"[Replication Agent] Fast mode: adapting past case {case['label']} "
+                  f"(memory {case['memory']['id'][:8]}).")
+            prompt += (f"\n\nFAST MODE: past case [{case['label']}] below is a kept baseline script for the same "
+                       "model family and task. Adapt that script to THIS paper and THIS data (column names, label, "
+                       "preprocessing and model settings the paper states) instead of writing one from nothing. "
+                       "Every requirement above still applies, and the paper's own text wins where they differ.")
         content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent",
                            memory=context)
     except Exception as e:
         print(f"[Replication Agent] Script generation call failed: {e}")
         return {}
-    return _parse_generation(content)
+    result = _parse_generation(content)
+    if result and case:
+        result["fast_mode_from"] = case["memory"]["id"]
+        result["fast_mode_usage_id"] = context.usage_ids.get(case["memory"]["id"])
+    return result
 
 
 def _repair_generated_script(code: str, stderr: str, parent_paper: dict, stdout: str = "",
@@ -796,6 +811,12 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
         run_result = _run_bounded(command, cwd=recon_dir, timeout=REPLICATION_TIMEOUT_SECONDS, env=env)
         (attempts_dir / f"attempt_{attempt}_stderr.txt").write_text(run_result.get("stderr") or "", encoding="utf-8")
         metrics = parse_metric_lines(run_result.get("stdout", ""))
+        if attempt == 1 and generated.get("fast_mode_from") and \
+                (run_result["timed_out"] or not (run_result["exit_code"] == 0 and metrics)):
+            # The adapted past script failed its first run: its memory ranks lower
+            # (judged now, before any repair can make the attempt pass).
+            from src.memory import learning
+            learning.report_fast_mode_failure(generated.get("fast_mode_usage_id"), generated["fast_mode_from"])
         if run_result["timed_out"] or (run_result["exit_code"] == 0 and metrics):
             break
         if run_result["exit_code"] == 0:
@@ -848,7 +869,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
         inferred_assumptions=generated.get("inferred_assumptions", []), warnings=warnings,
         notes=f"Repair attempts: {attempts}.", generated_by=generated_by,
         paper_text_status=paper.get("status", ""), revision_round=revision_round,
-        revision_instructions=instructions,
+        revision_instructions=instructions, fast_mode_from=generated.get("fast_mode_from"),
     )
 
 

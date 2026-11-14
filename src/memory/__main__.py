@@ -99,16 +99,17 @@ def _main(argv: list) -> int:
         print(("Dry run: nothing written. " if args.dry_run else "") + f"Report: {path}")
         return 0
     if args.command == "review":
+        from src.memory import ranking
         found = memory.find_memories(agent=args.agent, states=None, limit=100_000)
         for agent in sorted({m["agent"] for m in found}):
-            mine = sorted((m for m in found if m["agent"] == agent), key=lambda m: -(m["quality"] or 0))
+            mine = sorted((m for m in found if m["agent"] == agent), key=lambda m: -ranking.effective_quality(m))
             print(f"\n== {agent} ({len(mine)} memories)")
             shown = mine if len(mine) <= 2 * args.n else mine[:args.n] + [None] + mine[-args.n:]
             for m in shown:
                 if m is None:
                     print("   ...")
                     continue
-                print(f"   {m['quality'] or 0:.2f}  {m['state']:<11} {m['kind']}/{m['polarity']:<8} "
+                print(f"   {ranking.effective_quality(m):.2f}  {m['state']:<11} {m['kind']}/{m['polarity']:<8} "
                       f"{m['lineage']:<10} {m['title'][:80]}  [{m['id'][:8]}]")
         return 0
     if args.command in ("approve", "quarantine"):

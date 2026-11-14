@@ -150,6 +150,18 @@ class PostgresStore:
                 conn.execute(f"UPDATE {SCHEMA_NAME}.memories SET state = %s, "
                              "superseded_by = COALESCE(%s, superseded_by), updated_at = now() WHERE id = %s",
                              (op["state"], op.get("superseded_by"), op["key"]["id"]))
+            elif op["type"] == "usage_outcome":
+                changed = conn.execute(f"UPDATE {SCHEMA_NAME}.memory_usage SET helped = %s "
+                                       "WHERE id = %s AND helped IS NULL", (op["helped"], op["key"]["id"])).rowcount
+                if changed:
+                    column = sql.Identifier("times_helped" if op["helped"] else "times_hurt")
+                    conn.execute(sql.SQL("UPDATE {table} SET {col} = {col} + 1, updated_at = now() WHERE id = %s").format(
+                        table=sql.Identifier(SCHEMA_NAME, "memories"), col=column), (op["memory_id"],))
+            elif op["type"] == "set_quality":
+                from psycopg.types.json import Jsonb
+                conn.execute(f"UPDATE {SCHEMA_NAME}.memories SET quality = %s, quality_reasons = %s, "
+                             "updated_at = now() WHERE id = %s",
+                             (op["quality"], Jsonb(op["quality_reasons"]), op["key"]["id"]))
             else:
                 sets = sql.SQL(", ").join(sql.SQL("{0} = {0} + %s").format(sql.Identifier(c)) for c in op["counters"])
                 where = sql.SQL(" AND ").join(sql.SQL("{} = %s").format(sql.Identifier(k)) for k in op["key"])

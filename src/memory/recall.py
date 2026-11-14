@@ -35,12 +35,14 @@ import uuid
 from datetime import datetime, timezone
 
 from src.memory import features as task_features_module
+from src.memory import ranking
 
 WEIGHTS = {"failure_signature": 0.35, "model_family": 0.25, "task_type": 0.10, "parent_paper": 0.10,
            "dataset_identity": 0.05, "techniques": 0.05, "metrics": 0.05, "text": 0.05}
 MIN_RELEVANCE = 0.15
 K_GOOD, K_WARN = 3, 2
 CASE_CONTENT_CHARS = 5000
+FAST_MODE_QUALITY = 0.8  # plan 7.5: only a past solution this good is adapted instead of writing anew
 _LABEL = re.compile(r"\bM(\d{1,3})\b", re.I)
 _USED_JSON = re.compile(r'"memory_used"\s*:\s*\[([^\]]*)\]', re.I)
 _USED_LINE = re.compile(r"MEMORY_USED\s*:\s*([^\n]*)", re.I)
@@ -138,7 +140,7 @@ def rank(candidates: list, query: dict, code_version: str = None, exclude_run_id
         rel, parts = relevance(query, m)
         if rel < MIN_RELEVANCE:
             continue
-        score = rel * (0.5 + 0.5 * float(m.get("quality") or 0)) * freshness(m, code_version)
+        score = rel * (0.5 + 0.5 * ranking.effective_quality(m)) * freshness(m, code_version)
         scored[group].append((group, m, round(score, 4), parts))
     for group in scored.values():
         group.sort(key=lambda item: (-item[2], item[1].get("created_at") or ""))
@@ -154,12 +156,21 @@ def _reasons_line(m: dict) -> str:
     return "; ".join(p for p in picks if p)[:300]
 
 
-def _case_block(label: str, group: str, m: dict, score: float, with_content: bool) -> str:
+def _use_record(m: dict) -> str:
+    helped, hurt = int(m.get("times_helped") or 0), int(m.get("times_hurt") or 0)
+    if not helped and not hurt:
+        return "no recorded outcome of earlier use"
+    return f"after earlier use: {helped} good outcome(s), {hurt} bad outcome(s) (base quality {float(m.get('quality') or 0):.2f})"
+
+
+def _case_block(label: str, group: str, m: dict, score: float, with_content: bool, conflicts: list = ()) -> str:
     task = m.get("task") or {}
     lines = [f"[{label}] {'GOOD CASE' if group == 'good' else 'WARNING'} -- {m.get('kind')} from the "
-             f"{m.get('agent')}, quality {float(m.get('quality') or 0):.2f} (retrieval {score:.2f})",
+             f"{m.get('agent')}, quality {ranking.effective_quality(m):.2f} (retrieval {score:.2f})",
              f"Title: {m.get('title')}",
-             f"Why this score: {_reasons_line(m) or 'not recorded'}"]
+             f"Why this score: {_reasons_line(m) or 'not recorded'}; {_use_record(m)}"]
+    if conflicts:
+        lines.append(f"CONFLICTING CASES: this case and {', '.join(conflicts)} disagree; check which fits this task.")
     facts = {k: task.get(k) for k in ("model_family", "techniques", "task_type", "failure_signature", "source")
              if task.get(k)}
     if facts:
@@ -190,7 +201,12 @@ class MemoryContext:
         self.prompt_chars = 0
         self.finished = False
         self.error = None
+        self.task = {}           # the current task's features (context_for)
+        self.usage_ids = {}      # memory id -> its memory_usage row, after finish()
+        self.fast_mode = None    # the case adapted in fast mode (fast_mode_case)
+        self.reranked = False
         self._recall(self.query, trigger)
+        self._revise_rank()
 
     # --- Recall ---
 
@@ -232,6 +248,65 @@ class MemoryContext:
             inv["memory"]["recalls_with_cases"] += bool(new)
         return new
 
+    def _revise_rank(self) -> None:
+        """ReviseRank (plan 9.4): on a retry or rerun -- when Master Agent's
+        notes carry the latest feedback -- one short LLM call orders the pack
+        for that feedback ("[2] > [1] > [3]"). The answer must be a
+        permutation of the cases shown, else the order stays. Good cases
+        stay before warnings; labels follow the new order."""
+        from src import llm
+        from src.config import MEMORY_RERANK
+        notes = llm._supervisor_notes.get()
+        if not MEMORY_RERANK or not notes or len(self.items) < 2:
+            return
+        listing = "\n".join(f"[{n}] ({i['group']}) {i['memory'].get('title')} -- {(i['memory'].get('summary') or '')[:300]}"
+                            for n, i in enumerate(self.items, 1))
+        feedback = "\n".join(f"- {str(note)[:600]}" for note in notes[-3:])
+        prompt = (f"Feedback on earlier attempts of this task:\n{feedback}\n\nPast cases from other runs:\n{listing}\n\n"
+                  "Order ALL the past cases from most to least useful for the next attempt, given this feedback. "
+                  "Answer with only the order, for example: [2] > [1] > [3]")
+        try:
+            answer = llm.chat(prompt, timeout=60, agent="master_agent")
+        except Exception as e:
+            _warn("reorder the past cases for the latest feedback", e)
+            return
+        order = [int(n) for n in re.findall(r"\[(\d+)\]", answer or "")]
+        if sorted(order) != list(range(1, len(self.items) + 1)):
+            return  # not a permutation of the shown cases: keep the computed order
+        position = {n - 1: k for k, n in enumerate(order)}
+        indexed = list(enumerate(self.items))
+        ordered = [i for group in ("good", "warning")
+                   for _, i in sorted((p for p in indexed if p[1]["group"] == group), key=lambda p: position[p[0]])]
+        for n, item in enumerate(ordered, 1):
+            item["label"] = f"M{n}"
+        self.items = ordered
+        self.reranked = True
+
+    def fast_mode_case(self) -> dict | None:
+        """The good case to adapt instead of writing from nothing (plan 7.5),
+        or None. Only with MEMORY_REUSE on, and only a kept solution with
+        content, effective quality >= FAST_MODE_QUALITY, the same model
+        families, and -- where both are known -- the same task type and the
+        same row-count bucket. Every check of the result still runs."""
+        from src.config import MEMORY_REUSE
+        goods = [i for i in self.items if i["group"] == "good" and i["memory"].get("kind") == "solution"
+                 and i["memory"].get("lineage") == "kept" and i["memory"].get("content")]
+        if not MEMORY_REUSE or not goods:
+            return None
+        best, task = goods[0], self.task or {}
+        past = best["memory"].get("task") or {}
+        if ranking.effective_quality(best["memory"]) < FAST_MODE_QUALITY:
+            return None
+        if not task.get("model_family") or set(task["model_family"]) != set(past.get("model_family") or []):
+            return None
+        if task.get("task_type") and past.get("task_type") and task["task_type"] != past["task_type"]:
+            return None
+        rows, past_rows = (task.get("dataset_traits") or {}).get("rows"), (past.get("dataset_traits") or {}).get("rows")
+        if rows and past_rows and rows != past_rows:
+            return None
+        self.fast_mode = best
+        return best
+
     def block(self, items: list = None, requests_left: int = None) -> str:
         """The prompt text for these items (default: all), within the pack budget."""
         items = self.items if items is None else items
@@ -243,11 +318,15 @@ class MemoryContext:
         if left > 0:
             parts.append(REQUEST_RULE % left)
         used = sum(len(p) for p in parts)
+        label_of = {i["memory"]["id"]: i["label"] for i in self.items}
         for item in items:
             m = item["memory"]
-            full = _case_block(item["label"], item["group"], m, item["score"], with_content=True)
+            # Two shown cases that were found to disagree are flagged together (plan 8.4).
+            conflicts = [label_of[i] for i in (m.get("quality_reasons") or {}).get("contradicted_by") or []
+                         if i in label_of]
+            full = _case_block(item["label"], item["group"], m, item["score"], with_content=True, conflicts=conflicts)
             text = full if used + len(full) <= budget else \
-                _case_block(item["label"], item["group"], m, item["score"], with_content=False)
+                _case_block(item["label"], item["group"], m, item["score"], with_content=False, conflicts=conflicts)
             used += len(text)
             item["digest"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
             parts.append(text)
@@ -308,7 +387,7 @@ class MemoryContext:
             for item in self.items:
                 m = item["memory"]
                 was_used = item["label"] in used
-                memory.record_usage({
+                self.usage_ids[m["id"]] = memory.record_usage({
                     "run_id": run_context.current_run_id(), "agent": self.agent, "attempt": inv.get("attempt"),
                     "invocation_id": inv.get("invocation_id"), "memory_id": m["id"],
                     "rank_shown": int(item["label"][1:]), "trigger": item["trigger"],
@@ -353,7 +432,9 @@ def context_for(agent: str, task: dict, text: str = "", search_agents: list = No
         query["text"] = (text or "")[:2000]
         if failure:
             query["failure_signature"] = task_features_module.failure_signature(failure)
-        return MemoryContext(agent, query, search_agents or [agent], kinds=kinds)
+        ctx = MemoryContext(agent, query, search_agents or [agent], kinds=kinds)
+        ctx.task = dict(task)
+        return ctx
     except Exception as e:
         _warn(f"prepare memory for the {agent}", e)
         return None

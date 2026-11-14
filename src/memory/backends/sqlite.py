@@ -131,6 +131,15 @@ class SqliteStore:
         elif op["type"] == "set_state":
             conn.execute("UPDATE memories SET state = ?, superseded_by = COALESCE(?, superseded_by), updated_at = ? "
                          "WHERE id = ?", (op["state"], op.get("superseded_by"), _now(), op["key"]["id"]))
+        elif op["type"] == "usage_outcome":
+            if conn.execute("UPDATE memory_usage SET helped = ? WHERE id = ? AND helped IS NULL",
+                            (int(op["helped"]), op["key"]["id"])).rowcount:
+                column = "times_helped" if op["helped"] else "times_hurt"
+                conn.execute(f"UPDATE memories SET {column} = {column} + 1, updated_at = ? WHERE id = ?",
+                             (_now(), op["memory_id"]))
+        elif op["type"] == "set_quality":
+            conn.execute("UPDATE memories SET quality = ?, quality_reasons = ?, updated_at = ? WHERE id = ?",
+                         (op["quality"], json.dumps(op["quality_reasons"], default=str), _now(), op["key"]["id"]))
         else:
             sets = ", ".join(f"{c} = {c} + ?" for c in op["counters"])
             where = " AND ".join(f"{k} = ?" for k in op["key"])
