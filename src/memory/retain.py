@@ -670,6 +670,11 @@ def _finding_memories(run: dict, stage: dict, lineage: str) -> list:
     return out
 
 
+# An approved report (or its slides) holds this run's numbers; as a memory it could carry
+# them into another run's report. Its failures are still remembered.
+NOT_REMEMBERED_WHEN_APPROVED = ("Report Agent", "Presentation Agent")
+
+
 def build_memories(run: dict) -> tuple[list, str]:
     """(memories, how lineage was found) for one run -- nothing is written."""
     lineage, lineage_source = stage_lineage(run)
@@ -677,6 +682,8 @@ def build_memories(run: dict) -> tuple[list, str]:
     memories = []
     for stage in run["stages"]:
         lin = lineage.get(stage["id"]) or ("unknown", "no lineage recorded")
+        if stage["decision"] == "Approved" and stage["agent"] in NOT_REMEMBERED_WHEN_APPROVED:
+            continue
         if stage["decision"] == "Approved":
             script = _script(run, stage) if stage["agent"] == "Replication Agent" else None
             m = _approved_memory(run, stage, lin, script)

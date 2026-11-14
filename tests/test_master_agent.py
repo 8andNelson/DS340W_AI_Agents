@@ -608,7 +608,7 @@ class TestCleaningAgentPipelineWiring(MasterAgentTestCase):
             result = master_agent.run_pipeline("credit card fraud detection")
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["phase"], "EXPERIMENTATION")
+        self.assertEqual(result["phase"], "COMPLETE")
         self.assertEqual(result["cleaning_result"], cleaning_result)
         cleaning_run.assert_called_once_with(data_result["selected_datasets"], target_terms=[],
                                              target_rows=data_result["target_entries"])
@@ -655,7 +655,7 @@ class TestCodeDiscoveryAgentPipelineWiring(MasterAgentTestCase):
         result, ranked_pool, *_ = self._run(data_result, code_discovery_result=code_discovery_result)
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["phase"], "EXPERIMENTATION")
+        self.assertEqual(result["phase"], "COMPLETE")
         self.assertEqual(result["code_discovery_result"], code_discovery_result)
 
     def test_still_succeeds_when_no_implementation_found(self):
@@ -667,7 +667,7 @@ class TestCodeDiscoveryAgentPipelineWiring(MasterAgentTestCase):
         result, *_ = self._run(data_result, code_discovery_result=code_discovery_result)
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["phase"], "EXPERIMENTATION")
+        self.assertEqual(result["phase"], "COMPLETE")
         self.assertEqual(result["code_discovery_result"]["status"], "NOT_FOUND")
 
     def test_called_with_the_recommended_parent_paper(self):
@@ -736,7 +736,7 @@ class TestReplicationAgentPipelineWiring(MasterAgentTestCase):
         result, *_ = self._run(data_result, replication_result=replication_result)
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["phase"], "EXPERIMENTATION")
+        self.assertEqual(result["phase"], "COMPLETE")
         self.assertEqual(result["replication_result"], replication_result)
 
     def test_halts_when_replication_is_blocked(self):
@@ -813,7 +813,7 @@ class TestEvaluationAgentPipelineWiring(MasterAgentTestCase):
         result, *_ = self._run(data_result, evaluation_result=evaluation_result)
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["phase"], "EXPERIMENTATION")
+        self.assertEqual(result["phase"], "COMPLETE")
         self.assertEqual(result["evaluation_result"], evaluation_result)
 
     def test_still_succeeds_on_failed_or_inconclusive_evaluation(self):
@@ -880,7 +880,7 @@ class TestExperimentAgentPipelineWiring(MasterAgentTestCase):
         result, *_ = self._run(data_result, experiment_result=experiment_result)
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["phase"], "EXPERIMENTATION")
+        self.assertEqual(result["phase"], "COMPLETE")
         self.assertEqual(result["experiment_result"], experiment_result)
         self.assertEqual(result["experiment_results"], [experiment_result])
         self.assertEqual(result["reruns"], [])

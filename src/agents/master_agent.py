@@ -386,6 +386,44 @@ def _format_experiment_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_report_report(result: dict) -> str:
+    lines = [
+        "[Report Agent] Final research report",
+        f"Status: {result.get('status', '')}",
+        f"Report: {result.get('report_path', '')}",
+        f"Facts:  {result.get('facts_path', '')}",
+        f"Prose sections written: {', '.join(result.get('prose_sections_written') or []) or 'none'}"
+        + (f" (by {result['written_by']})" if result.get("written_by") else ""),
+        f"Sentences removed by the grounding check: {len(result.get('removed_claims') or [])}",
+    ]
+    for r in (result.get("removed_claims") or [])[:10]:
+        lines.append(f"  - [{r.get('section')}] {r.get('reason')}: \"{r.get('sentence', '')[:160]}\"")
+    for key in ("metrics_figure_path", "gap_figure_path"):
+        if result.get(key):
+            lines.append(f"Figure: {result[key]}")
+    if result.get("warnings"):
+        lines.append("Warnings:")
+        lines.extend(f"  - {w}" for w in result["warnings"])
+    return "\n".join(lines)
+
+
+def _format_presentation_report(result: dict) -> str:
+    lines = [
+        "[Presentation Agent] Project slides",
+        f"Status: {result.get('status', '')}",
+        f"Slides: {result.get('presentation_path', '')} ({len(result.get('slides') or [])} slides)",
+        f"Built from: {result.get('facts_path', '')}",
+        f"Bullets shortened by: {result.get('written_by') or 'no LLM (the report sentences are used)'}",
+        f"Bullets removed by the grounding check: {len(result.get('removed_claims') or [])}",
+    ]
+    if result.get("fallback_slides"):
+        lines.append(f"Slides using the report's own sentences: {', '.join(result['fallback_slides'])}")
+    if result.get("warnings"):
+        lines.append("Warnings:")
+        lines.extend(f"  - {w}" for w in result["warnings"])
+    return "\n".join(lines)
+
+
 # --- Per-stage checkers: each returns a list of blocker log entries ---
 
 def _check_intake(structured: dict) -> list:
@@ -626,6 +664,75 @@ def _check_experiment(result: dict) -> list:
     return []
 
 
+def _check_report(result: dict) -> list:
+    """
+    The report must exist and hold every required section. Its prose is
+    checked by the Report Agent itself (report_agent._ground); prose that
+    could not be written makes it DEGRADED, not blocked -- the facts,
+    tables and references are still a true report. Master Agent checks
+    that the file holds what the agent says it holds, rather than trusting
+    its summary.
+    """
+    from src.agents.report_agent import APPENDICES, SECTIONS
+
+    path = Path((result or {}).get("report_path") or "")
+    if not path.is_file():
+        return [_log_entry("Correction", "Report Agent", f"The report file {path} was not written.",
+                           "Retrying", "Diagnose the failure and re-run the Report Agent.")]
+    text = path.read_text(encoding="utf-8")
+    missing = [s for s in SECTIONS + APPENDICES if not any(line.startswith("## ") and line.endswith(s)
+                                                            for line in text.splitlines())]
+    if missing:
+        return [_log_entry("Correction", "Report Agent", f"The report lacks the section(s): {', '.join(missing)}.",
+                           "Retrying", "Re-run the Report Agent so every required section is present.")]
+    return []
+
+
+def _check_presentation(result: dict) -> list:
+    """
+    Master Agent opens the slides itself: every slide of the structure is
+    present in order, and the comparison table and results chart hold
+    exactly the values recorded in the report's facts -- a slide may not
+    show a number the run did not produce.
+    """
+    from pptx import Presentation
+    from src.agents import presentation_agent as pa
+
+    def blocker(issue: str) -> list:
+        return [_log_entry("Correction", "Presentation Agent", issue, "Retrying",
+                           "Re-run the Presentation Agent from the report's facts.")]
+
+    path, facts_path = Path((result or {}).get("presentation_path") or ""), Path((result or {}).get("facts_path") or "")
+    if not path.is_file():
+        return blocker(f"The slides file {path} was not written.")
+    try:
+        deck = Presentation(str(path))
+        facts = json.loads(facts_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return blocker(f"The slides or the report's facts could not be read: {type(e).__name__}: {e}")
+    shapes = [shape for slide in deck.slides for shape in slide.shapes]
+    titles = [s.name[len(pa.TITLE_SHAPE):] for s in shapes if s.name.startswith(pa.TITLE_SHAPE)]
+    if titles != list(pa.SLIDES):
+        return blocker(f"The slides are {titles}, not the required structure {list(pa.SLIDES)}.")
+
+    expected = [[m["metric"], pa._fmt(m["published_value"]), pa._fmt(m["reproduced_value"]),
+                 pa._fmt(m["difference_points"]), pa._fmt(m["classification"])]
+                for m in facts["evaluation"]["metrics"][:8]]
+    tables = [s for s in shapes if s.name == pa.COMPARISON_TABLE]
+    found = [[cell.text for cell in row.cells] for row in tables[0].table.rows][1:] if tables else []
+    if found != expected:
+        return blocker(f"The comparison table shows {found}, but the recorded metrics are {expected}.")
+
+    comparable = pa.comparable_metrics(facts)
+    charts = [s for s in shapes if s.name == pa.RESULTS_CHART]
+    plotted = [list(series.values) for series in charts[0].chart.plots[0].series] if charts else []
+    wanted = ([[m["published_value"] for m in comparable], [m["reproduced_value"] for m in comparable]]
+              if comparable else [])
+    if plotted != wanted:
+        return blocker(f"The results chart plots {plotted}, but the recorded values are {wanted}.")
+    return []
+
+
 # --- Diagnosing a failed attempt ---
 
 # What each agent is for, so the diagnosis call knows the agent's job.
@@ -644,6 +751,9 @@ AGENT_ROLES = {
                         "baseline as a senior data analyst.",
     "Experiment Agent": "reads the gap to the paper's published score and requests one rerun of an earlier "
                         "agent with new instructions, or stops.",
+    "Report Agent": "writes the final research report from the run's recorded results; tables come from code and "
+                    "the LLM writes only prose that is checked against the facts.",
+    "Presentation Agent": "builds the slides (.pptx) from the Report Agent's facts and checked prose.",
 }
 
 
@@ -1053,6 +1163,8 @@ STAGE_CHECKS = {
     "Replication Agent": ("_check_replication", "_format_replication_report"),
     "Evaluation Agent": ("_check_evaluation", "_format_evaluation_report"),
     "Experiment Agent": ("_check_experiment", "_format_experiment_report"),
+    "Report Agent": ("_check_report", "_format_report_report"),
+    "Presentation Agent": ("_check_presentation", "_format_presentation_report"),
 }
 
 # After these stages of the first pass, Master Agent reads Slack for a
@@ -1224,6 +1336,10 @@ def _stage_state(agent_name: str, output: dict) -> dict:
                     "inferred_assumptions")}}
     if agent_name == "Evaluation Agent":
         return {"evaluation_result": {key: output.get(key) for key in ("status", "metrics", "likely_causes")}}
+    if agent_name == "Report Agent":
+        return {"report_status": output.get("status")}
+    if agent_name == "Presentation Agent":
+        return {"presentation_status": output.get("status")}
     return {}
 
 
@@ -1345,6 +1461,12 @@ def _stage_call(target: str, request: dict, ctx: dict, drive: dict):
                 ctx["dataset_result"], ctx["code_discovery_result"], list(drive["history"]),
                 list(drive["feedback"]))
         return lambda: module.run(*args)
+    if target == "Report Agent":
+        project = {**ctx, **(inputs.get("project") or {})}
+        return lambda: module.run(project, run_id=_current_run_id)
+    if target == "Presentation Agent":
+        report = inputs.get("report_result") or ctx["report_result"]
+        return lambda: module.run(report)
     raise ValueError(f"Master Agent has no call for the {target}.")
 
 
@@ -1818,6 +1940,8 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
           "rerun_end_reason": str,              # why Master Agent ended the rerun loop
           "experiment_results": list,           # every Experiment Agent analysis, in order
           "experiment_result": dict | None,     # the last one
+          "report_result": dict | None,         # the Report Agent's report (Milestone 13)
+          "presentation_result": dict | None,   # the Presentation Agent's slides (Milestone 14)
           "blockers": [...],   # non-empty only when success is False
         }
     """
@@ -1852,7 +1976,7 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
                   input_mode=ctx.get("input_mode", "topic"), input_fingerprint=ctx.get("input_fingerprint"),
                   rerun_end_reason=drive["end_reason"], experiment_results=drive["experiment_results"],
                   experiment_result=drive["experiment_results"][-1] if drive["experiment_results"] else None,
-                  blockers=drive["blockers"])
+                  report_result=None, presentation_result=None, blockers=drive["blockers"])
     if drive["blockers"]:
         return result
 
@@ -1866,4 +1990,24 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
 
     _relay_and_apply(result, ctx["ranked_pool"], run_floor_ts)
 
+    # The report and then the slides are written last, from the final results
+    # (a Slack relay above may have replaced the data). Master Agent requests
+    # the report; its handoff requests the Presentation Agent. Each is checked
+    # like any other stage; one that fails MAX_ATTEMPTS times halts the run.
+    from src.orchestration.handoff import RESULT_KEY
+    for agent, key in RESULT_KEY.items():
+        if key in result and agent not in ("Report Agent", "Presentation Agent"):
+            ctx[key] = result[key]
+    report_inputs = {"project": {key: result.get(key) for key in (
+        "reruns", "rerun_end_reason", "experiment_results", "input_mode")}}
+    report_drive = _new_drive(evaluated=True)
+    _drive(ctx, [request("master_agent", "Report Agent", report_inputs,
+                         "The rerun loop ended; write the final report from the recorded results.")],
+           report_drive)
+    result.update(report_result=ctx.get("report_result"), presentation_result=ctx.get("presentation_result"))
+    if report_drive["blockers"]:
+        result.update(success=False, phase=report_drive["phase"], blockers=report_drive["blockers"])
+        return result
+    update_state({"phase": "COMPLETE"})
+    result["phase"] = "COMPLETE"
     return result

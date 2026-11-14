@@ -27,6 +27,8 @@ PREREQUISITES = {
     "Replication Agent": ("Cleaning Agent", "Code Discovery Agent"),
     "Evaluation Agent": ("Replication Agent",),
     "Experiment Agent": ("Evaluation Agent",),
+    "Report Agent": ("Evaluation Agent",),
+    "Presentation Agent": ("Report Agent",),
 }
 
 # The workflow state an agent's stage belongs to (project state's "phase").
@@ -40,6 +42,8 @@ AGENT_PHASE = {
     "Replication Agent": "BASELINE_REPLICATION",
     "Evaluation Agent": "BASELINE_EVALUATION",
     "Experiment Agent": "EXPERIMENTATION",
+    "Report Agent": "REPORT_GENERATION",
+    "Presentation Agent": "PRESENTATION_GENERATION",
 }
 
 # The result key each agent's output is kept under in Master Agent's context.
@@ -53,6 +57,8 @@ RESULT_KEY = {
     "Replication Agent": "replication_result",
     "Evaluation Agent": "evaluation_result",
     "Experiment Agent": "experiment_result",
+    "Report Agent": "report_result",
+    "Presentation Agent": "presentation_result",
 }
 
 

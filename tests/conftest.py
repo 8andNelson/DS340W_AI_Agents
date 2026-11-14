@@ -14,7 +14,7 @@ from src.memory import scrub as memory_scrub
 from src.slack import slack_client
 
 from src.agents import (
-    cleaning_agent, data_agent, master_agent, replication_agent,
+    cleaning_agent, data_agent, master_agent, presentation_agent, replication_agent, report_agent,
 )
 from src.orchestration import (
     code_discovery_cache, column_mapping, comparison, dataset_cache, run_context, run_store, state_manager,
@@ -39,6 +39,8 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     monkeypatch.setattr(cleaning_agent, "PROCESSED_DATA_DIR", tmp_path / "data" / "processed")
     monkeypatch.setattr(data_agent, "RAW_DATA_DIR", tmp_path / "data" / "raw")
     monkeypatch.setattr(replication_agent, "REPLICATION_DIR", tmp_path / "replication")
+    monkeypatch.setattr(report_agent, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(presentation_agent, "PRESENTATIONS_DIR", tmp_path / "presentations")
     monkeypatch.setattr(llm, "OPENROUTER_API_KEY", "test-key")
 
     # A test that forgets to mock an LLM call must fail loudly, never reach
