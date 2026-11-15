@@ -17,7 +17,7 @@ from src.agents import (
     cleaning_agent, data_agent, master_agent, presentation_agent, replication_agent, report_agent,
 )
 from src.orchestration import (
-    code_discovery_cache, column_mapping, comparison, dataset_cache, repo_review, run_context, run_store,
+    code_discovery_cache, column_mapping, comparison, dataset_cache, repo_review, run_context, run_store, sandbox,
     state_manager,
 )
 from src.search import camoufox_fetch, page_fetch, paper_fulltext, serpapi_search, web_search
@@ -45,6 +45,11 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     monkeypatch.setattr(repo_review, "REVIEW_DIR", tmp_path / "replication" / "_reviewed")
     monkeypatch.setattr(repo_review, "_git", lambda *a, **k: {"exit_code": 1, "stdout": "",
                                                                "stderr": "git is disabled in tests"})
+    # The Docker sandbox: never a real container. With no docker CLI found,
+    # sandbox._docker returns "not found" and runs nothing; sandbox tests
+    # patch find_docker and subprocess.run themselves.
+    monkeypatch.setattr(sandbox, "find_docker", lambda: "")
+    monkeypatch.setattr(sandbox, "_find_docker_desktop", lambda: None)
     monkeypatch.setattr(report_agent, "REPORTS_DIR", tmp_path / "reports")
     monkeypatch.setattr(presentation_agent, "PRESENTATIONS_DIR", tmp_path / "presentations")
     monkeypatch.setattr(llm, "OPENROUTER_API_KEY", "test-key")

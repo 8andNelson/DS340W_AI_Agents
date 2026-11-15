@@ -461,9 +461,49 @@ def approved_review(clone_dir="", commit_sha="abc") -> dict:
     return {"verdict": "APPROVED", "commit_sha": commit_sha, "clone_dir": str(clone_dir), "summary": "APPROVED."}
 
 
+class FakeSandbox:
+    """Stands in for sandbox.Sandbox: records every pip call and run."""
+
+    def __init__(self, pip=None, runs=(), broken_versions=()):
+        self._pip = pip or (lambda args: run_result(exit_code=0))
+        self._runs = iter(runs)
+        self.broken_versions = set(broken_versions)
+        self.volume, self.version, self.image, self.digest = "", "", "", "python@sha256:test"
+        self.versions, self.pips, self.commands, self.closed = [], [], [], False
+
+    def use_python(self, version):
+        self.versions.append(version)
+        if version in self.broken_versions:
+            return run_result(exit_code=1, stderr="pull failed")
+        self.volume, self.version, self.image = "vol", version, f"python:{version}-slim"
+        return run_result(exit_code=0)
+
+    def pip(self, args, timeout):
+        self.pips.append(list(args))
+        return self._pip(args)
+
+    def run(self, command, env, timeout):
+        self.commands.append((list(command), dict(env)))
+        return next(self._runs)
+
+    def freeze(self):
+        return "pandas==2.2.3\n"
+
+    def data_env(self, variables):
+        return {var: f"/data/{split}.csv" for var, split in variables.items()}
+
+    def describe(self):
+        return {"image": self.image, "digest": self.digest, "python": self.version, "run_network": "none",
+                "run_user": "65534:65534", "memory": "6g", "cpus": "8", "pids": "1024",
+                "capabilities": "all dropped, no-new-privileges", "host_mounts": ["repository copy (read-write)"]}
+
+    def close(self):
+        self.closed = True
+
+
 class RepositoryTestCase(ReplicationAgentTestCase):
     """The repository path, with the reviewed clone replaced by files the
-    test writes (no git, no network)."""
+    test writes and the Docker sandbox by FakeSandbox (no git, no Docker)."""
     files = {"train.py": "print('training')\n"}
 
     def setUp(self):
@@ -486,10 +526,15 @@ class RepositoryTestCase(ReplicationAgentTestCase):
         return patch.object(replication_agent, "_get_repository_code", side_effect=fake)
 
     def _env(self, **overrides):
-        env = {"ok": True, "error": "", "python": "py", "install": "install -r requirements.txt",
+        env = {"ok": True, "error": "", "python": "3.12 (python@sha256:test)", "install": "install -r requirements.txt",
                "modifications": [], "warnings": []}
         env.update(overrides)
         return patch.object(replication_agent, "_setup_repository_environment", return_value=env)
+
+    def _docker(self, box, available=True):
+        return (patch.object(replication_agent.sandbox, "engine_available",
+                             return_value=(available, "" if available else "The Docker engine is not running.")),
+                patch.object(replication_agent.sandbox, "Sandbox", return_value=box))
 
     def _repository(self):
         return make_repository(review=approved_review())
@@ -538,64 +583,57 @@ class TestRepositoryEnvironment(ReplicationAgentTestCase):
         super().setUp()
         self.repo_dir = Path(self._tmpdir.name) / "repo"
         self.repo_dir.mkdir()
-        self.venv_dir = Path(self._tmpdir.name) / "venv"
 
-    def _setup(self, pip_results, pythons=(), venvs=None):
-        venvs = [] if venvs is None else venvs
-        installs = []
+    def _setup(self, box):
+        return replication_agent._setup_repository_environment(self.repo_dir, box)
 
-        def fake_pip(venv_dir, cwd, args):
-            installs.append(args)
-            return pip_results(args)
-
-        with patch.object(replication_agent, "_create_venv",
-                          side_effect=lambda d, python=None: venvs.append(python) or run_result(exit_code=0)), \
-             patch.object(replication_agent, "_fallback_pythons", return_value=list(pythons)), \
-             patch.object(replication_agent, "_pip_install", side_effect=fake_pip):
-            env = replication_agent._setup_repository_environment(self.repo_dir, self.venv_dir, make_repository())
-        return env, installs
-
-    def test_install_failure_retries_with_an_older_python(self):
+    def test_wheels_are_tried_on_each_sandbox_python_before_a_source_build(self):
         (self.repo_dir / "requirements.txt").write_text("pandas==2.2.3\n")
         attempts = iter([1, 0])
-        venvs = []
-        env, installs = self._setup(lambda args: run_result(exit_code=next(attempts)),
-                                    pythons=[("3.12", "C:/py312/python.exe")], venvs=venvs)
+        box = FakeSandbox(pip=lambda args: run_result(exit_code=next(attempts)))
+        env = self._setup(box)
 
         self.assertTrue(env["ok"])
-        self.assertEqual(venvs, [None, "C:/py312/python.exe"])
-        # Wheels only first, so a pin with no wheel fails fast instead of compiling.
-        self.assertEqual(installs[:2], [["install", "--only-binary=:all:", "-r", "requirements.txt"]] * 2)
-        self.assertEqual(env["python"], "C:/py312/python.exe")
-        self.assertIn("Python 3.12", env["modifications"][0])
-
-    def test_a_pin_that_cannot_install_is_relaxed_and_recorded(self):
-        (self.repo_dir / "requirements.txt").write_text("pandas==2.2.3\nnumpy==2.2.6\n")
-
-        def pip(args):
-            return run_result(exit_code=1 if "-r" in args or args == ["install", "pandas==2.2.3"] else 0)
-
-        env, installs = self._setup(pip)
-
-        self.assertTrue(env["ok"])
-        self.assertIn(["install", "pandas"], installs)
-        self.assertIn("without the pin 'pandas==2.2.3'", " ".join(env["modifications"]))
-        self.assertNotIn("numpy", " ".join(env["modifications"]))
+        self.assertEqual(box.versions, list(replication_agent.sandbox.SANDBOX_PYTHON_VERSIONS[:2]))
+        self.assertEqual(box.pips, [["install", "--only-binary=:all:", "-r", "requirements.txt"]] * 2)
+        self.assertIn(f"Python {replication_agent.sandbox.SANDBOX_PYTHON_VERSIONS[1]}", env["modifications"][0])
+        self.assertIn("python@sha256:test", env["python"])
 
     def test_a_source_build_is_tried_only_after_every_wheel_install(self):
         (self.repo_dir / "requirements.txt").write_text("oldpkg==0.1\n")
-        venvs = []
-        env, installs = self._setup(lambda args: run_result(exit_code=1 if "--only-binary=:all:" in args else 0),
-                                    pythons=[("3.12", "C:/py312/python.exe")], venvs=venvs)
+        versions = replication_agent.sandbox.SANDBOX_PYTHON_VERSIONS
+        box = FakeSandbox(pip=lambda args: run_result(exit_code=1 if "--only-binary=:all:" in args else 0))
+        env = self._setup(box)
 
         self.assertTrue(env["ok"])
-        self.assertEqual(installs[-1], ["install", "-r", "requirements.txt"])
-        self.assertEqual(venvs, [None, "C:/py312/python.exe", None])
-        self.assertEqual(env["modifications"], [])  # this Python, the declared versions
+        self.assertEqual(box.pips[-1], ["install", "-r", "requirements.txt"])
+        self.assertEqual(box.versions, [*versions, versions[0]])
+        self.assertEqual(env["modifications"], [])  # the first Python, the declared versions
+
+    def test_a_python_whose_image_cannot_be_made_is_skipped(self):
+        (self.repo_dir / "requirements.txt").write_text("numpy\n")
+        first, second = replication_agent.sandbox.SANDBOX_PYTHON_VERSIONS[:2]
+        box = FakeSandbox(broken_versions={first})
+        env = self._setup(box)
+
+        self.assertTrue(env["ok"])
+        self.assertEqual(box.version, second)
+        self.assertIn("could not be made", " ".join(env["warnings"]))
+
+    def test_a_pin_that_cannot_install_is_relaxed_and_recorded(self):
+        (self.repo_dir / "requirements.txt").write_text("pandas==2.2.3\nnumpy==2.2.6\n")
+        box = FakeSandbox(pip=lambda args: run_result(
+            exit_code=1 if "-r" in args or args == ["install", "pandas==2.2.3"] else 0))
+        env = self._setup(box)
+
+        self.assertTrue(env["ok"])
+        self.assertIn(["install", "pandas"], box.pips)
+        self.assertIn("without the pin 'pandas==2.2.3'", " ".join(env["modifications"]))
+        self.assertNotIn("numpy", " ".join(env["modifications"]))
 
     def test_a_requirement_that_never_installs_fails_the_setup(self):
         (self.repo_dir / "requirements.txt").write_text("pandas==2.2.3\n")
-        env, _ = self._setup(lambda args: run_result(exit_code=1, stderr="boom"))
+        env = self._setup(FakeSandbox(pip=lambda args: run_result(exit_code=1, stderr="boom")))
 
         self.assertFalse(env["ok"])
         self.assertIn("pandas==2.2.3", env["error"])
@@ -605,122 +643,139 @@ class TestRepositoryEnvironment(ReplicationAgentTestCase):
         (self.repo_dir / "train.py").write_text("import numpy\nimport sklearn.ensemble\nimport helpers\n"
                                                 "import os\nimport strange_lib\n")
         (self.repo_dir / "helpers.py").write_text("x = 1\n")
-        env, installs = self._setup(lambda args: run_result(exit_code=0))
+        box = FakeSandbox()
+        env = self._setup(box)
 
-        self.assertIn(["install", "scikit-learn"], installs)
-        self.assertNotIn(["install", "numpy"], installs)  # declared: installed by -r
-        self.assertNotIn(["install", "helpers"], installs)  # the repository's own module
+        self.assertIn(["install", "scikit-learn"], box.pips)
+        self.assertNotIn(["install", "numpy"], box.pips)  # declared: installed by -r
+        self.assertNotIn(["install", "helpers"], box.pips)  # the repository's own module
         self.assertIn("strange_lib", " ".join(env["warnings"]))  # unknown: logged, never installed
-        self.assertFalse(any("strange_lib" in " ".join(a) for a in installs))
+        self.assertFalse(any("strange_lib" in " ".join(a) for a in box.pips))
 
     def test_no_dependency_file_is_not_a_failure(self):
         (self.repo_dir / "train.py").write_text("import pandas\n")
-        env, installs = self._setup(lambda args: run_result(exit_code=0))
+        box = FakeSandbox()
+        env = self._setup(box)
 
         self.assertTrue(env["ok"])
-        self.assertEqual(installs, [["install", "pandas"]])
+        self.assertEqual(box.pips, [["install", "pandas"]])
 
 
 class TestRepositoryRun(RepositoryTestCase):
     def _run(self, run_results, fix=None):
-        results = iter(run_results)
+        box = FakeSandbox(runs=run_results)
         fix = fix or {"diagnosis": "", "actions": []}
-        with self._code(), self._env(), \
-             patch.object(replication_agent, "_pip_freeze", return_value=""), \
-             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)) as pip, \
+        engine, sandbox_class = self._docker(box)
+        with self._code(), self._env(), engine, sandbox_class, \
              patch.object(replication_agent, "_wire_dataset_into_repo", return_value=[]), \
              patch.object(replication_agent, "_extract_entry_point_from_readme", return_value=[]), \
-             patch.object(replication_agent, "_propose_repository_fix", return_value=fix) as propose, \
-             patch.object(replication_agent, "_run_bounded", side_effect=lambda *a, **k: next(results)) as runs:
+             patch.object(replication_agent, "_propose_repository_fix", return_value=fix) as propose:
             result = replication_agent._replicate_from_repository(make_paper(), self._repository(),
                                                                   make_cleaning_result())
-        return result, runs, propose, pip
+        return result, box, propose
 
-    def test_successful_run(self):
-        result, runs, propose, _ = self._run([run_result(exit_code=0, stdout="accuracy: 0.9")])
+    def test_successful_run_in_the_sandbox(self):
+        result, box, propose = self._run([run_result(exit_code=0, stdout="accuracy: 0.9")])
 
         self.assertEqual(result["status"], "OK")
         self.assertFalse(result["repository_failed"])
         self.assertEqual(result["entry_point"], "train.py")
         self.assertEqual(result["repository_review"]["verdict"], "APPROVED")
-        self.assertIn("TRAIN_CSV", runs.call_args.kwargs["env"])
+        self.assertEqual(result["sandbox"]["run_network"], "none")
+        command, env = box.commands[0]
+        self.assertEqual(command, ["python", "train.py"])
+        self.assertEqual(env["TRAIN_CSV"], "/data/train.csv")  # the container path, not the host one
+        self.assertTrue(box.closed)  # the sandbox volume is always removed
+        self.assertIn("Sandbox: Docker", (self.slug_dir / "ENVIRONMENT.md").read_text())
         propose.assert_not_called()
 
+    def test_without_docker_the_repository_is_never_run(self):
+        box = FakeSandbox()
+        engine, sandbox_class = self._docker(box, available=False)
+        with self._code(), engine, sandbox_class as made, \
+             patch.object(replication_agent, "_setup_repository_environment") as setup:
+            result = replication_agent._replicate_from_repository(make_paper(), self._repository(),
+                                                                  make_cleaning_result())
+
+        made.assert_not_called()
+        setup.assert_not_called()
+        self.assertTrue(result["repository_failed"])
+        self.assertIn("Docker is not available", result["notes"])
+
     def test_a_missing_module_is_installed_and_the_run_repeated(self):
-        result, runs, propose, pip = self._run([
+        result, box, propose = self._run([
             run_result(exit_code=1, stderr="ModuleNotFoundError: No module named 'sklearn'"),
             run_result(exit_code=0)])
 
         self.assertEqual(result["status"], "OK")
-        self.assertEqual(runs.call_count, 2)
-        pip.assert_called_once()
-        self.assertEqual(pip.call_args.args[2], ["install", "scikit-learn"])
+        self.assertEqual(len(box.commands), 2)
+        self.assertEqual(box.pips, [["install", "scikit-learn"]])
         self.assertIn("ModuleNotFoundError", " ".join(result["modifications"]))
         propose.assert_not_called()
 
     def test_an_unknown_missing_module_is_never_installed(self):
-        result, _, _, pip = self._run([
+        result, box, _ = self._run([
             run_result(exit_code=1, stderr="ModuleNotFoundError: No module named 'evil_pkg'"),
             run_result(exit_code=1, stderr="ModuleNotFoundError: No module named 'evil_pkg'")])
 
-        pip.assert_not_called()
+        self.assertEqual(box.pips, [])
         self.assertTrue(result["repository_failed"])
 
     def test_a_failing_run_gets_one_checked_repair_and_runs_again(self):
         self.files = {"train.py": "x\n", "src/main.py": "x\n"}
         fix = {"diagnosis": "train.py is a stub; src/main.py is the experiment.",
                "actions": [{"type": "command", "command": ["python", "src/main.py", "--seed", "1"]}]}
-        result, runs, _, _ = self._run([run_result(exit_code=1, stderr="error"), run_result(exit_code=0)], fix)
+        result, box, _ = self._run([run_result(exit_code=1, stderr="error"), run_result(exit_code=0)], fix)
 
         self.assertEqual(result["status"], "OK")
         self.assertEqual(result["entry_point_source"], "repair_llm")
-        self.assertEqual(runs.call_args.args[0][1:], ["src/main.py", "--seed", "1"])
+        self.assertEqual(box.commands[-1][0], ["python", "src/main.py", "--seed", "1"])
         self.assertIn("Repair: ran python src/main.py --seed 1 instead.", result["modifications"])
 
     def test_still_failing_after_the_repair_marks_the_repository_failed(self):
         fix = {"diagnosis": "d", "actions": [{"type": "install", "packages": ["xgboost"]}]}
-        result, runs, _, _ = self._run([run_result(exit_code=1, stderr="e1"), run_result(exit_code=1, stderr="e2")],
-                                       fix)
+        result, box, _ = self._run([run_result(exit_code=1, stderr="e1"), run_result(exit_code=1, stderr="e2")], fix)
 
         self.assertEqual(result["status"], "BLOCKED")
         self.assertTrue(result["repository_failed"])
-        self.assertEqual(runs.call_count, 2)  # one run, one run after the repair -- no more
+        self.assertEqual(len(box.commands), 2)  # one run, one run after the repair -- no more
+        self.assertIn(["install", "xgboost"], box.pips)
 
     def test_a_repair_with_no_valid_action_does_not_run_again(self):
         fix = {"diagnosis": "d", "actions": [{"type": "command", "command": ["bash", "-c", "rm -rf /"]}]}
-        result, runs, _, _ = self._run([run_result(exit_code=1, stderr="e1")], fix)
+        result, box, _ = self._run([run_result(exit_code=1, stderr="e1")], fix)
 
         self.assertTrue(result["repository_failed"])
-        self.assertEqual(runs.call_count, 1)
+        self.assertEqual(len(box.commands), 1)
         self.assertIn("Repair action rejected", " ".join(result["warnings"]))
 
     def test_no_entry_point_asks_for_a_repair(self):
         self.files = {"experiment.py": "x\n"}
         fix = {"diagnosis": "d", "actions": [{"type": "command", "command": ["python", "experiment.py"]}]}
-        result, runs, propose, _ = self._run([run_result(exit_code=0)], fix)
+        result, box, propose = self._run([run_result(exit_code=0)], fix)
 
         propose.assert_called_once()
         self.assertEqual(result["status"], "OK")
         self.assertEqual(result["entry_point"], "experiment.py")
 
     def test_a_timeout_is_not_repaired(self):
-        result, runs, propose, _ = self._run([run_result(timed_out=True, exit_code=None)])
+        result, box, propose = self._run([run_result(timed_out=True, exit_code=None)])
 
         self.assertEqual(result["status"], "TIMEOUT")
         self.assertTrue(result["repository_failed"])
         propose.assert_not_called()
 
     def test_an_unapproved_repository_is_never_set_up(self):
-        with patch.object(replication_agent, "_setup_repository_environment") as setup:
+        with patch.object(replication_agent.sandbox, "engine_available") as engine:
             result = replication_agent._replicate_from_repository(
                 make_paper(), make_repository(review={"verdict": "REJECTED", "summary": "REJECTED: malware"}),
                 make_cleaning_result())
 
-        setup.assert_not_called()
+        engine.assert_not_called()
         self.assertTrue(result["repository_failed"])
         self.assertIn("has not approved", result["warnings"][-1])
 
-    def test_an_old_clone_with_read_only_files_does_not_stop_a_retry(self):
+    def test_an_old_copy_with_read_only_files_does_not_stop_a_retry(self):
         (self.repo_dir / ".git").mkdir(parents=True)
         (self.repo_dir / ".git" / "pack.idx").write_text("x")
         (self.repo_dir / ".git" / "pack.idx").chmod(0o444)
@@ -778,7 +833,6 @@ class TestCheckFixActions(ReplicationAgentTestCase):
 
 class TestRepositoryFallback(RepositoryTestCase):
     def test_a_repository_that_does_not_run_falls_back_to_reconstruction(self):
-        (self.slug_dir / "venv").mkdir(parents=True)
         failed = replication_agent._default_result(
             status="BLOCKED", source="cloned_repository", repo_url="https://github.com/example/fraud-detection",
             commit_sha="abc", replication_dir=str(self.slug_dir), repository_failed=True,
@@ -794,7 +848,6 @@ class TestRepositoryFallback(RepositoryTestCase):
 
         repo_fn.assert_called_once()
         self.assertEqual(recon.call_count, 2)
-        self.assertFalse((self.slug_dir / "venv").exists())  # the repository's packages do not carry over
         self.assertEqual(result["source"], "reconstructed")
         self.assertEqual(result["repository_fallback"]["repo_url"], "https://github.com/example/fraud-detection")
         self.assertIn("did not run", result["warnings"][0])
@@ -824,7 +877,7 @@ class TestChildEnvironment(unittest.TestCase):
         self.assertEqual((child["PATH_EXTRA_OK"], child["TRAIN_CSV"], child["PYTHONUTF8"]), ("1", "t.csv", "1"))
 
 
-class TestRemoveTreeAndPythons(ReplicationAgentTestCase):
+class TestRemoveTree(ReplicationAgentTestCase):
     def test_remove_tree_deletes_read_only_files(self):
         target = Path(self._tmpdir.name) / "repo" / ".git" / "objects" / "pack"
         target.mkdir(parents=True)
@@ -835,11 +888,3 @@ class TestRemoveTreeAndPythons(ReplicationAgentTestCase):
         replication_agent._remove_tree(Path(self._tmpdir.name) / "repo")
 
         self.assertFalse((Path(self._tmpdir.name) / "repo").exists())
-
-    def test_fallback_pythons_are_older_than_this_one(self):
-        with patch.object(replication_agent.sys, "version_info", (3, 12, 0)), \
-             patch.object(replication_agent, "_find_python", side_effect=lambda v: f"/py{v}") as find:
-            found = replication_agent._fallback_pythons()
-
-        self.assertEqual(found, [("3.11", "/py3.11"), ("3.10", "/py3.10")])
-        self.assertNotIn("3.13", [c.args[0] for c in find.call_args_list])

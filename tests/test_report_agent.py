@@ -196,3 +196,17 @@ def test_an_approved_report_is_never_turned_into_a_memory():
     run_store.record_stage(run_id, "Report Agent", 1, "Approved", {"status": "OK", "report_path": "r.md"})
     memories, _ = retain.build_memories(retain.load_run(run_id))
     assert not [m for m in memories if m["agent"] == "Report Agent"]
+
+
+def test_a_sandboxed_repository_run_is_described():
+    line = report_agent._environment_line({"source": "cloned_repository", "sandbox": {
+        "image": "python:3.12-slim", "digest": "python@sha256:abc", "run_network": "none",
+        "run_user": "65534:65534", "capabilities": "all dropped, no-new-privileges", "memory": "6g", "cpus": "8"}})
+    assert "Docker sandbox: python:3.12-slim (python@sha256:abc), network none" in line
+
+
+def test_a_fallback_says_why_the_repository_did_not_run():
+    line = report_agent._environment_line({"source": "reconstructed", "repository_fallback": {
+        "repo_url": "https://github.com/a/b", "reason": "Docker is not available."}})
+    assert "virtual environment" in line
+    assert "https://github.com/a/b did not run (Docker is not available.)" in line

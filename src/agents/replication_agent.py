@@ -28,10 +28,12 @@ project (which only ever did read-only search, LLM calls, and file I/O on
 data the project itself controls). Containment, not a human approval
 gate, is the safeguard (per CLAUDE.md's Autonomous Operation policy):
 
-  - Every install/run happens inside a fresh virtualenv under
+  - A cloned repository is installed and run in a Docker sandbox (below);
+    a reconstructed script in a fresh virtualenv under
     replication/<slug>/venv/ -- the project's own .venv is never touched.
-  - Dependencies are only ever installed from a known, declared source:
-    the repo's own committed file (Path A) or a fixed allowlist of common
+  - Dependencies are only ever installed from a known source: the repo's
+    own committed file and known packages its code imports (Path A), or a
+    fixed allowlist of common
     ML libraries (Path B, since that list comes from a generative call,
     not a repo's own committed file -- a meaningfully different trust
     level).
@@ -39,6 +41,13 @@ gate, is the safeguard (per CLAUDE.md's Autonomous Operation policy):
     bounded timeout.
   - No setup step is ever auto-elevated (sudo/admin); one that needs it
     is reported as a failure, not bypassed.
+
+A cloned repository's code runs only in a Docker sandbox
+(src/orchestration/sandbox.py): no network while it runs, no host secrets,
+unprivileged, resource-limited, with only the repository copy and the
+prepared CSVs mounted. Without Docker it is not run, and the baseline is
+reconstructed instead. Master Agent reviews the repository first
+(repo_review), and only that reviewed copy is used.
 
 Comparing reproduced metrics against the paper's published results is
 the Evaluation Agent's job, not this one's -- this agent's job ends at
@@ -59,7 +68,7 @@ import pandas as pd
 from src import llm
 from src.agents.evaluation_agent import METRIC_LINE_FORMAT, parse_metric_lines
 from src.search import paper_fulltext
-from src.orchestration import repo_dependencies, repo_review
+from src.orchestration import repo_dependencies, repo_review, sandbox
 from src.orchestration.handoff import request as handoff_request
 
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -77,12 +86,6 @@ PROFILE_SAMPLE_ROWS = 2000
 PROFILE_MAX_COLUMNS = 60
 STDERR_FEEDBACK_CHARS = 3000
 PAPER_EXCERPT_CHARS = 12000
-
-# When a cloned repository's pinned dependencies do not install on the
-# pipeline's own Python (a live run: pandas==2.2.3 has no wheel for Python
-# 3.14, so pip built it from source and failed), its venv is made again
-# with each older Python installed here, newest first.
-FALLBACK_PYTHON_VERSIONS = ("3.13", "3.12", "3.11", "3.10")
 
 # A cloned repository that fails gets ONE repair (missing packages, then one
 # checked LLM-proposed fix from a fixed menu) and one more run; after that
@@ -143,6 +146,7 @@ _RESULT_DEFAULTS = {
     "fast_mode_from": None,        # memory id of a past script adapted in fast mode (src/memory/recall.py)
     "repository_review": None,     # Master Agent's review of a cloned repository: {"verdict", "commit_sha", "summary"}
     "repository_failed": False,    # a cloned repository did not run, even after one repair
+    "sandbox": None,               # the Docker sandbox a cloned repository ran in (sandbox.Sandbox.describe)
     "repository_fallback": None,   # {"repo_url", "commit_sha", "reason", "warnings"} when it did not, and the baseline was reconstructed
     "warnings": [],
     "notes": "",
@@ -228,21 +232,6 @@ def _remove_tree(path: Path) -> None:
 
 def _create_venv(venv_dir: Path, python: str = None) -> dict:
     return _run_bounded([python or sys.executable, "-m", "venv", str(venv_dir)], timeout=VENV_TIMEOUT_SECONDS)
-
-
-def _find_python(version: str) -> str:
-    """The path of an installed Python <version>, or "" if there is none."""
-    if os.name == "nt":
-        found = _run_bounded(["py", f"-{version}", "-c", "import sys; print(sys.executable)"], timeout=30)
-        return found["stdout"].strip() if found["exit_code"] == 0 else ""
-    return shutil.which(f"python{version}") or ""
-
-
-def _fallback_pythons() -> list:
-    """[(version, path)] of the installed Pythons older than this one, from
-    FALLBACK_PYTHON_VERSIONS, newest first."""
-    older = [v for v in FALLBACK_PYTHON_VERSIONS if tuple(map(int, v.split("."))) < sys.version_info[:2]]
-    return [(v, path) for v in older if (path := _find_python(v))]
 
 
 def _pip_install(venv_dir: Path, cwd: Path, install_args: list) -> dict:
@@ -348,7 +337,7 @@ def _save_run_output(slug_dir: Path, run_result: dict) -> tuple:
 def _write_environment_doc(slug_dir: Path, details: dict) -> None:
     lines = [
         "# Replication Environment",
-        f"Python: {sys.version}",
+        f"Pipeline Python (this machine): {sys.version}",
         f"OS: {platform.platform()}",
     ]
     for key, value in details.items():
@@ -394,7 +383,7 @@ def _declared_dependency_files(repo_dir: Path) -> list:
     return [name for name in DEPENDENCY_FILENAMES if (repo_dir / name).is_file()]
 
 
-def _install_relaxed_requirements(venv_dir: Path, repo_dir: Path) -> tuple:
+def _install_relaxed_requirements(box, repo_dir: Path) -> tuple:
     """Install requirements.txt one line at a time; a pinned line that fails
     is installed without its pin. Returns (ok, modifications, failed lines)."""
     modifications, failed = [], []
@@ -402,9 +391,9 @@ def _install_relaxed_requirements(venv_dir: Path, repo_dir: Path) -> tuple:
         if req["kind"] != "pypi":
             failed.append(req["line"])
             continue
-        if _pip_install(venv_dir, repo_dir, ["install", req["line"]])["exit_code"] == 0:
+        if box.pip(["install", req["line"]], timeout=INSTALL_TIMEOUT_SECONDS)["exit_code"] == 0:
             continue
-        if req["spec"] and _pip_install(venv_dir, repo_dir, ["install", req["name"]])["exit_code"] == 0:
+        if req["spec"] and box.pip(["install", req["name"]], timeout=INSTALL_TIMEOUT_SECONDS)["exit_code"] == 0:
             modifications.append(f"Installed {req['name']} without the pin '{req['line']}': the pinned version "
                                  "does not install in this environment.")
             continue
@@ -412,72 +401,65 @@ def _install_relaxed_requirements(venv_dir: Path, repo_dir: Path) -> tuple:
     return not failed, modifications, failed
 
 
-def _setup_repository_environment(repo_dir: Path, venv_dir: Path, repository: dict) -> dict:
-    """A new venv with everything the repository needs: its declared
-    dependencies, then the packages its code imports but does not declare.
+def _setup_repository_environment(repo_dir: Path, box) -> dict:
+    """A new venv in the Docker sandbox (src/orchestration/sandbox.py) with
+    everything the repository needs: its declared dependencies, then the
+    packages its code imports but does not declare.
 
     Declared dependencies are tried in this order, stopping at the first
     that installs:
-      1. pre-built wheels only (--only-binary=:all:) on this Python, then on
-         each older installed Python (FALLBACK_PYTHON_VERSIONS) -- a pin with
-         no wheel fails in seconds, not after a long source build (a live
-         run spent minutes compiling pandas 2.2.3 for Python 3.14);
-      2. a normal install on this Python (source builds allowed);
+      1. pre-built wheels only (--only-binary=:all:) on each sandbox Python
+         (sandbox.SANDBOX_PYTHON_VERSIONS) -- a pin with no wheel fails in
+         seconds, not after a long source build (a live run spent minutes
+         compiling pandas 2.2.3 for Python 3.14);
+      2. a normal install on the first Python (source builds allowed);
       3. requirements.txt one line at a time, a pin that cannot install
          relaxed (recorded, not hidden).
     A project install (pip install .) has no wheel-only step.
     Returns {"ok", "error", "python", "install", "modifications", "warnings"}."""
-    env = {"ok": False, "error": "", "python": sys.executable, "install": "", "modifications": [], "warnings": []}
-    current = f"{sys.version_info.major}.{sys.version_info.minor}"
-
-    def fresh_venv(python: str = None) -> bool:
-        if venv_dir.exists():
-            _remove_tree(venv_dir)
-        return _create_venv(venv_dir, python)["exit_code"] == 0
-
-    if _create_venv(venv_dir)["exit_code"] != 0:
-        env["error"] = "Virtualenv creation failed."
-        return env
-
+    env = {"ok": False, "error": "", "python": "", "install": "", "modifications": [], "warnings": []}
+    versions = list(sandbox.SANDBOX_PYTHON_VERSIONS)
     install_args, not_installed = _select_dependency_install(_declared_dependency_files(repo_dir))
     if install_args is None:
         env["warnings"].append(f"{not_installed} The packages the code imports are installed instead.")
+        made = box.use_python(versions[0])
+        if made["exit_code"] != 0:
+            env["error"] = f"The sandbox environment could not be made: {(made['stderr'] or '')[-1500:]}"
+            return env
     else:
         env["install"] = " ".join(install_args)
         requirements = install_args[:2] == ["install", "-r"]
-        pythons = [(current, sys.executable)] + _fallback_pythons()
         if requirements:
-            attempts = [(v, py, ["install", "--only-binary=:all:", *install_args[1:]]) for v, py in pythons] \
-                + [(current, sys.executable, install_args)]
+            attempts = [(v, ["install", "--only-binary=:all:", *install_args[1:]]) for v in versions] \
+                + [(versions[0], install_args)]
         else:
-            attempts = [(v, py, install_args) for v, py in pythons]
+            attempts = [(v, install_args) for v in versions]
         install_result = None
-        for i, (version, python, args) in enumerate(attempts):
-            if i and not fresh_venv(None if python == sys.executable else python):
+        for i, (version, args) in enumerate(attempts):
+            made = box.use_python(version)
+            if made["exit_code"] != 0:
+                install_result = made
+                env["warnings"].append(f"The Python {version} sandbox could not be made: "
+                                       f"{(made['stderr'] or '').strip()[-300:]}")
                 continue
-            install_result = _pip_install(venv_dir, repo_dir, args)
+            install_result = box.pip(args, timeout=INSTALL_TIMEOUT_SECONDS)
             if install_result["exit_code"] == 0:
-                if python != sys.executable:
-                    env["python"] = python
-                    env["modifications"].append(
-                        f"Made the environment with Python {version} ({python}): the repository's dependencies "
-                        f"do not install on Python {current}.")
+                if version != versions[0]:
+                    env["modifications"].append(f"Made the environment with Python {version}: the repository's "
+                                                f"dependencies do not install on Python {versions[0]}.")
                 break
             if i + 1 < len(attempts):
                 following = attempts[i + 1]
-                how = "with source builds allowed" if "--only-binary=:all:" not in following[2] else "from wheels"
+                how = "with source builds allowed" if "--only-binary=:all:" not in following[1] else "from wheels"
                 env["warnings"].append(f"Dependency installation failed on Python {version}; trying Python "
                                        f"{following[0]} {how}.")
                 print(f"[Replication Agent] {env['warnings'][-1]}")
         stderr = (install_result or {}).get("stderr") or ""
-        if (install_result or {}).get("exit_code") != 0 and requirements:
+        if (install_result or {}).get("exit_code") != 0 and requirements and box.volume:
             env["warnings"].append("Dependency installation still failed; installing the requirements one at a "
                                    "time and relaxing pins that cannot install.")
             print(f"[Replication Agent] {env['warnings'][-1]}")
-            if not venv_dir.exists() and _create_venv(venv_dir)["exit_code"] != 0:
-                env["error"] = "Virtualenv creation failed."
-                return env
-            ok, relaxed, failed = _install_relaxed_requirements(venv_dir, repo_dir)
+            ok, relaxed, failed = _install_relaxed_requirements(box, repo_dir)
             env["modifications"] += relaxed
             if not ok:
                 env["error"] = f"Dependency installation failed for: {', '.join(failed)}. {stderr[-1500:]}"
@@ -489,25 +471,25 @@ def _setup_repository_environment(repo_dir: Path, venv_dir: Path, repository: di
     declared = {r["name"] for r in repo_dependencies.declared_requirements(repo_dir) if r["name"]}
     imported, unknown = repo_dependencies.imported_packages(repo_dir)
     for package in [p for p in imported if repo_dependencies.normalize(p) not in declared]:
-        if _pip_install(venv_dir, repo_dir, ["install", package])["exit_code"] == 0:
+        if box.pip(["install", package], timeout=INSTALL_TIMEOUT_SECONDS)["exit_code"] == 0:
             env["modifications"].append(f"Installed {package}: the code imports it, but the repository does not "
                                         "declare it.")
         else:
             env["warnings"].append(f"Could not install {package}, which the code imports.")
     if unknown:
         env["warnings"].append(f"Imports with no known package, not installed: {', '.join(unknown[:20])}.")
+    env["python"] = f"{box.version} ({box.digest or box.image})"
     env["ok"] = True
     return env
 
 
-def _run_installing_missing_modules(command: list, repo_dir: Path, venv_dir: Path, env: dict,
-                                    modifications: list) -> dict:
-    """Run the command; when it stops on a ModuleNotFoundError for a known
-    package, install that package and run again (at most
+def _run_installing_missing_modules(command: list, box, env: dict, modifications: list) -> dict:
+    """Run the command in the sandbox; when it stops on a ModuleNotFoundError
+    for a known package, install that package and run again (at most
     MAX_MISSING_MODULE_INSTALLS times)."""
     tried = set()
     while True:
-        result = _run_bounded(command, cwd=repo_dir, timeout=REPLICATION_TIMEOUT_SECONDS, env=env)
+        result = box.run(command, env=env, timeout=REPLICATION_TIMEOUT_SECONDS)
         if result["exit_code"] == 0 or result["timed_out"] or len(tried) >= MAX_MISSING_MODULE_INSTALLS:
             return result
         package = repo_dependencies.IMPORT_TO_PACKAGE.get(repo_dependencies.missing_module(result["stderr"]))
@@ -515,7 +497,7 @@ def _run_installing_missing_modules(command: list, repo_dir: Path, venv_dir: Pat
             return result
         tried.add(package)
         print(f"[Replication Agent] The run needs {package}; installing it and running again.")
-        if _pip_install(venv_dir, repo_dir, ["install", package])["exit_code"] != 0:
+        if box.pip(["install", package], timeout=INSTALL_TIMEOUT_SECONDS)["exit_code"] != 0:
             return result
         modifications.append(f"Installed {package}: the run stopped on a ModuleNotFoundError for it.")
 
@@ -619,17 +601,16 @@ def _check_fix_actions(actions: list, repo_dir: Path, cleaning_result: dict) -> 
     return accepted, rejected
 
 
-def _apply_fix_actions(actions: list, repo_dir: Path, venv_dir: Path, cleaning_result: dict,
-                       command: list) -> tuple:
+def _apply_fix_actions(actions: list, repo_dir: Path, box, cleaning_result: dict, command: list) -> tuple:
     """Apply checked actions. Returns (command, modifications)."""
     modifications = []
     for action in actions:
         if action["type"] == "install":
             for package in action["packages"]:
-                if _pip_install(venv_dir, repo_dir, ["install", package])["exit_code"] == 0:
+                if box.pip(["install", package], timeout=INSTALL_TIMEOUT_SECONDS)["exit_code"] == 0:
                     modifications.append(f"Repair: installed {package}.")
         elif action["type"] == "command":
-            command = [str(_venv_python(venv_dir)), *action["command"][1:]]
+            command = ["python", *action["command"][1:]]
             modifications.append(f"Repair: ran {' '.join(action['command'])} instead.")
         elif action["type"] == "copy_data":
             target = _inside(repo_dir, action["dest"])
@@ -640,16 +621,19 @@ def _apply_fix_actions(actions: list, repo_dir: Path, venv_dir: Path, cleaning_r
 
 
 def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_result: dict) -> dict:
-    """Run the authors' code. Any failure (code not approved, environment,
-    no entry point, a failing run) gets one repair -- missing packages are
-    installed, then one checked LLM-proposed fix -- and one more run. A
-    repository that still does not run is marked repository_failed, and run()
-    reconstructs the baseline from the paper instead."""
+    """Run the authors' code, only in the Docker sandbox (sandbox.py): no
+    network while it runs, no host secrets, no host folder but the
+    repository copy. Without Docker the repository is not run at all.
+
+    Any failure (code not approved, no sandbox, environment, no entry point,
+    a failing run) gets one repair -- missing packages are installed, then
+    one checked LLM-proposed fix -- and one more run. A repository that
+    still does not run is marked repository_failed, and run() reconstructs
+    the baseline from the paper instead."""
     paper_title = (parent_paper or {}).get("title", "")
     repo_url = repository.get("repo_url", "")
     slug_dir = REPLICATION_DIR / _slugify(paper_title or repo_url)
     repo_dir = slug_dir / "repo"
-    venv_dir = slug_dir / "venv"
     warnings = []
     review = repository.get("review") or {}
     base = {"source": "cloned_repository", "repo_url": repo_url, "replication_dir": str(slug_dir),
@@ -664,38 +648,45 @@ def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_re
     slug_dir.mkdir(parents=True, exist_ok=True)
     if repo_dir.exists():
         _remove_tree(repo_dir)
-    # A venv left by an earlier attempt can come from another Python (see
-    # FALLBACK_PYTHON_VERSIONS); its packages would look installed and fail
-    # at run time, so every attempt starts from a new venv.
-    if venv_dir.exists():
-        _remove_tree(venv_dir)
 
     code = _get_repository_code(repository, repo_dir)
     if not code["ok"]:
         return failed("The repository's code cannot be used.", code["error"], commit_sha=code["commit_sha"])
     commit = {"commit_sha": code["commit_sha"]}
 
-    env = _setup_repository_environment(repo_dir, venv_dir, repository)
+    available, reason = sandbox.engine_available()
+    if not available:
+        return failed("The repository's code runs only in the Docker sandbox, and Docker is not available.",
+                      reason, **commit)
+
+    box = sandbox.Sandbox(repo_dir, {split: (cleaning_result or {}).get(f"{split}_csv_path") for split in DATA_SPLITS})
+    try:
+        return _run_in_sandbox(box, paper_title, repo_url, slug_dir, repo_dir, review, cleaning_result, commit,
+                               warnings, failed, base)
+    finally:
+        box.close()
+
+
+def _run_in_sandbox(box, paper_title, repo_url, slug_dir, repo_dir, review, cleaning_result, commit, warnings,
+                    failed, base) -> dict:
+    env = _setup_repository_environment(repo_dir, box)
     warnings += env["warnings"]
     pip_freeze_path = slug_dir / "pip_freeze.txt"
-    pip_freeze_path.write_text(_pip_freeze(venv_dir) if venv_dir.exists() else "", encoding="utf-8")
+    pip_freeze_path.write_text(box.freeze() if box.volume else "", encoding="utf-8")
+    sandbox_record = {"sandbox": box.describe()}
     if not env["ok"]:
         return failed("The repository's environment could not be set up.", env["error"], **commit,
-                      pip_freeze_path=str(pip_freeze_path), modifications=env["modifications"])
+                      pip_freeze_path=str(pip_freeze_path), modifications=env["modifications"], **sandbox_record)
 
     entry_point = _detect_entry_point_by_convention(repo_dir)
     entry_point_source = "convention" if entry_point else ""
-    command = [str(_venv_python(venv_dir)), entry_point] if entry_point else None
+    command = ["python", entry_point] if entry_point else None
     if not command:
         readme_command = _extract_entry_point_from_readme(repo_dir, paper_title)
         if readme_command:
-            # The LLM returns a bare "python"/"python3" token -- substitute
-            # the isolated venv's own interpreter so the dependencies just
-            # installed into it are actually the ones used.
-            if readme_command[0] in ("python", "python3"):
-                command = [str(_venv_python(venv_dir)), *readme_command[1:]]
-            else:
-                command = readme_command
+            # A bare "python"/"python3" becomes the sandbox venv's Python (Sandbox.run).
+            command = ["python", *readme_command[1:]] if readme_command[0] in ("python", "python3") \
+                else readme_command
             entry_point = " ".join(readme_command)
             entry_point_source = "readme_llm"
 
@@ -704,12 +695,12 @@ def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_re
     if not wired:
         warnings.append("No conventional data/ directory found in the repo; running unmodified -- "
                         "dataset path may need manual wiring if the run fails.")
-    run_env = data_env(cleaning_result)
+    run_env = box.data_env({var: key.replace("_csv_path", "") for var, key in DATA_ENV_VARS.items()})
 
     run_result = None
     if command:
-        print(f"[Replication Agent] Running: {' '.join(command)}")
-        run_result = _run_installing_missing_modules(command, repo_dir, venv_dir, run_env, modifications)
+        print(f"[Replication Agent] Running in the sandbox: {' '.join(command)}")
+        run_result = _run_installing_missing_modules(command, box, run_env, modifications)
     if run_result is None or (run_result["exit_code"] != 0 and not run_result["timed_out"]):
         failure = (run_result["stderr"] or run_result["stdout"]) if run_result else \
             "No entry point could be determined (no conventional filename, nothing documented in the README)."
@@ -720,30 +711,35 @@ def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_re
         if fix["diagnosis"]:
             warnings.append(f"Repair diagnosis: {fix['diagnosis']}")
         if actions:
-            command, applied = _apply_fix_actions(actions, repo_dir, venv_dir, cleaning_result, command)
+            command, applied = _apply_fix_actions(actions, repo_dir, box, cleaning_result, command)
             modifications += applied
             if any(a["type"] == "command" for a in actions):
                 entry_point, entry_point_source = " ".join(command[1:]), "repair_llm"
         if command and actions:
             print(f"[Replication Agent] Running again after the repair: {' '.join(command)}")
-            run_result = _run_installing_missing_modules(command, repo_dir, venv_dir, run_env, modifications)
+            run_result = _run_installing_missing_modules(command, box, run_env, modifications)
+        pip_freeze_path.write_text(box.freeze(), encoding="utf-8")  # the repair may have installed more
 
+    box_info = box.describe()
     _write_environment_doc(slug_dir, {
-        "Source": "cloned_repository", "Repository": repo_url, "Commit": code["commit_sha"],
+        "Source": "cloned_repository", "Repository": repo_url, "Commit": commit["commit_sha"],
         "Master Agent review": review.get("summary", ""), "Entry point": entry_point,
         "Command": " ".join(command or []), "Dependency install": env["install"] or "none declared",
-        "Venv Python": env["python"], "Modifications": "; ".join(modifications) or "none",
+        "Sandbox": f"Docker {box_info['image']} ({box_info['digest'] or 'digest unknown'}); run with no network, "
+                   f"as uid {box_info['run_user']}, {box_info['capabilities']}, memory {box_info['memory']}, "
+                   f"{box_info['cpus']} CPUs; host mounts: {', '.join(box_info['host_mounts'])}",
+        "Modifications": "; ".join(modifications) or "none",
     })
     if run_result is None:
         return failed("Could not determine how to run this repository.",
                       "No entry point could be determined, and the repair found none.", **commit,
-                      pip_freeze_path=str(pip_freeze_path), modifications=modifications)
+                      pip_freeze_path=str(pip_freeze_path), modifications=modifications, **sandbox_record)
 
     stdout_path, stderr_path = _save_run_output(slug_dir, run_result)
     result = dict(**commit, entry_point=entry_point, entry_point_source=entry_point_source, command=command,
                   exit_code=run_result["exit_code"], stdout_path=stdout_path, stderr_path=stderr_path,
                   duration_seconds=run_result["duration_seconds"], pip_freeze_path=str(pip_freeze_path),
-                  modifications=modifications)
+                  modifications=modifications, sandbox=box_info)
     if run_result["timed_out"]:
         return failed("The repository's run timed out.",
                       f"No result within {REPLICATION_TIMEOUT_SECONDS}s.", status="TIMEOUT", **result)
@@ -1234,11 +1230,6 @@ def run(parent_paper: dict, code_discovery_result: dict, cleaning_result: dict, 
                 repository_fallback = {"repo_url": result["repo_url"], "commit_sha": result["commit_sha"],
                                        "reason": result["notes"], "warnings": list(result["warnings"])}
                 _FAILED_REPOSITORIES[key] = repository_fallback
-                # The reconstruction reuses this venv; the repository's pinned
-                # packages (or an older Python) must not carry over into it.
-                failed_venv = Path(result["replication_dir"]) / "venv"
-                if result.get("replication_dir") and failed_venv.exists():
-                    _remove_tree(failed_venv)
         if repository_fallback is not None:
             print(f"[Replication Agent] The repository does not run ({repository_fallback['reason']}); "
                   "reconstructing the baseline from the paper instead.")

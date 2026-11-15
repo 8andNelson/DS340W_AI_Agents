@@ -196,7 +196,10 @@ def gather_facts(project: dict, run_id: str = None) -> dict:
                         "fast_mode_from": replication.get("fast_mode_from"),
                         "warnings": list(replication.get("warnings") or []),
                         "pip_freeze_path": replication.get("pip_freeze_path") or "",
-                        "environment_file": str(environment) if environment and environment.is_file() else ""},
+                        "environment_file": str(environment) if environment and environment.is_file() else "",
+                        "sandbox": replication.get("sandbox"),
+                        "repository_fallback": replication.get("repository_fallback"),
+                        "baseline_failed": bool(replication.get("baseline_failed"))},
         "evaluation": {"status": evaluation.get("status"),
                        "metrics": [{k: m.get(k) for k in ("metric", "published_value", "reproduced_value",
                                                           "difference_points", "classification", "notes")}
@@ -442,6 +445,21 @@ def gap_figure(facts: dict) -> str | None:
     return _svg(620, height, "Gap to the Parent Paper over the reruns", body)
 
 
+def _environment_line(rep: dict) -> str:
+    """Where the baseline ran, from the Replication Agent's own record."""
+    box = rep.get("sandbox") or {}
+    if rep.get("source") == "cloned_repository" and box:
+        return (f"- The authors' code ran in a Docker sandbox: {box.get('image') or 'image not recorded'} "
+                f"({box.get('digest') or 'digest not recorded'}), network {box.get('run_network')}, user "
+                f"{box.get('run_user')}, Linux capabilities {box.get('capabilities')}, memory limit "
+                f"{box.get('memory')}, {box.get('cpus')} CPUs.")
+    line = "- The reconstructed baseline ran in its own virtual environment under replication/."
+    if rep.get("repository_fallback"):
+        line += (f" The discovered repository {rep['repository_fallback'].get('repo_url', '')} did not run "
+                 f"({rep['repository_fallback'].get('reason', '')}).")
+    return line
+
+
 def _prose(sections: dict, key: str, why: str) -> list:
     text = sections.get(key)
     return [text if text else f"*This section was not written: {why}*", ""]
@@ -569,7 +587,7 @@ def render(facts: dict, sections: dict, removed: list, figures: dict, prose_erro
           f"- Train/test/validation split seed: {cl['split_seed'] if cl['split_seed'] is not None else 'n/a'}",
           f"- Environment record: {rep['environment_file'] or 'not recorded'}",
           f"- Installed packages (pip freeze): {rep['pip_freeze_path'] or 'not recorded'}",
-          "- Each replication runs in its own virtual environment under replication/.", ""]
+          _environment_line(rep), ""]
 
     L += ["## 11. Results", "",
           f"Overall reproduction status: **{ev['status'] or 'not set'}**. "
