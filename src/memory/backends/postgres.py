@@ -172,10 +172,13 @@ class PostgresStore:
     # --- Reads ---
 
     def fetch_memories(self, agent: str = None, kind: str = None, states: tuple = ("active",),
-                       ids: list = None, limit: int = 50, conn=None, content_shas: list = None) -> list[dict]:
+                       ids: list = None, limit: int = 50, conn=None, content_shas: list = None,
+                       created_before: str = None, polarities: tuple = None, exclude_run_id: str = None,
+                       offset: int = 0) -> list[dict]:
         if conn is None:
             with self.session() as conn:
-                return self.fetch_memories(agent, kind, states, ids, limit, conn, content_shas)
+                return self.fetch_memories(agent, kind, states, ids, limit, conn, content_shas, created_before,
+                                           polarities, exclude_run_id, offset)
         if (ids is not None and not ids) or (content_shas is not None and not content_shas):
             return []
         columns = ", ".join(schema.TABLES["memories"])
@@ -195,8 +198,18 @@ class PostgresStore:
         if content_shas is not None:
             where.append("content_sha = ANY(%s)")
             params.append(list(content_shas))
+        if created_before:
+            where.append("created_at <= %s")
+            params.append(datetime.fromisoformat(created_before))
+        if polarities:
+            where.append("polarity = ANY(%s)")
+            params.append(list(polarities))
+        if exclude_run_id:
+            where.append("(run_id IS NULL OR run_id <> %s)")
+            params.append(exclude_run_id)
         query = f"SELECT {columns} FROM {SCHEMA_NAME}.memories" + (" WHERE " + " AND ".join(where) if where else "")
-        rows = conn.execute(query + " ORDER BY created_at DESC LIMIT %s", [*params, limit]).fetchall()
+        rows = conn.execute(query + " ORDER BY created_at DESC, id LIMIT %s OFFSET %s",
+                            [*params, limit, offset]).fetchall()
         return [decode("memories", r) for r in rows]
 
     # --- Role check (`python -m src.memory check-role`) ---

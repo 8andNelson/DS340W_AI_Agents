@@ -148,7 +148,8 @@ class TestLikelyCauses(unittest.TestCase):
 class TestRun(unittest.TestCase):
     def test_matched_metric_is_classified(self):
         with patch.object(evaluation_agent, "_extract_metrics", side_effect=[{"accuracy": 94.0}, {"accuracy": 94.5}]):
-            result = evaluation_agent.run(make_paper(), make_replication_result(stdout_path="x"))
+            result = evaluation_agent.run(make_paper(official_abstract="Accuracy 94%."),
+                                          make_replication_result(stdout_path="x"))
 
         self.assertEqual(result["status"], "EXACT")
         self.assertEqual(len(result["metrics"]), 1)
@@ -188,7 +189,7 @@ class TestRun(unittest.TestCase):
     def test_overall_status_is_worst_case_among_multiple_metrics(self):
         with patch.object(evaluation_agent, "_extract_metrics",
                            side_effect=[{"accuracy": 94.0, "f1": 90.0}, {"accuracy": 94.1, "f1": 60.0}]):
-            result = evaluation_agent.run(make_paper(), make_replication_result(stdout_path="x"))
+            result = evaluation_agent.run(make_paper(official_abstract="Stated results."), make_replication_result(stdout_path="x"))
 
         classifications = {m["metric"]: m["classification"] for m in result["metrics"]}
         self.assertEqual(classifications["accuracy"], "EXACT")
@@ -208,6 +209,90 @@ class TestRun(unittest.TestCase):
         published_call_text = extract_mock.call_args_list[0].args[0]
         self.assertIn("Accuracy 94%.", published_call_text)
         self.assertIn("Some abstract text.", published_call_text)
+
+
+class TestMetricUnitsAndTrust(unittest.TestCase):
+    """Review finding 18: units, unbounded metrics and unverified values."""
+
+    def test_a_percent_metric_line_keeps_its_unit(self):
+        parsed = evaluation_agent.parse_metric_lines("METRIC recall=0.5%\nMETRIC f1=91.2%\nMETRIC accuracy=0.95")
+        points = {k: evaluation_agent.to_percentage_points(v) for k, v in parsed.items()}
+        self.assertAlmostEqual(points["recall"], 0.5)   # was 50 before the fix
+        self.assertAlmostEqual(points["f1"], 91.2)
+        self.assertAlmostEqual(points["accuracy"], 95.0)
+
+    def test_extracted_values_carry_their_unit(self):
+        answer = ('{"recall": {"value": 0.5, "unit": "percent"}, "f1": {"value": 0.91, "unit": "fraction"}, '
+                  '"rmse": {"value": 3.2, "unit": "other"}, "auc": 98.9}')
+        with patch.object(evaluation_agent.llm, "chat", return_value=answer):
+            metrics = evaluation_agent._extract_metrics("text", "a paper")
+        self.assertEqual(metrics, {"recall": 0.005, "f1": 0.91, "rmse": 3.2, "auc": 98.9})
+
+    def test_an_error_or_loss_is_never_put_on_the_percentage_scale(self):
+        with patch.object(evaluation_agent, "_extract_metrics", side_effect=[{"RMSE": 0.42, "accuracy": 0.9},
+                                                                             {"RMSE": 0.40, "accuracy": 0.9}]):
+            result = evaluation_agent.run(make_paper(official_abstract="RMSE 0.42"),
+                                          make_replication_result(stdout_path="x"))
+        rmse = next(m for m in result["metrics"] if m["metric"] == "RMSE")
+        self.assertIsNone(rmse["difference_points"])     # not 2 "points"
+        self.assertEqual(rmse["classification"], "INCONCLUSIVE")
+        self.assertIn("raw difference 0.02", rmse["notes"])
+        accuracy = next(m for m in result["metrics"] if m["metric"] == "accuracy")
+        self.assertEqual(accuracy["classification"], "EXACT")
+
+    def test_search_snippet_values_are_shown_but_not_counted(self):
+        from src.agents.experiment_agent import score_gap
+        with patch.object(evaluation_agent, "_extract_metrics", side_effect=[{"accuracy": 96.0}, {"accuracy": 80.0}]):
+            result = evaluation_agent.run(make_paper(), make_replication_result(stdout_path="x"))  # snippet only
+        metric = result["metrics"][0]
+        self.assertEqual(result["published_source"], "search_snippet")
+        self.assertIsNone(metric["difference_points"])
+        self.assertAlmostEqual(metric["provisional_difference_points"], 16.0)
+        self.assertEqual(metric["classification"], "INCONCLUSIVE")
+        self.assertIn("UNVERIFIED", metric["notes"])
+        self.assertIsNone(score_gap(result))
+
+
+class TestReviewAvailability(unittest.TestCase):
+    """Review finding 21: an unavailable review is not an acceptance."""
+
+    def _review(self, chat):
+        with patch.object(evaluation_agent.llm, "chat", side_effect=chat):
+            return evaluation_agent.review(make_paper(), {"status": "", "text": ""},
+                                           make_replication_result(), [], "")
+
+    def test_a_failed_review_is_retried_once(self):
+        answer = '{"assessment": "valid", "findings": [], "decision": {"action": "accept", "reason": "ok"}}'
+        result = self._review([RuntimeError("provider down"), answer])
+        self.assertEqual(result["review_status"], "COMPLETE")
+        self.assertEqual(result["assessment"], "valid")
+
+    def test_a_review_that_never_runs_is_unavailable(self):
+        result = self._review([RuntimeError("down"), "not json at all"])
+        self.assertEqual(result["review_status"], "UNAVAILABLE")
+        self.assertIn("UNAVAILABLE", result["decision_notes"][0])
+        self.assertTrue(evaluation_agent.review_unavailable({"review": result}))
+
+
+class TestVerifiedLeakage(unittest.TestCase):
+    """Review finding 8: the analyst's verified leakage counts too."""
+
+    def test_static_and_analyst_leakage_are_both_counted(self):
+        quote = "smote.fit_resample(X, y) before train_test_split"
+        evaluation = {"review": {"static_findings": [{"check": "resample_before_split", "issue": "static",
+                                                      "category": "data_leakage", "severity": "critical"}],
+                                 "findings": [
+                                     {"category": "data_leakage", "severity": "critical", "verified": True,
+                                      "issue": "analyst", "evidence": quote},
+                                     {"category": "data_leakage", "severity": "critical", "verified": True,
+                                      "issue": "too short a quote", "evidence": "import pandas"},
+                                     {"category": "data_leakage", "severity": "minor", "verified": True,
+                                      "issue": "minor", "evidence": quote},
+                                     {"category": "data_leakage", "severity": "critical", "verified": False,
+                                      "issue": "unverified", "evidence": quote}]}}
+        found = evaluation_agent.verified_leakage(evaluation)
+        self.assertEqual([f["issue"] for f in found], ["static", "analyst"])
+        self.assertEqual(found[1]["check"], "analyst_review")
 
 
 if __name__ == "__main__":

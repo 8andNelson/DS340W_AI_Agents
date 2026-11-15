@@ -39,6 +39,20 @@ def current_run_id() -> str | None:
     return _run.get("run_id")
 
 
+def update_task(**fields) -> None:
+    """Record what the run's task is, as Master Agent approves each stage
+    (topic, intake, parent_paper, dataset, cleaning). Every memory recall of
+    the run describes the task from the same record (review finding 7), not
+    from whatever one agent happens to be given."""
+    if _run.get("run_id"):
+        _run.setdefault("task", {}).update({k: v for k, v in fields.items() if v is not None})
+
+
+def task() -> dict:
+    """The run's task record (update_task), or {}."""
+    return dict(_run.get("task") or {})
+
+
 def info(run_id: str) -> dict:
     """What was recorded at the start of run_id, or {} for another run."""
     return dict(_run) if _run.get("run_id") == run_id else {}

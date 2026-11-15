@@ -160,7 +160,12 @@ def curate_run(run_id: str, new_memories: list) -> dict:
             target, m = (lesson(item.get("lesson")), case(item.get("case"))) if isinstance(item, dict) else (None, None)
             if not target or not m or not quote_found(item.get("quote"), m):
                 continue
-            memory.increment(target["id"], seen_count=1)
+            # One support per run, lesson and case: a repeated call or a duplicate
+            # entry does not count again (the op id is fixed).
+            if target["id"] in report["supported"]:
+                continue
+            memory.increment(target["id"], op_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"support|{run_id}|{target['id']}")),
+                             seen_count=1)
             report["supported"].append(target["id"])
             if target["state"] == "candidate" and int(target.get("seen_count") or 1) + 1 >= ACTIVATION_RUNS:
                 memory.set_state(target["id"], "active",
@@ -175,7 +180,9 @@ def curate_run(run_id: str, new_memories: list) -> dict:
                 reasons = dict(a.get("quality_reasons") or {})
                 reasons["contradicted_by"] = sorted(set(reasons.get("contradicted_by") or []) | {b["id"]})
                 reasons["contradiction"] = {"value": -CONTRADICTION_PENALTY, "reason": f"contradicted by memory {b['id'][:8]}"}
-                memory.client().write({"op_id": str(uuid.uuid4()), "type": "set_quality", "table": "memories",
+                memory.client().write({"op_id": str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                                                f"contradiction|{run_id}|{a['id']}|{b['id']}")),
+                                       "type": "set_quality", "table": "memories",
                                        "key": {"id": a["id"]}, "quality": max(0.0, float(a.get("quality") or 0) - CONTRADICTION_PENALTY),
                                        "quality_reasons": reasons})
             report["contradicted"].append([target["id"], m["id"]])

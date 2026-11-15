@@ -1369,10 +1369,16 @@ def _after_stage(agent_name: str, output, ctx: dict, drive: dict) -> None:
     """Keep an approved first-pass result in ctx and project state. Inside a
     rerun, project state is written only when the rerun is kept
     (_close_rerun)."""
-    from src.orchestration import dataset_cache
+    from src.orchestration import dataset_cache, run_context
     from src.orchestration.handoff import AGENT_PHASE
     from src.orchestration.state_manager import update_state
 
+    # The run's task record, so every memory recall describes the same task.
+    field = {"Intake Agent": "intake", "Validation Agent": "parent_paper", "Data Agent": "dataset",
+             "Cleaning Agent": "cleaning"}.get(agent_name)
+    if field:
+        value = output.get("recommended_parent_paper") if field == "parent_paper" else output
+        run_context.update_task(topic=ctx.get("topic"), **{field: value})
     if agent_name == "Intake Agent":
         output["project_topic"] = ctx["topic"]
         ctx["target_terms"] = output.get("target_terms", [])
@@ -1621,10 +1627,36 @@ def _undo_rerun(reason: str, ctx: dict, drive: dict, decision: str = "Rejected")
     _end_rerun(drive)
 
 
+def _compared_metrics(evaluation_result: dict) -> set:
+    """The metrics counted in the gap (both sides stated, trusted, bounded)."""
+    return {m["metric"] for m in (evaluation_result or {}).get("metrics", []) if m.get("difference_points") is not None}
+
+
+def _rerun_invalid(rerun: dict, ctx: dict) -> str:
+    """Why an Experiment Agent rerun's baseline cannot replace the current
+    one, or "". The gap alone is not enough: a closer score with new
+    leakage is not a real score, a baseline nobody reviewed is not known to
+    be valid, and a smaller mean over fewer metrics is not closer."""
+    from src.agents.evaluation_agent import review_unavailable, verified_leakage
+
+    before, after = rerun["before"].get("evaluation_result"), ctx["evaluation_result"]
+    known = {(f.get("check"), f.get("line"), f.get("evidence")) for f in verified_leakage(before)}
+    new = [f for f in verified_leakage(after) if (f.get("check"), f.get("line"), f.get("evidence")) not in known]
+    if new:
+        return f"the new baseline has verified data leakage ({new[0].get('issue', '')})"
+    if review_unavailable(after):
+        return "the analyst review of the new baseline was unavailable, so its validity is not known"
+    dropped = sorted(_compared_metrics(before) - _compared_metrics(after))
+    if dropped:
+        return f"the new baseline no longer reports {', '.join(dropped)}, so its gap is not comparable"
+    return ""
+
+
 def _close_rerun(ctx: dict, drive: dict) -> bool:
     """The Evaluation Agent has evaluated the rerun's baseline. Keep it, or
-    undo an Experiment Agent rerun that moved the score further from the
-    paper. Returns True when it is kept."""
+    undo an Experiment Agent rerun that is not a valid, comparable baseline
+    (_rerun_invalid) or that moved the score further from the paper.
+    Returns True when it is kept."""
     from src.agents.experiment_agent import score_gap
     from src.orchestration.state_manager import update_state
 
@@ -1635,12 +1667,17 @@ def _close_rerun(ctx: dict, drive: dict) -> bool:
                   metrics_after=_metrics_summary(ctx["evaluation_result"]))
     change = (f"gap {gap_before} -> {gap_after} points; overall {record['status_before']} -> "
               f"{record['status_after']}; metrics {record['metrics_before']} -> {record['metrics_after']}")
-    widened = gap_before is not None and (gap_after is None or gap_after > gap_before + GAP_TOLERANCE_POINTS)
-    if widened and rerun["sender"] == "Experiment Agent":
+    if rerun["sender"] == "Experiment Agent":
         # Validity fixes (Evaluation Agent requests) are kept even when the
         # score moves away: a leaky score is not a real score.
-        _undo_rerun(f"the score moved further from the paper ({change})", ctx, drive, decision="Reverted")
-        return False
+        invalid = _rerun_invalid(rerun, ctx)
+        if invalid:
+            _undo_rerun(f"{invalid} ({change})", ctx, drive, decision="Reverted")
+            return False
+        widened = gap_before is not None and (gap_after is None or gap_after > gap_before + GAP_TOLERANCE_POINTS)
+        if widened:
+            _undo_rerun(f"the score moved further from the paper ({change})", ctx, drive, decision="Reverted")
+            return False
 
     record.update(applied=True, outcome=change,
                   improved=gap_after is not None and (gap_before is None

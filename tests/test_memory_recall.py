@@ -94,14 +94,32 @@ def test_the_pack_has_the_rules_labels_scores_and_content(bank):
 
 
 def test_the_pack_budget_drops_content_before_cases(bank):
+    probe = recall.MemoryContext("Replication Agent", {"model_family": ["xgboost"]}, ["Replication Agent"])
+    first = probe.items[0]
+    summary = recall._case_block(first["label"], first["group"], first["memory"], first["score"], with_content=False)
+    budget = len(recall.SEPARATOR.join(probe._layout([])[0])) + len(recall.SEPARATOR) + len(summary)
     ctx = recall.MemoryContext("Replication Agent", {"model_family": ["xgboost"]}, ["Replication Agent"],
-                               pack_chars=1200)
+                               pack_chars=budget)  # room for the rules and one summary, not its script
     text = ctx.block()
     assert "[M1]" in text and XGB_SCRIPT.strip() not in text
+    assert len(text) <= budget and ctx.items[0]["delivered"] == "summary"
+
+
+def test_the_pack_budget_is_never_exceeded(bank):
+    """Review finding 10: a 300-character pack returned 2,305 characters."""
+    for budget in (300, 1500, 2500):
+        ctx = recall.MemoryContext("Replication Agent", {"model_family": ["xgboost"]}, ["Replication Agent"],
+                                   pack_chars=budget)
+        assert len(ctx.block()) <= budget
+    tiny = recall.MemoryContext("Replication Agent", {"model_family": ["xgboost"]}, ["Replication Agent"],
+                                pack_chars=300)
+    assert tiny.block() == ""  # the rules do not fit: no case goes out without them
+    assert tiny.used_labels("MEMORY_USED: M1") == ([], ["M1"])  # nothing was shown
 
 
 def test_used_labels_are_parsed_and_unknown_ones_are_rejected(bank):
     ctx = recall.MemoryContext("Replication Agent", {"model_family": ["xgboost"]}, ["Replication Agent"])
+    ctx.block()  # the cases the model receives
     assert ctx.used_labels('```json\n{"memory_used": ["M1", "M9"]}\n```') == (["M1"], ["M9"])
     assert ctx.used_labels("# MEMORY_USED: M2, M1\nimport os") == (["M2", "M1"], [])
     assert ctx.used_labels("no labels here") == ([], [])

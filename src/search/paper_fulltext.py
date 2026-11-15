@@ -287,3 +287,68 @@ def excerpt(text: str, keywords: tuple, max_chars: int = 12000, head_chars: int 
         budget -= len(paragraph) + 5
     body = "\n[...]\n".join(p for _i, p in sorted(chosen))
     return f"{head}\n[...]\n{body}" if body else head
+
+
+# A results-table row as pypdf extracts it: a label, then numbers on one line
+# ("KBD + RFE + Over + RF 0.9926 0.9926 1.0000 ..."). Decimals and percentages
+# count; plain integers do not (they are mostly counts, years and page numbers).
+_TABLE_NUMBER = re.compile(r"(?<![\w.])\d*\.\d+%?(?![\w.])|(?<![\w.])\d+(?:\.\d+)?\s?%")
+_METRIC_WORD = re.compile(r"\b(acc|accuracy|ac|f1|f-1|f1-score|auc|roc|recall|rc|sensitivity|precision|pr|"
+                          r"specificity|mcc|kappa|g-mean|error|rmse|mae|mse)\b", re.IGNORECASE)
+TABLE_GAP_LINES = 4      # non-number lines a table may have between its rows (headers, wrapped labels)
+TABLE_CONTEXT_LINES = 3  # lines kept around a table: its header row and its caption
+
+
+def table_blocks(text: str, max_chars: int = 12000) -> str:
+    """The paper's results tables as pypdf extracted them, within max_chars.
+
+    A table is a run of lines with at least two decimal or percentage
+    values, plus its header and caption lines. Tables whose rows or headers
+    name a metric (accuracy, F1, AUC ...) come first; each table is kept
+    whole or left out, in the paper's own order. Deterministic."""
+    lines = (text or "").splitlines()
+    numeric = [len(_TABLE_NUMBER.findall(line)) >= 2 for line in lines]
+    groups, start, last = [], None, None
+    for i, is_row in enumerate(numeric):
+        if not is_row:
+            continue
+        if start is not None and i - last > TABLE_GAP_LINES + 1:
+            groups.append((start, last))
+            start = None
+        if start is None:
+            start = i
+        last = i
+    if start is not None:
+        groups.append((start, last))
+    tables = []
+    for first, final in groups:
+        if sum(numeric[first:final + 1]) < 2:
+            continue
+        block = "\n".join(lines[max(first - TABLE_CONTEXT_LINES, 0):final + TABLE_CONTEXT_LINES + 1]).strip()
+        tables.append((0 if _METRIC_WORD.search(block) else 1, first, block))
+    budget, chosen = max_chars, []
+    for _priority, first, block in sorted(tables):
+        if len(block) + 5 > budget:
+            continue
+        chosen.append((first, block))
+        budget -= len(block) + 5
+    return "\n[...]\n".join(block for _first, block in sorted(chosen))
+
+
+def results_text(text: str, max_chars: int = 24000) -> str:
+    """What an agent needs to read a paper's own published results: the
+    results passages, the results tables, and the passages that describe
+    its datasets (so a result can be matched to the data it was measured
+    on). The whole text when it fits."""
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    passages = excerpt(text, RESULT_KEYWORDS, max_chars=max_chars // 3)
+    tables = table_blocks(text, max_chars=max_chars // 2)
+    data = excerpt(text, DATA_KEYWORDS, max_chars=max_chars - max_chars // 3 - max_chars // 2, head_chars=0)
+    parts = [passages]
+    if tables:
+        parts.append(f"[RESULTS TABLES, as extracted from the PDF]\n{tables}")
+    if data.strip(" \n[.]"):
+        parts.append(f"[DATASET DESCRIPTION]\n{data.lstrip(chr(10)).removeprefix('[...]').lstrip()}")
+    return "\n\n".join(parts)

@@ -37,6 +37,9 @@ MEMORY_MAX_REQUESTS_PER_CALL = int(os.getenv("MEMORY_MAX_REQUESTS_PER_CALL", "2"
 _on = ("true", "1", "yes")
 MEMORY_REUSE = os.getenv("MEMORY_REUSE", "true").strip().lower() in _on      # fast mode: adapt a good past script
 MEMORY_CURATOR = os.getenv("MEMORY_CURATOR", "true").strip().lower() in _on  # one LLM call per run writes lessons
+# Each agent's reflection on a finished run (one LLM call per agent, lessons checked
+# against the records; src/memory/reflection.py). Replaces the curator when on.
+MEMORY_REFLECTION = os.getenv("MEMORY_REFLECTION", "true").strip().lower() in _on
 MEMORY_RERANK = os.getenv("MEMORY_RERANK", "true").strip().lower() in _on    # reorder a retry's pack for its feedback
 MEMORY_WARNINGS = os.getenv("MEMORY_WARNINGS", "true").strip().lower() in _on  # false: good cases only (a test condition)
 # The controlled test this run belongs to (src/orchestration/comparison.py sets

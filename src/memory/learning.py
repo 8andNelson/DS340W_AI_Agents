@@ -24,8 +24,26 @@ only while it is empty, and moves times_helped / times_hurt in the same
 transaction). ranking.effective_quality turns the counts into the score
 recall ranks by. "Used" is the model's self-report; an outcome is what
 followed, not proof that the memory caused it.
+
+What counts (review findings 1, 13 and 14):
+  * Only MEMORY_MODE=read_write learns. In "read" mode the bank is frozen
+    for a controlled test: no outcome is recorded, so earlier test runs
+    cannot change the ranking later test runs get.
+  * One outcome per memory per attempt: several LLM calls of one attempt
+    that used the same memory are one use.
+  * Approval is not enough for the agents whose work is the reproduction
+    (VALIDITY_AGENTS). A memory used there helped only when the run's final
+    baseline is valid -- no verified leakage, and the analyst review ran --
+    and, for the Replication Agent, close to the paper (a measured gap of
+    at most CREDIT_GAP_POINTS). Leakage is "hurt"; an unknown validity or
+    fidelity is not judged.
+  * The report counts only outcomes that were stored; a failed write is
+    listed in "failed", never counted as learned.
 """
 import uuid
+
+VALIDITY_AGENTS = ("Replication Agent", "Evaluation Agent", "Experiment Agent")
+CREDIT_GAP_POINTS = 10.0  # ranking.gap_outcome >= 0.5
 
 
 def _client():
@@ -34,11 +52,18 @@ def _client():
     return c if c and c.backend != "off" else None
 
 
+def bank_learns() -> bool:
+    """Only MEMORY_MODE=read_write changes the bank; "read" is a frozen bank."""
+    from src.config import MEMORY_MODE
+    return MEMORY_MODE == "read_write"
+
+
 def record_outcome(usage_id: str, memory_id: str, helped: bool) -> bool:
-    """Apply one usage outcome (once). Fail-soft."""
+    """Apply one usage outcome (once). Fail-soft. Nothing is recorded while
+    the bank is frozen (MEMORY_MODE=read)."""
     try:
         c = _client()
-        if c is None:
+        if c is None or not bank_learns():
             return False
         c.write({"op_id": str(uuid.uuid4()), "type": "usage_outcome", "table": "memory_usage",
                  "key": {"id": usage_id}, "memory_id": memory_id, "helped": bool(helped)})
@@ -56,7 +81,28 @@ def report_fast_mode_failure(usage_id: str | None, memory_id: str | None) -> boo
     return record_outcome(usage_id, memory_id, False)
 
 
-def _outcome(row: dict, attempts: dict, by_agent: dict, lineage: dict, warnings: set) -> tuple[bool | None, str]:
+def _validity(final: dict | None, agent: str) -> tuple[bool | None, str]:
+    """(True, why) when the run's final baseline earns credit for this
+    agent's memories; (False, why) when it is invalid; (None, why) unknown."""
+    from src.agents.evaluation_agent import review_unavailable, verified_leakage
+    from src.agents.experiment_agent import score_gap
+    if not final:
+        return None, "no final evaluation: the baseline's validity is unknown"
+    if verified_leakage(final):
+        return False, "the final baseline has verified data leakage"
+    if review_unavailable(final):
+        return None, "the analyst review was unavailable: validity unknown"
+    if agent == "Replication Agent":
+        gap = score_gap(final)
+        if gap is None:
+            return None, "no measurable gap to the paper: fidelity unknown"
+        if gap > CREDIT_GAP_POINTS:
+            return None, f"kept, but {gap} points from the paper (> {CREDIT_GAP_POINTS}): no credit"
+    return True, "valid final baseline"
+
+
+def _outcome(row: dict, attempts: dict, by_agent: dict, lineage: dict, warnings: set,
+             final: dict = None) -> tuple[bool | None, str]:
     """(helped, why) for one used memory_usage row."""
     attempt = attempts.get(row.get("invocation_id"))
     if attempt is None:
@@ -76,20 +122,40 @@ def _outcome(row: dict, attempts: dict, by_agent: dict, lineage: dict, warnings:
         return None, f"lineage {state or 'unknown'}: not judged"
     if row["invocation_id"] in warnings:
         return False, "the attempt's output is itself a warning (e.g. verified leakage)"
-    return True, "approved, kept, and not a warning"
+    if row.get("agent") in VALIDITY_AGENTS:
+        valid, why = _validity(final, row.get("agent"))
+        if not valid:
+            return valid, why
+    return True, "approved, kept, not a warning, and the final baseline is valid"
 
 
 def learn_run(run_id: str) -> dict:
     """Record the outcome of every past case this run used. Returns
-    {"helped": n, "hurt": n, "not_judged": n}. Never raises."""
-    report = {"helped": 0, "hurt": 0, "not_judged": 0}
+    {"helped": n, "hurt": n, "not_judged": n, "duplicate_uses": n,
+    "failed": [usage ids], "skipped": reason | None} -- helped and hurt
+    count stored outcomes only. Never raises."""
+    report = {"helped": 0, "hurt": 0, "not_judged": 0, "duplicate_uses": 0, "failed": [], "skipped": None}
     try:
         c = _client()
         if c is None or not run_id:
             return report
-        usage = [u for u in c.local.rows("memory_usage", run_id=run_id) if u.get("used") and u.get("helped") is None]
+        if not bank_learns():
+            report["skipped"] = "MEMORY_MODE is not read_write: the bank is frozen"
+            return report
+        rows = [u for u in c.local.rows("memory_usage", run_id=run_id) if u.get("used")]
+        # One outcome per memory per attempt (several calls of one attempt are one use).
+        groups = {}
+        for u in sorted(rows, key=lambda u: u.get("created_at") or ""):
+            groups.setdefault((u.get("memory_id"), u.get("invocation_id")), []).append(u)
+        usage = []
+        for group in groups.values():
+            report["duplicate_uses"] += len(group) - 1
+            if all(u.get("helped") is None for u in group):
+                usage.append(group[0])
         if not usage:
             return report
+        from src.memory import retain
+        final = (retain.load_run(run_id) or {}).get("final_evaluation")
         events = c.local.rows("memory_events", run_id=run_id, event_type="attempt")
         attempts = {e["invocation_id"]: e for e in events if e.get("invocation_id")}
         by_agent = {}
@@ -99,12 +165,14 @@ def learn_run(run_id: str) -> dict:
         warnings = {m.get("invocation_id") for m in c.local.rows("memories", run_id=run_id)
                     if m.get("polarity") == "negative" and m.get("invocation_id")}
         for row in usage:
-            helped, _why = _outcome(row, attempts, by_agent, lineage, warnings)
+            helped, _why = _outcome(row, attempts, by_agent, lineage, warnings, final)
             if helped is None:
                 report["not_judged"] += 1
                 continue
-            record_outcome(row["id"], row["memory_id"], helped)
-            report["helped" if helped else "hurt"] += 1
+            if record_outcome(row["id"], row["memory_id"], helped):
+                report["helped" if helped else "hurt"] += 1
+            else:
+                report["failed"].append(row["id"])
     except Exception as e:
         print(f"[Memory] WARNING: could not learn from run {run_id}: {e}")
     return report

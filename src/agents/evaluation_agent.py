@@ -55,6 +55,7 @@ from pathlib import Path
 import pandas as pd
 
 from src import llm
+from src.orchestration import leakage_probe
 from src.orchestration.code_checks import find_leakage
 from src.orchestration.dataset_budget import MAX_MASTER_ROWS
 from src.search import paper_fulltext
@@ -70,8 +71,16 @@ APPROXIMATE_THRESHOLD_POINTS = 5.0  # percentage points
 # The LLM extraction below remains the fallback for output in any other
 # form (e.g. a cloned repository's own logging).
 METRIC_LINE_FORMAT = "METRIC <name>=<value>"
-_METRIC_LINE = re.compile(r"^\s*METRIC\s+([A-Za-z0-9_\- ]+?)\s*[=:]\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*%?\s*$",
+_METRIC_LINE = re.compile(r"^\s*METRIC\s+([A-Za-z0-9_\- ]+?)\s*[=:]\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(%?)\s*$",
                           re.MULTILINE)
+# Metrics with no fixed 0-1 / 0-100 scale: never converted to percentage
+# points (an RMSE of 0.5 is not 50 points), so never in the gap.
+UNBOUNDED_METRIC = re.compile(r"rmse|mse|mae|mape|loss|error(?!rate)|seconds|time|latency|runtime|perplexity")
+# A result as a paper writes it: a decimal or a percentage. Plain integers
+# (page numbers, counts, years) never confirm a value.
+_NUMBER = re.compile(r"\d*\.\d+|\d+(?=\s?%)")
+PUBLISHED_TEXT_CHARS = 24000  # results passages + results tables + dataset description (paper_fulltext.results_text)
+MAX_CONTEXT_ASSUMPTIONS = 12
 
 _STATUS_RANK = {"EXACT": 0, "APPROXIMATE": 1, "FAILED": 2, "INCONCLUSIVE": 3}
 
@@ -80,6 +89,7 @@ _METRIC_DEFAULTS = {
     "published_value": None,
     "reproduced_value": None,
     "difference_points": None,
+    "provisional_difference_points": None,  # a difference shown, but not counted in the gap (see run())
     "classification": "INCONCLUSIVE",
     "notes": "",
 }
@@ -91,14 +101,37 @@ def _default_metric(**overrides) -> dict:
     return metric
 
 
+# Names that mean the same metric, so a paper's "AUC" matches a run's "roc_auc".
+METRIC_ALIASES = {
+    "acc": "accuracy", "ac": "accuracy",
+    "f1score": "f1", "fscore": "f1", "fmeasure": "f1", "f1measure": "f1",
+    "rocauc": "auc", "aucroc": "auc", "auroc": "auc", "areaundercurve": "auc", "areaunderthecurve": "auc",
+    "areaundertheroccurve": "auc", "rocaucscore": "auc", "aucscore": "auc",
+    "sensitivity": "recall", "rc": "recall", "tpr": "recall", "truepositiverate": "recall",
+    "pr": "precision", "ppv": "precision",
+}
+
+
 def _normalize_metric_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    key = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    return METRIC_ALIASES.get(key, key)
 
 
 def parse_metric_lines(text: str) -> dict:
     """Metrics printed as METRIC_LINE_FORMAT lines; a later line for the
-    same metric wins (the final evaluation, not an intermediate one)."""
-    return {name.strip(): float(value) for name, value in _METRIC_LINE.findall(text or "")}
+    same metric wins (the final evaluation, not an intermediate one).
+
+    A value printed with "%" is a percentage and becomes a fraction
+    ("recall=0.5%" -> 0.005), so to_percentage_points gives 0.5 points --
+    without this the unit was dropped and 0.5% was read as 50 points."""
+    return {name.strip(): float(value) / 100 if percent else float(value)
+            for name, value, percent in _METRIC_LINE.findall(text or "")}
+
+
+def is_bounded_score(name: str) -> bool:
+    """True for a 0-1 / 0-100 score (accuracy, F1, AUC ...); False for an
+    error, loss or time, which percentage points cannot compare."""
+    return not UNBOUNDED_METRIC.search(_normalize_metric_name(name))
 
 
 def _read_stdout(stdout_path: str) -> str:
@@ -123,36 +156,118 @@ def reproduced_metrics(stdout: str, source_label: str) -> dict:
     return _extract_metrics((stdout or "")[-STDOUT_CHAR_LIMIT:], source_label)
 
 
-def _extract_metrics(text: str, source_label: str, max_chars: int = STDOUT_CHAR_LIMIT) -> dict:
+def _number_in_text(value: float, text: str) -> bool:
+    """True when value is written as a number in text -- as stated, or as
+    the same value on the other scale (0.9926 in a table, 99.26% in prose)."""
+    written = {round(float(n), 6) for n in _NUMBER.findall((text or "").replace(",", ""))}
+    return any(round(v, 6) in written for v in (value, value / 100, value * 100))
+
+
+def _metric_value(item) -> tuple:
+    """(value as stated, unit) of one metric in the model's answer, or (None, "")."""
+    if isinstance(item, dict):
+        return item.get("value"), str(item.get("unit") or "").lower()
+    return item, ""
+
+
+def _as_fraction(value: float, unit: str) -> float:
+    # A stated percentage becomes a fraction, as for METRIC lines.
+    return float(value) / 100 if unit == "percent" else float(value)
+
+
+def _extract_metrics(text: str, source_label: str, max_chars: int = STDOUT_CHAR_LIMIT, context: str = "",
+                     verify: bool = False, details: dict | None = None) -> dict:
     """One LLM call restricted to metrics EXPLICITLY stated in text.
     Returns {} on any failure, malformed response, or when nothing is
-    stated -- never estimates or guesses a value."""
+    stated -- never estimates or guesses a value.
+
+    context: what was reproduced (method, data). A paper often reports many
+    scenarios (models x preprocessing x datasets); the model then picks the
+    ONE scenario that matches the reproduction and returns that row only.
+    verify: keep a value only if it is written in text (no invented number).
+    details: filled with how the extraction went -- status FOUND /
+    NONE_STATED / AMBIGUOUS / FAILED, the chosen scenario and dataset, and
+    a note for every value left out -- so "the paper states no metric" is
+    never reported when the answer could not be read. A metric given as a
+    list of values is kept only when all of them agree."""
+    info = details if details is not None else {}
+    info.update(status="NONE_STATED", scenario="", dataset="", reason="", notes=[], raw_reply="")
     if not text:
         return {}
 
+    context_block = f"""
+WHAT WAS REPRODUCED (use it to choose the matching result):
+{context}
+
+The text may report many scenarios (several models, preprocessing pipelines or datasets). Choose the ONE
+scenario and dataset that match what was reproduced; if none matches, the paper's own main (final) method.
+Return the values of that one row only.
+""" if context else ""
     prompt = f"""You are extracting quantitative evaluation metrics from {source_label}.
 
 Text:
 {text[:max_chars]}
+{context_block}
+Find every evaluation metric (e.g. accuracy, precision, recall, F1, AUC) with a numeric value EXPLICITLY stated in this text. Do not estimate, infer, or compute a metric that isn't directly stated. Table columns are often abbreviated (AC/ACC = accuracy, RC = recall, PR = precision): use the full metric name.
 
-Find every evaluation metric (e.g. accuracy, precision, recall, F1, AUC) with a numeric value EXPLICITLY stated in this text. Do not estimate, infer, or compute a metric that isn't directly stated.
-
-Return ONLY a JSON object mapping metric name to its numeric value (a plain number, not a string; keep the scale exactly as stated -- percentages as 0-100, fractions as 0-1):
-{{"accuracy": 94.2, "f1": 0.91}}
-If no metric is explicitly stated, return {{}}.
+Return ONLY a JSON object. Give each metric ONE value, exactly as stated, its unit ("percent" when the text states it as a percentage, "fraction" for a 0-1 value, "other" for anything else: an error, loss, time, count) and the exact text it was read from:
+{{"scenario": "<the scenario or model, as written; empty if the text reports one result>",
+  "dataset": "<the dataset, as written; empty if only one>",
+  "reason": "<one sentence: why this scenario>",
+  "metrics": {{"accuracy": {{"value": 94.2, "unit": "percent", "quote": "accuracy of 94.2%"}},
+              "f1": {{"value": 0.91, "unit": "fraction", "quote": "0.91"}}}}}}
+If no metric is explicitly stated, return {{"metrics": {{}}}}.
 Return ONLY valid JSON. No explanation or markdown."""
 
     try:
         content = llm.chat(prompt, timeout=300, agent="evaluation_agent")
-    except Exception:
+    except Exception as e:
+        info.update(status="FAILED", notes=[f"The model call failed: {type(e).__name__}: {e}"])
         return {}
 
-    data = llm.parse_json(content, default={})
+    data = llm.parse_json(content, default=None)
     if not isinstance(data, dict):
+        info.update(status="FAILED", raw_reply=(content or "")[:2000],
+                    notes=["The model's answer was not a JSON object, so no value could be read."])
         return {}
+    if isinstance(data.get("metrics"), dict):
+        found = data["metrics"]
+        info.update(scenario=str(data.get("scenario") or "").strip(), dataset=str(data.get("dataset") or "").strip(),
+                    reason=str(data.get("reason") or "").strip())
+    else:
+        found = data  # the older answer shape: {"accuracy": {...}, ...}
 
-    return {name: float(value) for name, value in data.items()
-            if isinstance(value, (int, float)) and not isinstance(value, bool)}
+    metrics = {}
+    for name, item in found.items():
+        candidates = item if isinstance(item, list) else [item]
+        values = []
+        for candidate in candidates:
+            value, unit = _metric_value(candidate)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                values.append((float(value), unit))
+        if not values:
+            continue
+        if verify:
+            unverified = [v for v, _u in values if not _number_in_text(v, text[:max_chars])]
+            if unverified:
+                info["notes"].append(f"{name}: {', '.join(map(str, unverified))} is not written in the text, so it "
+                                     "was left out (UNVERIFIED).")
+                values = [(v, u) for v, u in values if v not in unverified]
+                if not values:
+                    continue
+        fractions = sorted({round(_as_fraction(v, u), 6) for v, u in values})
+        if len(fractions) > 1:
+            info["notes"].append(f"{name}: the text gives several values ({', '.join(map(str, fractions))}) and "
+                                 "none was chosen for the reproduced scenario, so none is used.")
+            continue
+        metrics[name] = _as_fraction(*values[0])
+
+    if metrics:
+        info["status"] = "FOUND"
+    elif info["notes"]:
+        info["status"] = "AMBIGUOUS"
+        info["raw_reply"] = (content or "")[:2000]
+    return metrics
 
 
 def to_percentage_points(value: float) -> float:
@@ -412,6 +527,33 @@ Return ONE JSON object:
 Return ONLY valid JSON. No explanation or markdown."""
 
 
+# A finding that blocks a baseline or a rerun needs more than a few
+# characters of quoted evidence: "import pandas" occurs in almost any script.
+MIN_DECISIVE_QUOTE_CHARS = 20
+REVIEW_ATTEMPTS = 2
+
+
+def verified_leakage(evaluation_result: dict | None) -> list:
+    """Every verified data-leakage finding of an evaluation: the
+    deterministic checks' (code_checks) and the analyst review's (verified,
+    critical or major, with a quote of at least MIN_DECISIVE_QUOTE_CHARS).
+    The one definition of "this baseline leaks", used by Master Agent's
+    rerun acceptance and by memory retention."""
+    review_result = (evaluation_result or {}).get("review") or {}
+    static = list(review_result.get("static_findings") or [])
+    analyst = [dict(f, check=f.get("check") or "analyst_review") for f in review_result.get("findings") or []
+               if f.get("verified") and f.get("category") == "data_leakage"
+               and f.get("severity") in ("critical", "major")
+               and len(str(f.get("evidence") or "").strip()) >= MIN_DECISIVE_QUOTE_CHARS]
+    return static + analyst
+
+
+def review_unavailable(evaluation_result: dict | None) -> bool:
+    """True when the analyst review never ran: the baseline's validity was
+    not checked, which is not the same as checked and valid."""
+    return ((evaluation_result or {}).get("review") or {}).get("review_status") == "UNAVAILABLE"
+
+
 def _decide(raw: dict, findings: list, static: list, facts: dict, source: str) -> tuple[dict, list]:
     """Turn the LLM's proposed decision into one the evidence supports.
     Returns (decision, notes on any change). Deterministic rules:
@@ -494,26 +636,40 @@ def review(parent_paper: dict, paper: dict, replication_result: dict, metrics: l
     source = replication_result.get("source", "")
 
     raw, reviewed_by, review_error = {}, "", ""
-    try:
-        from src.memory import recall
-        context = recall.for_agent("Evaluation Agent", text=parent_paper.get("title", ""), parent_paper=parent_paper,
-                                   cleaning=cleaning_result, dataset=dataset_result, script=script)
-        content = llm.chat(_review_prompt(parent_paper, paper, replication_result, script, stdout, stderr,
-                                          metrics, facts, static, history),
-                           timeout=REVIEW_TIMEOUT_SECONDS, effort="high", agent="evaluation_agent", memory=context)
-        raw = llm.parse_json(content, default={})
-        raw = raw if isinstance(raw, dict) else {}
-        reviewed_by = llm.last_served_by()
-    except Exception as e:
-        review_error = f"The review call failed: {e}"
+    # A provider outage or an unreadable answer is retried once; after that
+    # the review is UNAVAILABLE -- never read as an "accept" of a baseline
+    # that no one reviewed.
+    for attempt in range(1, REVIEW_ATTEMPTS + 1):
+        try:
+            from src.memory import recall
+            context = recall.for_agent("Evaluation Agent", text=parent_paper.get("title", ""),
+                                       parent_paper=parent_paper, cleaning=cleaning_result, dataset=dataset_result,
+                                       script=script)
+            content = llm.chat(_review_prompt(parent_paper, paper, replication_result, script, stdout, stderr,
+                                              metrics, facts, static, history),
+                               timeout=REVIEW_TIMEOUT_SECONDS, effort="high", agent="evaluation_agent",
+                               memory=context)
+            raw = llm.parse_json(content, default={})
+            raw = raw if isinstance(raw, dict) else {}
+            reviewed_by = llm.last_served_by()
+            review_error = "" if raw.get("decision") or raw.get("findings") or raw.get("assessment") else \
+                f"The review answer had no assessment, findings or decision (attempt {attempt})."
+        except Exception as e:
+            raw, review_error = {}, f"The review call failed (attempt {attempt}): {e}"
+        if not review_error:
+            break
+        print(f"[Evaluation Agent] {review_error}")
+    review_status = "UNAVAILABLE" if review_error else "COMPLETE"
 
     corpus = "\n".join([script, stdout or "", stderr, paper.get("text", ""), json.dumps(facts, default=str)])
     findings = _verify(raw.get("findings") or [], corpus)
     decision, decision_notes = _decide(raw.get("decision"), findings, static, facts, source)
     if review_error:
-        decision_notes.insert(0, review_error)
+        decision_notes.insert(0, f"{review_error} The analyst review is UNAVAILABLE: the baseline's validity was "
+                                 "checked only by the deterministic leakage checks.")
 
     return {
+        "review_status": review_status,
         "assessment": str(raw.get("assessment") or ""),
         "static_findings": static,
         "findings": findings,
@@ -551,6 +707,58 @@ def _request_for(decision: dict, review_result: dict) -> list:
     }]
 
 
+def _reproduction_context(replication_result: dict, cleaning_result: dict | None, dataset_result: dict | None) -> str:
+    """What was reproduced, for choosing the matching row of a paper that
+    reports many scenarios: the method details and the data used."""
+    lines = []
+    if replication_result.get("source") == "reconstructed":
+        lines.append("A baseline reconstructed from the paper's method.")
+    elif replication_result.get("repo_url"):
+        lines.append(f"The repository {replication_result['repo_url']} "
+                     f"(entry point {replication_result.get('entry_point') or 'unknown'}).")
+    assumptions = [str(a) for a in replication_result.get("inferred_assumptions") or []]
+    if assumptions:
+        lines.append("Method details: " + " ".join(assumptions[:MAX_CONTEXT_ASSUMPTIONS]))
+    datasets = [d.get("display_name") or d.get("name") or ""
+                for d in (dataset_result or {}).get("selected_datasets") or []]
+    rows = (cleaning_result or {}).get("rows_total")
+    if datasets or rows:
+        lines.append(f"Data: {', '.join(filter(None, datasets)) or 'unnamed dataset'}"
+                     + (f", {rows} rows." if rows else "."))
+    return "\n".join(lines)
+
+
+def _published_leakage_check(published_by_key: dict, reproduced_by_key: dict, trusted_source: bool, paper: dict,
+                             replication_result: dict, cleaning_result: dict | None) -> dict:
+    """leakage_probe.check on the bounded metrics stated on both sides, in
+    percentage points. Only for values read from the paper itself."""
+    if not trusted_source:
+        return {"status": "SKIPPED", "reason": "The published values are not from the paper itself.", "metrics": []}
+    points = lambda by_key: {k: to_percentage_points(v) for k, (name, v) in by_key.items() if is_bounded_score(name)}
+    result = leakage_probe.check(points(published_by_key), points(reproduced_by_key),
+                                 paper.get("text", "") if paper.get("status") == "FULL_TEXT" else "",
+                                 replication_result, cleaning_result)
+    if result["status"] != "SKIPPED":
+        print(f"[Evaluation Agent] Published-score leakage check: {result['status']} -- {result['reason']}")
+    return result
+
+
+def _unpublished_note(metric: str, extraction: dict, published_source: str) -> str:
+    """Why a reproduced metric has no published value. 'Not stated' only
+    when the paper's text was read and states none."""
+    status = extraction.get("status")
+    if status == "FAILED":
+        return "The paper's value could not be read: the extraction failed (see published_extraction)."
+    if status == "AMBIGUOUS" or any(n.startswith(f"{metric}:") for n in extraction.get("notes") or []):
+        return "The paper's value could not be read reliably (see published_extraction)."
+    if status == "FOUND":
+        scenario = ", ".join(filter(None, [extraction.get("scenario"), extraction.get("dataset")]))
+        return f"Not stated for the paper's matching scenario{f' ({scenario})' if scenario else ''}."
+    if published_source == "full_text":
+        return "Not stated in the paper's own text."
+    return "Not stated in the paper's available text (abstract or metadata, not the full paper)."
+
+
 def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = None, dataset_result: dict = None,
         history: list = None) -> dict:
     """
@@ -578,11 +786,13 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
     paper = paper_fulltext.get_parent_paper_text(parent_paper) if parent_paper else {"status": "", "text": ""}
     published_limit = STDOUT_CHAR_LIMIT
     if paper.get("status") == "FULL_TEXT":
-        published_text = paper_fulltext.excerpt(paper["text"], paper_fulltext.RESULT_KEYWORDS, max_chars=8000)
+        # The results tables too: a paper's per-scenario metrics are often
+        # only in a table (in a live run, only one AUC was in the prose).
+        published_text = paper_fulltext.results_text(paper["text"], max_chars=PUBLISHED_TEXT_CHARS)
         published_source = "full_text"
-        published_label = ("an academic paper's own full text -- extract only the final results of the paper's own "
-                           "main method, not those of baselines or of other papers it cites")
-        published_limit = 8000
+        published_label = ("an academic paper's own full text -- extract only results of the paper's own "
+                           "methods, not those of other papers it cites")
+        published_limit = PUBLISHED_TEXT_CHARS
     elif parent_paper.get("official_abstract"):
         published_text = parent_paper["official_abstract"]
         published_source = "official_abstract"
@@ -593,20 +803,50 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
         published_label = "an academic paper's own stated results"
     reproduced_text = _read_stdout(replication_result.get("stdout_path", ""))
 
-    published_metrics = _extract_metrics(published_text, published_label, max_chars=published_limit)
+    extraction = {}
+    published_metrics = _extract_metrics(published_text, published_label, max_chars=published_limit,
+                                         context=_reproduction_context(replication_result, cleaning_result,
+                                                                       dataset_result),
+                                         verify=published_source == "full_text", details=extraction)
+    extraction.setdefault("status", "FOUND" if published_metrics else "NONE_STATED")
+    for note in extraction.get("notes") or []:
+        print(f"[Evaluation Agent] Published values: {note}")
+    if extraction.get("scenario") or extraction.get("dataset"):
+        print(f"[Evaluation Agent] Published values read for: {extraction.get('scenario') or 'the main result'}"
+              + (f", {extraction['dataset']}" if extraction.get("dataset") else "")
+              + (f" ({extraction['reason']})" if extraction.get("reason") else ""))
+    scenario_note = ", ".join(filter(None, [extraction.get("scenario"), extraction.get("dataset")]))
     reproduced = reproduced_metrics(reproduced_text, "a reproduction run's captured output")
 
     published_by_key = {_normalize_metric_name(k): (k, v) for k, v in published_metrics.items()}
     reproduced_by_key = {_normalize_metric_name(k): (k, v) for k, v in reproduced.items()}
 
+    # A search snippet can quote another paper's results: its values are
+    # shown, but never counted in the gap or classified (UNVERIFIED).
+    trusted_source = published_source != "search_snippet"
     metrics = []
     for key, (pub_name, pub_value) in published_by_key.items():
         if key in reproduced_by_key:
             _, rep_value = reproduced_by_key[key]
+            if not is_bounded_score(pub_name):
+                metrics.append(_default_metric(
+                    metric=pub_name, published_value=pub_value, reproduced_value=rep_value,
+                    notes=f"Not a 0-1/0-100 score (error, loss or time): raw difference "
+                          f"{round(abs(rep_value - pub_value), 6)}, not percentage points, and not counted in "
+                          "the gap."))
+                continue
             classification, diff = _classify(pub_value, rep_value)
+            if not trusted_source:
+                metrics.append(_default_metric(
+                    metric=pub_name, published_value=pub_value, reproduced_value=rep_value,
+                    provisional_difference_points=diff,
+                    notes="UNVERIFIED published value (read from a search snippet, not the paper): shown, but "
+                          "not classified and not counted in the gap."))
+                continue
             metrics.append(_default_metric(
                 metric=pub_name, published_value=pub_value, reproduced_value=rep_value,
                 difference_points=diff, classification=classification,
+                notes=f"Paper's value for: {scenario_note}." if scenario_note else "",
             ))
         else:
             metrics.append(_default_metric(
@@ -617,14 +857,23 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
         if key not in published_by_key:
             metrics.append(_default_metric(
                 metric=rep_name, reproduced_value=rep_value,
-                notes="Not stated in the paper's own text.",
+                notes=_unpublished_note(rep_name, extraction, published_source),
             ))
 
     overall = max((m["classification"] for m in metrics), key=lambda c: _STATUS_RANK[c]) if metrics else "INCONCLUSIVE"
     causes = _likely_causes(parent_paper, replication_result, metrics)
+    leakage_check = _published_leakage_check(published_by_key, reproduced_by_key, trusted_source, paper,
+                                             replication_result, cleaning_result)
+    if leakage_check["status"] == "CONSISTENT_WITH_LEAKAGE":
+        causes.append(leakage_probe.likely_cause(leakage_check))
+    if extraction["status"] in ("FAILED", "AMBIGUOUS"):
+        causes.append("The paper's published values could not be read reliably "
+                      f"({extraction['status']}: {' '.join(extraction.get('notes') or [])}) -- the gap is unknown "
+                      "for those metrics; this does not mean the paper states no result.")
     if published_source == "search_snippet" and published_metrics:
         causes.append("The published values were read from a search-result snippet, not the paper's verified "
-                      "abstract -- a snippet can quote another paper's results, so treat them as UNVERIFIED.")
+                      "abstract -- a snippet can quote another paper's results, so they are UNVERIFIED and not "
+                      "counted in the gap.")
 
     print(f"[Evaluation Agent] Compared {len(metrics)} metric(s): overall={overall}. Reviewing the replication...")
     review_result = review(parent_paper, paper, replication_result, metrics, reproduced_text,
@@ -634,6 +883,9 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
         print(f"[Evaluation Agent] Leakage check: {f['issue']} (line {f['line']}: {f['evidence']})")
     for note in review_result["decision_notes"]:
         print(f"[Evaluation Agent] Decision check: {note}")
+    if review_result["review_status"] == "UNAVAILABLE":
+        causes.append("The analyst review was unavailable, so the baseline's validity was checked only by the "
+                      "deterministic leakage checks.")
     print(f"[Evaluation Agent] Done. Overall={overall}, decision={decision['action']}"
           + (f" -> {decision['target_agent']}" if decision["target_agent"] else "") + ".")
 
@@ -643,9 +895,16 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
         "metrics": metrics,
         "published_metrics_found": bool(published_metrics),
         "published_source": published_source,
+        # How the paper's values were read: status, the chosen scenario and
+        # dataset, and why any value was left out (raw reply on a failure).
+        "published_extraction": extraction,
+        # Can the paper's score be reached without leakage? (leakage_probe;
+        # CONSISTENT_WITH_LEAKAGE stops the Experiment Agent chasing it.)
+        "published_leakage_check": leakage_check,
         "reproduced_metrics_found": bool(reproduced),
         "likely_causes": causes,
         "review": review_result,
+        "review_status": review_result["review_status"],
         "decision": decision,
         "requests": _request_for(decision, review_result),
         "notes": "",

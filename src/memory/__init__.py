@@ -45,7 +45,8 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 LOCAL_DB = REPO_ROOT / "database" / "memory_local.db"
 
 BACKENDS = ("off", "sqlite", "postgres")
-CACHE_MAX_AGE = timedelta(days=7)       # an older local copy is not used for reads (quarantines may be missing)
+CACHE_MAX_AGE = timedelta(days=1)       # an older local copy is not used for reads (quarantines may be missing);
+                                        # every run syncs at its start and end, so a day covers normal use
 MAX_SEND_ATTEMPTS = 5                   # an op rejected this often is set aside as "failed", for review
 REMOTE_RETRY_SECONDS = 300              # after a connection failure, reads skip the hosted store this long
 
@@ -110,10 +111,45 @@ class MemoryClient:
             try:
                 rows = self.remote.fetch_memories(**filters)
                 self.local.cache_memories(rows)
-                return rows
+                self._reconcile(rows, filters)
+                return self._with_local_changes(rows, filters)
             except RemoteUnavailable as e:
                 self._mark_down(e)
         return self.local.fetch_memories(**filters) if self.cache_usable() else []
+
+    def _with_local_changes(self, rows: list, filters: dict) -> list:
+        """The hosted result as this machine sees it: each row with its
+        pending local changes (cache_memories applied them), filtered again
+        by them (a memory quarantined here is no longer "active"), plus the
+        memories made here and not sent yet (review finding 2)."""
+        ids = [r["id"] for r in rows]
+        if filters.get("ids") is not None:
+            wanted = set(filters["ids"])
+            ids += [i for i in self.local.pending_insert_ids() if i in wanted]
+        else:
+            ids += list(self.local.pending_insert_ids())
+        local = {k: v for k, v in filters.items() if k not in ("offset", "conn")}
+        local.update(ids=list(dict.fromkeys(ids)), limit=filters.get("limit", 50) + len(ids))
+        merged = self.local.fetch_memories(**local)
+        return merged[:filters.get("limit", 50)]
+
+    def _reconcile(self, rows: list, filters: dict) -> None:
+        """A complete hosted answer (one page, under its limit) is the truth
+        for its filters: a local copy that matches the same filters but was
+        not returned has changed on the hosted store (e.g. a teammate
+        quarantined it). Its current row is fetched and cached, so the local
+        copy cannot bring it back while the store is unreachable (finding 3).
+        Copies with pending local changes are left alone (finding 2)."""
+        if filters.get("offset") or len(rows) >= filters.get("limit", 50):
+            return
+        returned = {r["id"] for r in rows}
+        local = {k: v for k, v in filters.items() if k not in ("offset", "conn", "limit")}
+        pending = self.local.pending_memory_ids()
+        stale = [m["id"] for m in self.local.fetch_memories(**local, limit=1_000_000)
+                 if m["id"] not in returned and m["id"] not in pending]
+        for start in range(0, len(stale), 500):
+            chunk = stale[start:start + 500]
+            self.local.cache_memories(self.remote.fetch_memories(ids=chunk, states=None, limit=len(chunk)))
 
     # --- Sync ---
 
@@ -322,17 +358,33 @@ def record_usage(usage: dict) -> str | None:
         return None
 
 
-def increment(memory_id: str, **counters) -> bool:
-    """Add to a memory's counters (seen_count, times_recalled, times_used, times_helped, times_hurt)."""
+def increment(memory_id: str, op_id: str = None, **counters) -> bool:
+    """Add to a memory's counters (seen_count, times_recalled, times_used, times_helped, times_hurt).
+    A fixed op_id makes a retried call count once (the store applies an op id once)."""
     try:
         c = client()
         if c.backend == "off":
             return False
-        c.write({"op_id": str(uuid.uuid4()), "type": "increment", "table": "memories",
+        c.write({"op_id": op_id or str(uuid.uuid4()), "type": "increment", "table": "memories",
                  "key": {"id": memory_id}, "counters": counters})
         return True
     except Exception as e:
         _warn(f"update the counters of memory {memory_id}", e)
+        return False
+
+
+def set_quality(memory_id: str, quality: float, quality_reasons: dict, op_id: str = None) -> bool:
+    """Replace a memory's base quality and its reasons (a contradiction, a
+    rescore). Fail-soft; a fixed op_id makes a retry apply once."""
+    try:
+        c = client()
+        if c.backend == "off":
+            return False
+        c.write({"op_id": op_id or str(uuid.uuid4()), "type": "set_quality", "table": "memories",
+                 "key": {"id": memory_id}, "quality": float(quality), "quality_reasons": quality_reasons})
+        return True
+    except Exception as e:
+        _warn(f"change the quality of memory {memory_id}", e)
         return False
 
 

@@ -97,17 +97,21 @@ def _normalize_column_name(col) -> str:
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize every column name, de-duplicating collisions that the
     normalization itself creates (e.g. 'Amount' and 'amount ' both
-    normalizing to 'amount')."""
-    seen = {}
-    new_cols = []
-    for c in df.columns:
-        norm = _normalize_column_name(c)
-        if norm in seen:
-            seen[norm] += 1
-            norm = f"{norm}_{seen[norm]}"
-        else:
-            seen[norm] = 1
-        new_cols.append(norm)
+    normalizing to 'amount'). A suffix is never a name another column has
+    or gets: 'A', 'a', 'a_2' become 'a', 'a_3', 'a_2' (a suffix checked
+    only against the first name made 'a', 'a_2', 'a_2')."""
+    normalized = [_normalize_column_name(c) for c in df.columns]
+    reserved = set(normalized)  # every name some column normalizes to
+    used, new_cols = set(), []
+    for norm in normalized:
+        name, n = norm, 2
+        while name in used:
+            name = f"{norm}_{n}"
+            n += 1
+            if name in reserved:
+                name = norm  # taken by another column: try the next suffix
+        used.add(name)
+        new_cols.append(name)
     df = df.copy()
     df.columns = new_cols
     return df
@@ -132,34 +136,44 @@ def _write_conflicts_log(conflicts: list) -> None:
     CONFLICTS_LOG.write_text(json.dumps(conflicts, indent=2))
 
 
-def _split_train_test_validation(master: pd.DataFrame, seed: int = SPLIT_SEED) -> tuple:
+def _slice(shuffled: pd.DataFrame) -> tuple:
+    n = len(shuffled)
+    train_end = round(n * TRAIN_FRAC)
+    test_end = train_end + round(n * TEST_FRAC)
+    return shuffled.iloc[:train_end], shuffled.iloc[train_end:test_end], shuffled.iloc[test_end:]
+
+
+def _split_train_test_validation(master: pd.DataFrame, seed: int = SPLIT_SEED, label_column: str = "") -> tuple:
     """
     Deterministic 70/20/10 train/test/validation split: shuffle once with
-    a fixed seed, then slice by row count. Not stratified -- Cleaning
-    Agent doesn't know what the Modeling Agent's eventual target column
-    will be, so a plain random split is the only one that doesn't assume
-    anything about the data's shape or task.
+    a fixed seed, then slice by row count.
+
+    With a known label column the split is stratified: each label value is
+    shuffled and sliced 70/20/10 on its own, so a rare class (e.g. 6%
+    fraud) is in every split in the same ratio -- an unstratified split can
+    leave it out of the test set, making its metrics undefined. Without a
+    label, the plain random split assumes nothing about the task.
 
     Slicing (rather than three independent random draws) guarantees every
     row ends up in exactly one split and the three split sizes always sum
     to the master's total row count, regardless of rounding.
     """
-    shuffled = master.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    n = len(shuffled)
-    train_end = round(n * TRAIN_FRAC)
-    test_end = train_end + round(n * TEST_FRAC)
-    train_df = shuffled.iloc[:train_end]
-    test_df = shuffled.iloc[train_end:test_end]
-    validation_df = shuffled.iloc[test_end:]
-    return train_df, test_df, validation_df
+    if not label_column or label_column not in master.columns:
+        return _slice(master.sample(frac=1.0, random_state=seed).reset_index(drop=True))
+    parts = ([], [], [])
+    for _value, group in master.groupby(label_column, dropna=False, sort=True):
+        for part, piece in zip(parts, _slice(group.sample(frac=1.0, random_state=seed))):
+            part.append(piece)
+    # Shuffle again so the rows of one class are not in one block.
+    return tuple(pd.concat(part).sample(frac=1.0, random_state=seed).reset_index(drop=True) for part in parts)
 
 
-def _write_split_csvs(master: pd.DataFrame) -> dict:
+def _write_split_csvs(master: pd.DataFrame, label_column: str = "") -> dict:
     """Split the merged master CSV and write train/test/validation CSVs
     alongside it. Returns their paths and row counts for the pipeline
     result/state, so the future Modeling Agent (and this run's report) can
     find them without recomputing the split."""
-    train_df, test_df, validation_df = _split_train_test_validation(master)
+    train_df, test_df, validation_df = _split_train_test_validation(master, label_column=label_column)
 
     train_path = PROCESSED_DATA_DIR / TRAIN_CSV_NAME
     test_path = PROCESSED_DATA_DIR / TEST_CSV_NAME
@@ -354,7 +368,13 @@ def run(selected_datasets: list, target_terms: list = None, target_rows: int | N
 
     master = pd.concat([i["df"] for i in accepted], axis=0, join="outer", ignore_index=True, sort=False)
     before_dedupe = len(master)
-    master = master.drop_duplicates()
+    # The source tag is provenance, not data: two datasets holding the same
+    # row (e.g. mirrors of one dataset) must not keep it twice, or the copies
+    # can land in train and test and inflate the evaluation. The first
+    # source's tag is kept.
+    data_columns = [c for c in master.columns if c != SOURCE_COLUMN]
+    cross_source = int((master.duplicated(subset=data_columns) & ~master.duplicated()).sum())
+    master = master.drop_duplicates(subset=data_columns)
     deduped = before_dedupe - len(master)
 
     master, master_cap = stratified_cap(master, MAX_MASTER_ROWS, label_column or None)
@@ -372,7 +392,9 @@ def run(selected_datasets: list, target_terms: list = None, target_rows: int | N
 
     notes_parts = []
     if deduped:
-        notes_parts.append(f"Removed {deduped} duplicate row(s) across the merged set.")
+        notes_parts.append(f"Removed {deduped} duplicate row(s) across the merged set"
+                           + (f", {cross_source} of them found in more than one source dataset." if cross_source
+                              else "."))
     if sampled:
         notes_parts.append(f"Row budget applied (at most {MAX_ROWS_PER_DATASET} rows per dataset, "
                            f"{MAX_MASTER_ROWS} in total; stratified, seed fixed) -- see 'sampling'.")
@@ -386,7 +408,7 @@ def run(selected_datasets: list, target_terms: list = None, target_rows: int | N
           f"(target met: {target_met}), "
           f"columns={master.shape[1]}, label='{label_column or 'unknown'}', wrote {master_path}.")
 
-    split_info = _write_split_csvs(master)
+    split_info = _write_split_csvs(master, label_column)
 
     return {
         "status": status,
@@ -399,10 +421,16 @@ def run(selected_datasets: list, target_terms: list = None, target_rows: int | N
         "target_met": target_met,
         "conflicts": conflicts,
         "label_column": label_column,
+        # Class counts of the label in the merged data: the imbalance a
+        # memory's scope is matched on (plan 18.4).
+        "label_counts": ({str(k): int(v) for k, v in master[label_column].value_counts().items()}
+                         if label_column and label_column in master.columns else {}),
         "column_mappings": mappings,
         "sampling": sampling,
         "master_sampling": master_cap,
         "sampled": sampled,
+        "cross_source_duplicates": cross_source,
+        "split_stratified_on": label_column or None,
         "notes": notes,
         **split_info,
     }

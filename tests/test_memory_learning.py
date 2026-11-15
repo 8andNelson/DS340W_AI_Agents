@@ -11,6 +11,10 @@ from src.memory import curator, learning, ranking, recall
 from src.orchestration import run_context, run_metrics, run_store
 
 XGB_SCRIPT = "import os\nfrom xgboost import XGBClassifier\nprint('METRIC accuracy=0.9')\n"
+# A valid final baseline 1 point from the paper: a used memory earns credit (learning.VALIDITY_AGENTS).
+GOOD_EVALUATION = {"metrics": [{"metric": "accuracy", "published_value": 95.0, "reproduced_value": 94.0,
+                                "difference_points": 1.0, "classification": "EXACT"}],
+                   "review": {"review_status": "COMPLETE", "static_findings": [], "findings": []}}
 
 
 def _put(**m):
@@ -25,7 +29,8 @@ def _answer(used=("M1",), ok=True):
     return lambda prompt, *a: json.dumps({"ok": ok, "memory_used": list(used)})
 
 
-def _run_that_uses_a_memory(monkeypatch, memory_id_family, passes: bool, finish_status="halted"):
+def _run_that_uses_a_memory(monkeypatch, memory_id_family, passes: bool, finish_status="halted",
+                            evaluation=GOOD_EVALUATION):
     """A run whose Replication Agent attempt uses the best xgboost case, then passes or fails its checks."""
     monkeypatch.setattr(llm, "_chat_once", _answer())
     run_id = run_store.start_run("credit card fraud detection")
@@ -39,7 +44,8 @@ def _run_that_uses_a_memory(monkeypatch, memory_id_family, passes: bool, finish_
     check = lambda out: [] if out["ok"] else [master_agent._log_entry("Correction", "Replication Agent",  # noqa: E731
                                                                      "script failed", "Rejected", "")]
     output, _ = master_agent._supervise("Replication Agent", work, check, lambda out: "report", max_attempts=1)
-    run_store.finish_run(run_id, finish_status, "BASELINE_REPLICATION", result={"reruns": []})
+    run_store.finish_run(run_id, finish_status, "BASELINE_REPLICATION",
+                         result={"reruns": [], "evaluation_result": evaluation})
     return run_id, output["used"][0]
 
 
@@ -121,11 +127,19 @@ def test_a_diagnosis_is_judged_by_the_failed_agents_next_attempt(monkeypatch):
 
 def _fast_mode_bank(quality=0.9, family=("xgboost",)):
     return _put(title="kept xgboost baseline", content=XGB_SCRIPT, quality=quality,
-                task={"model_family": list(family), "task_type": "binary"})
+                task={"model_family": list(family), "task_type": "binary", "dataset_traits": {"rows": "1k-10k"}})
+
+
+def _known_task():
+    """The run's task record, as Master Agent fills it in: fast mode needs a
+    known task type and row count (review finding 7)."""
+    run_context.set_run("fast-mode-run")
+    run_context.update_task(intake={"ml_task": "binary classification"}, cleaning={"rows_total": 5000})
 
 
 def test_fast_mode_adapts_a_good_kept_script_of_the_same_family(monkeypatch):
     mid = _fast_mode_bank()
+    _known_task()
     prompts = []
     monkeypatch.setattr(llm, "_chat_once", lambda prompt, *a: prompts.append(prompt) or
                         '```json\n{"inferred_assumptions": [], "memory_used": ["M1"]}\n```\n```python\nprint(1)\n```')
@@ -139,6 +153,7 @@ def test_fast_mode_adapts_a_good_kept_script_of_the_same_family(monkeypatch):
                                                   (0.9, ("xgboost",), False)])
 def test_fast_mode_needs_quality_the_same_family_and_reuse_on(monkeypatch, quality, family, reuse):
     _fast_mode_bank(quality=quality, family=family)
+    _known_task()
     monkeypatch.setattr(config, "MEMORY_REUSE", reuse)
     prompts = []
     monkeypatch.setattr(llm, "_chat_once", lambda prompt, *a: prompts.append(prompt) or "```python\nprint(1)\n```")
@@ -148,6 +163,7 @@ def test_fast_mode_needs_quality_the_same_family_and_reuse_on(monkeypatch, quali
 
 def test_an_adapted_script_that_fails_its_first_run_ranks_lower_even_after_repair(monkeypatch, tmp_path):
     mid = _fast_mode_bank()
+    _known_task()
     generation = '```json\n{"inferred_assumptions": [], "memory_used": ["M1"]}\n```\n```python\nraise SystemExit(1)\n```'
     monkeypatch.setattr(llm, "_chat_once", lambda prompt, *a: generation if "FAST MODE" in prompt or
                         "reconstructing" in prompt else "```python\nprint('METRIC accuracy=0.9')\n```")

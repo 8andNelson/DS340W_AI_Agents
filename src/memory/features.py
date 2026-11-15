@@ -16,6 +16,33 @@ from src.orchestration.run_metrics import metric_key, model_families
 
 TASK_TYPES = ("binary", "multiclass", "regression", "anomaly")
 
+# Model names as papers write them -> run_metrics.MODEL_FAMILIES keys. The
+# AST detector reads code identifiers ("XGBClassifier"); a methodology is
+# prose ("XGBoost", "random forest", "SVM, RF and LR"), which it never
+# recognised (review finding 7). Upper-case abbreviations match only in
+# upper case, and a phrase found for one family is blanked before the next,
+# so "extreme gradient boosting" is xgboost, not also gradient_boosting.
+PROSE_MODELS = (
+    ("xgboost", r"xgboost|extreme gradient boosting|\bXGB\b"),
+    ("lightgbm", r"light\s?gbm|\bLGBM\b"),
+    ("catboost", r"catboost"),
+    ("isolation_forest", r"isolation forests?"),
+    ("local_outlier_factor", r"local outlier factor|\bLOF\b"),
+    ("extra_trees", r"extra(?:-|\s)trees|extremely randomi[sz]ed trees"),
+    ("random_forest", r"random forests?|\bRF\b"),
+    ("adaboost", r"adaboost|adaptive boosting"),
+    ("gradient_boosting", r"gradient[- ]boost(?:ing|ed)(?: decision trees?| machines?)?|\bGBDT\b|\bGBM\b"),
+    ("decision_tree", r"decision trees?|\bDT\b|\bCART\b"),
+    ("logistic_regression", r"logistic regression|\bLR\b"),
+    ("linear_model", r"linear regression|ridge regression|lasso|elastic[- ]net"),
+    ("svm", r"support vector (?:machines?|classifiers?|regression)|\bSVM\b|\bSVC\b"),
+    ("knn", r"k[- ]?nearest neighbou?rs?|\bKNN\b|\bk-NN\b"),
+    ("naive_bayes", r"na[iï]ve bayes"),
+    ("mlp", r"multi-?layer perceptron|\bMLP\b"),
+    ("neural_network", r"neural networks?|deep learning|\bANN\b|\bCNN\b|\bLSTM\b"),
+)
+
+
 # Identifiers, call names and keyword arguments in a script -> technique.
 TECHNIQUES = {
     "smote": ("SMOTE", "BorderlineSMOTE", "SVMSMOTE", "SMOTENC", "SMOTETomek", "SMOTEENN"),
@@ -96,6 +123,27 @@ def task_type(ml_task) -> str | None:
     return "other:" + metric_key(text)[:30]
 
 
+def prose_model_families(text: str) -> list:
+    """Model families named in prose (a paper's methodology)."""
+    text = str(text or "")
+    found = []
+    for family, pattern in PROSE_MODELS:
+        # Abbreviations (\bRF\b) are case-sensitive; written names are not.
+        parts = pattern.split("|")
+        named = [p for p in parts if not re.match(r"\\b[A-Z]", p)]
+        abbreviations = [p for p in parts if re.match(r"\\b[A-Z]", p)]
+        hits = []
+        if named:
+            hits += list(re.finditer("|".join(named), text, re.I))
+        if abbreviations:
+            hits += list(re.finditer("|".join(abbreviations), text))
+        if hits:
+            found.append(family)
+            for m in hits:  # blank the phrase so a later, broader family does not match it again
+                text = text[:m.start()] + " " * (m.end() - m.start()) + text[m.end():]
+    return sorted(found)
+
+
 def _bucket(value, edges: tuple, labels: tuple) -> str | None:
     if not isinstance(value, (int, float)):
         return None
@@ -103,6 +151,23 @@ def _bucket(value, edges: tuple, labels: tuple) -> str | None:
         if value < edge:
             return label
     return labels[-1]
+
+
+# How rare the minority class is: the trait that most changes what works
+# (resampling, class weights, thresholds) on a fraud-style task.
+MINORITY_EDGES = (0.01, 0.05, 0.20, 0.40)
+MINORITY_LABELS = ("<1%", "1-5%", "5-20%", "20-40%", ">=40%")
+
+
+def minority_share(cleaning: dict | None) -> float | None:
+    """The smallest class's share of the rows, from the Cleaning Agent's
+    recorded label counts; None when they were not recorded (older runs) --
+    never read from a data file a later run may have replaced."""
+    counts = [int(v) for v in ((cleaning or {}).get("label_counts") or {}).values()
+              if isinstance(v, (int, float)) and v >= 0]
+    if len(counts) < 2 or not sum(counts):
+        return None
+    return min(counts) / sum(counts)
 
 
 def dataset_traits(cleaning: dict | None, dataset: dict | None) -> dict:
@@ -113,6 +178,7 @@ def dataset_traits(cleaning: dict | None, dataset: dict | None) -> dict:
         "columns": _bucket(cleaning.get("columns_total"), (10, 30, 100), ("<10", "10-29", "30-99", ">=100")),
         "sampled": bool(cleaning.get("sampled")) if cleaning else None,
     }
+    traits["minority_share"] = _bucket(minority_share(cleaning), MINORITY_EDGES, MINORITY_LABELS)
     notes = " ".join(str(d.get("column_notes") or "") for d in dataset.get("selected_datasets") or [])
     if dataset.get("selected_datasets"):
         traits["anonymized_columns"] = bool(re.search(r"anonym|pca|undescribed|no descriptive", notes, re.I))
@@ -160,7 +226,8 @@ def task_features(run: dict, agent: str, script: str = None, failure: str = None
         features["model_family"] = model_families(script) or None
         features["techniques"] = techniques(script) or None
     elif parent.get("methodology"):
-        features["model_family"] = model_families(parent["methodology"]) or None
+        prose = parent["methodology"]
+        features["model_family"] = sorted(set(model_families(prose)) | set(prose_model_families(prose))) or None
     if failure:
         features["failure_signature"] = failure_signature(failure)
     return {k: v for k, v in features.items() if v not in (None, [], {})}

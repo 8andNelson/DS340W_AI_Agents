@@ -28,6 +28,13 @@ one made from a run on a held-out topic (the test topics themselves), so
 no run can get its answer from an earlier run of the same task, and test
 runs cannot feed each other (plan 11.8).
 
+The plan also freezes the bank itself (review finding 1): make_plan writes
+<name>.bank.json once -- every memory created before the snapshot, with its
+state, quality and outcome counts at that moment -- and records its sha256
+in the plan. A test run ranks by these frozen values (recall.frozen_bank),
+not by the live bank, which other runs keep changing; and the "read"
+condition records no outcome at all (learning.bank_learns).
+
 CLI:
   python -m src.orchestration.comparison plan <name> --topic "<t>" [--topic ...]
         [--conditions off read] [--repeats 3] [--no-warnings-condition]
@@ -75,6 +82,44 @@ def status_path(name: str) -> Path:
     return COMPARISONS_DIR / f"{name}.status.json"
 
 
+def bank_path(name: str) -> Path:
+    return COMPARISONS_DIR / f"{name}.bank.json"
+
+
+# What a frozen bank keeps of each memory: everything ranking reads that can
+# change after the memory is written.
+BANK_FIELDS = ("state", "quality", "quality_reasons", "times_helped", "times_hurt", "superseded_by")
+
+
+def write_bank(name: str, snapshot: str) -> dict:
+    """Write the frozen bank of a plan (once). Returns {"file", "sha256", "count"}."""
+    import hashlib
+    from src import memory
+    path = bank_path(name)
+    if path.exists():
+        raise FileExistsError(f"{path} exists: a frozen bank is written once and never changed")
+    rows = [m for m in memory.find_memories(states=None, limit=10_000_000) if (m.get("created_at") or "") <= snapshot]
+    bank = {"snapshot": snapshot, "memories": {m["id"]: {k: m.get(k) for k in BANK_FIELDS} for m in rows}}
+    data = json.dumps(bank, indent=0, sort_keys=True, default=str).encode("utf-8")
+    COMPARISONS_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)  # bytes: write_text would turn \n into \r\n on Windows and change the hash
+    return {"file": str(path), "sha256": hashlib.sha256(data).hexdigest(), "count": len(rows)}
+
+
+def read_bank(path: str) -> dict:
+    """{memory id: frozen fields} of a frozen bank file."""
+    return json.loads(Path(path).read_text(encoding="utf-8")).get("memories") or {}
+
+
+def bank_intact(plan: dict) -> bool:
+    """True when the plan's frozen bank file still has the sha256 the plan recorded."""
+    import hashlib
+    path = plan.get("memory_bank_file")
+    if not path or not Path(path).exists():
+        return False
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest() == plan.get("memory_bank_sha256")
+
+
 def load_plan(name: str) -> dict | None:
     path = plan_path(name)
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
@@ -112,9 +157,12 @@ def make_plan(name: str, topics: list, conditions: list = ("off", "read"), repea
     unknown = [c for c in conditions if c not in CONDITIONS]
     if unknown or len(conditions) < 2 or not topics or repeats < 1:
         raise ValueError(f"need >= 2 known conditions ({', '.join(CONDITIONS)}), topics and repeats >= 1")
+    snapshot = _now()
+    bank = write_bank(name, snapshot)
     plan = {
-        "name": name, "comparison_group": group_tag(name), "created_at": _now(),
-        "memory_snapshot": _now(),
+        "name": name, "comparison_group": group_tag(name), "created_at": snapshot,
+        "memory_snapshot": snapshot,
+        "memory_bank_file": bank["file"], "memory_bank_sha256": bank["sha256"], "memory_bank_count": bank["count"],
         "held_out_topics": sorted({topic_key(t) for t in topics}),
         "topics": list(topics), "conditions": {c: CONDITIONS[c] for c in conditions}, "repeats": repeats,
         "run_order": [{"n": i + 1, "topic": t, "condition": c} for i, (t, c) in enumerate(run_order(topics, list(conditions), repeats))],

@@ -36,7 +36,8 @@ def _supervise(agent, outputs, fail_issue="check failed"):
                                    max_attempts=3)
 
 
-def make_run(tmp_path, monkeypatch, gap=2.0, leaks=(), reruns=(), script=SCRIPT, status="success", name="paper"):
+def make_run(tmp_path, monkeypatch, gap=2.0, leaks=(), reruns=(), script=SCRIPT, status="success", name="paper",
+             findings=(), review_status=None):
     folder = tmp_path / "replication" / name
     folder.mkdir(parents=True)
     (folder / "train.py").write_text(script, encoding="utf-8", newline="\n")
@@ -49,7 +50,9 @@ def make_run(tmp_path, monkeypatch, gap=2.0, leaks=(), reruns=(), script=SCRIPT,
     replication = {"status": "OK", "source": "reconstructed", "entry_point": "train.py",
                    "replication_dir": str(folder), "exit_code": 0, "notes": "Repair attempts: 1."}
     _supervise("Replication Agent", [{"ok": False}, replication], fail_issue="ModuleNotFoundError: No module named 'xgb'")
-    final = _evaluation(gap, leaks)
+    final = _evaluation(gap, leaks, findings)
+    if review_status:
+        final["review"]["review_status"] = review_status
     _supervise("Evaluation Agent", [final])
     run_store.finish_run(run_id, status, "EXPERIMENTATION", parent_paper={"title": "A fraud paper", "doi": "10.1/x"},
                          result={"phase": "EXPERIMENTATION", "structured": INTAKE, "replication_result": replication,
@@ -132,6 +135,25 @@ def test_a_kept_baseline_with_verified_leakage_is_a_warning_not_a_solution(tmp_p
     assert not [m for m in _memories(run_id, agent="Replication Agent") if m["polarity"] == "positive"]
     finding = next(m for m in _memories(run_id, agent="Evaluation Agent") if m["title"].startswith("Verified finding"))
     assert finding["polarity"] == "neutral"  # no kept fix yet
+
+
+def test_leakage_found_only_by_the_analyst_review_is_a_warning_too(tmp_path, monkeypatch):
+    """Review finding 8: retention read only the deterministic checks."""
+    finding = {"category": "data_leakage", "severity": "critical", "verified": True,
+               "issue": "the scaler is fitted on train and test together",
+               "evidence": "scaler.fit(pd.concat([X_train, X_test]))"}
+    run_id = make_run(tmp_path, monkeypatch, gap=0.1, findings=[finding])
+    baseline = next(m for m in _memories(run_id, agent="Replication Agent") if m["title"].startswith("Leaky"))
+    assert baseline["polarity"] == "negative"
+    assert "scaler is fitted on train and test together" in baseline["summary"]
+    assert not [m for m in _memories(run_id, agent="Replication Agent") if m["polarity"] == "positive"]
+
+
+def test_an_unreviewed_baseline_gets_no_gap_credit(tmp_path, monkeypatch):
+    run_id = make_run(tmp_path, monkeypatch, gap=0.1, review_status="UNAVAILABLE")
+    baseline = next(m for m in _memories(run_id, agent="Replication Agent") if m["kind"] != "failure")
+    assert "analyst review was unavailable" in baseline["quality_reasons"]["outcome"]["reason"]
+    assert baseline["quality_reasons"]["outcome"]["value"] == 0.5
 
 
 def test_validity_is_success_for_the_evaluation_agent_even_when_the_gap_grows(tmp_path, monkeypatch):
@@ -336,3 +358,28 @@ def test_rescore_supersedes_changed_memories_and_retires_dropped_ones(tmp_path, 
 
 def test_rescore_needs_a_retained_run():
     assert retain.rescore_run("never-retained")["skipped"] == "not retained yet (use retain)"
+
+
+def test_a_paper_whose_scores_may_come_from_leakage_becomes_a_warning_for_each_agent(tmp_path, monkeypatch):
+    check = {"status": "CONSISTENT_WITH_LEAKAGE", "reason": "4 of 5 published metric(s) ...",
+             "metrics": [{"metric": "f1", "published_points": 99.26, "honest_points": 6.23, "leaky_points": 99.75,
+                          "explained_by_leakage": True},
+                         {"metric": "accuracy", "published_points": 99.26, "honest_points": 94.14,
+                          "leaky_points": 99.75, "explained_by_leakage": False}]}
+    plain = globals()["_evaluation"]
+    monkeypatch.setitem(globals(), "_evaluation", lambda *a, **k: {**plain(*a, **k), "published_leakage_check": check})
+    run_id = make_run(tmp_path, monkeypatch, gap=89.5)
+    warnings = {m["agent"]: m for m in _memories(run_id) if m["title"].startswith("Published scores may come from")}
+    assert set(warnings) == {"Validation Agent", "Experiment Agent", "Evaluation Agent"}
+    for agent, m in warnings.items():
+        assert m["kind"] == "failure" and m["polarity"] == "negative"  # negative: recall shows it
+        assert "A fraud paper" in m["title"]
+        assert "f1: paper 99.26, correct split 6.23, oversampled before the split 99.75" in m["summary"]
+        assert "accuracy" not in m["summary"]  # only the metrics the leak explains
+        assert retain.PUBLISHED_LEAK_GUIDANCE[agent] in m["summary"]
+        assert m["task"]["failure_signature"] == retain.PUBLISHED_LEAK_SIGNATURE
+
+
+def test_no_leakage_warning_without_the_verdict(tmp_path, monkeypatch):
+    run_id = make_run(tmp_path, monkeypatch, gap=89.5)
+    assert not [m for m in _memories(run_id) if m["title"].startswith("Published scores may come from")]

@@ -301,3 +301,69 @@ def test_data_goals_must_be_above_the_rows_used_and_not_already_failed():
     assert "found no usable new data" in check(eval_request("rerun_data_agent", goal={"target_entries": 8000}),
                                                failed)
     assert check(eval_request("rerun_data_agent", goal={"target_entries": 20000}), failed) == ""
+
+
+# --- Review finding 19: a closer score is kept only if it is a valid, comparable one ---
+
+LEAK_QUOTE = "X_res, y_res = SMOTE().fit_resample(X, y)"
+
+
+def _leaky(gap):
+    result = evaluation(gap=gap)
+    result["review"] = {"static_findings": [], "findings": [
+        {"category": "data_leakage", "severity": "critical", "verified": True,
+         "issue": "SMOTE is fitted on all rows before the split", "evidence": LEAK_QUOTE}]}
+    return result
+
+
+def _closer_rerun(tmp_path, new_evaluation):
+    ctx = make_ctx(tmp_path)
+    previous = ctx["replication_result"]
+    with patch("src.agents.replication_agent.run", return_value=dict(previous)), \
+         patch("src.agents.evaluation_agent.run", return_value=new_evaluation), \
+         patch("src.agents.experiment_agent.run", side_effect=[asks("Replication Agent"), stops()]):
+        loop = master_agent._rerun_loop(ctx)
+    return ctx, previous, loop
+
+
+def test_a_closer_rerun_with_new_verified_leakage_is_reverted(tmp_path):
+    ctx, previous, loop = _closer_rerun(tmp_path, _leaky(gap=0.5))  # 4.0 -> 0.5 looks better
+
+    assert loop["reruns"][0]["applied"] is False
+    assert "verified data leakage" in loop["reruns"][0]["outcome"]
+    assert ctx["replication_result"] is previous
+    assert any(e["decision"] == "Reverted" for e in log_entries())
+
+
+def test_a_closer_rerun_whose_review_was_unavailable_is_reverted(tmp_path):
+    unreviewed = evaluation(gap=0.5)
+    unreviewed["review"] = {"review_status": "UNAVAILABLE", "static_findings": [], "findings": []}
+    _ctx, _previous, loop = _closer_rerun(tmp_path, unreviewed)
+
+    assert loop["reruns"][0]["applied"] is False
+    assert "review of the new baseline was unavailable" in loop["reruns"][0]["outcome"]
+
+
+def test_a_rerun_that_stops_reporting_a_metric_is_reverted(tmp_path):
+    ctx = make_ctx(tmp_path)
+    two = evaluation(gap=4.0)
+    two["metrics"].append({"metric": "f1", "published_value": 90.0, "reproduced_value": 70.0,
+                           "difference_points": 20.0, "classification": "FAILED", "notes": ""})
+    ctx["evaluation_result"] = two  # mean gap 12.0 over accuracy and f1
+    with patch("src.agents.replication_agent.run", return_value=dict(ctx["replication_result"])), \
+         patch("src.agents.evaluation_agent.run", return_value=evaluation(gap=4.0)), \
+         patch("src.agents.experiment_agent.run", side_effect=[asks("Replication Agent"), stops()]):
+        loop = master_agent._rerun_loop(ctx)  # 12.0 -> 4.0 only because f1 is gone
+
+    assert loop["reruns"][0]["applied"] is False
+    assert "no longer reports f1" in loop["reruns"][0]["outcome"]
+
+
+def test_leakage_that_was_already_there_does_not_block_a_closer_rerun(tmp_path):
+    ctx = make_ctx(tmp_path, _leaky(gap=4.0))
+    with patch("src.agents.replication_agent.run", return_value=dict(ctx["replication_result"])), \
+         patch("src.agents.evaluation_agent.run", return_value=_leaky(gap=1.0)), \
+         patch("src.agents.experiment_agent.run", side_effect=[asks("Replication Agent"), stops()]):
+        loop = master_agent._rerun_loop(ctx)
+
+    assert loop["reruns"][0]["applied"] is True  # judged on the gap; the leakage is not new

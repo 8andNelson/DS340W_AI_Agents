@@ -84,9 +84,12 @@ class TestSuccessfulMerge(CleaningAgentTestCase):
         ]
 
         result = cleaning_agent.run(candidates)
-        # Row (x=1) from A and (x=1) from B differ by _source_dataset, so
-        # they are NOT exact duplicates and both survive -- 4 total rows.
-        self.assertEqual(result["rows_total"], 4)
+        # Row (x=1) is in A and in B. The source tag is provenance, not data,
+        # so it is one observation: kept once (review finding 15), else the
+        # copies can land in train and test.
+        self.assertEqual(result["rows_total"], 3)
+        self.assertEqual(result["cross_source_duplicates"], 1)
+        self.assertIn("1 of them found in more than one source dataset", result["notes"])
 
 
 class TestTargetRows(CleaningAgentTestCase):
@@ -293,6 +296,26 @@ class TestPerDatasetCleaning(CleaningAgentTestCase):
         df = pd.DataFrame([[1, 2]], columns=["Amount", "amount "])
         normalized = cleaning_agent._normalize_columns(df)
         self.assertEqual(len(set(normalized.columns)), 2)
+
+
+class TestIntegrityFixes(unittest.TestCase):
+    def test_normalized_column_names_are_always_unique(self):
+        for columns, expected in ((["A", "a", "a_2"], ["a", "a_3", "a_2"]),
+                                  (["Amount", "amount ", "AMOUNT"], ["amount", "amount_2", "amount_3"])):
+            out = list(cleaning_agent._normalize_columns(pd.DataFrame([list(range(len(columns)))],
+                                                                      columns=columns)).columns)
+            self.assertEqual(out, expected)
+
+    def test_the_split_is_stratified_on_the_label(self):
+        master = pd.DataFrame({"f": range(100), "label": [1] * 6 + [0] * 94})
+        train, test, validation = cleaning_agent._split_train_test_validation(master, label_column="label")
+        self.assertEqual((train.label.sum(), test.label.sum(), validation.label.sum()), (4, 1, 1))
+        self.assertEqual((len(train), len(test), len(validation)), (70, 20, 10))
+        self.assertFalse(set(train.f) & set(test.f) or set(train.f) & set(validation.f))
+
+    def test_without_a_label_the_split_is_the_plain_random_split(self):
+        master = pd.DataFrame({"f": range(10)})
+        self.assertEqual([len(p) for p in cleaning_agent._split_train_test_validation(master)], [7, 2, 1])
 
 
 if __name__ == "__main__":

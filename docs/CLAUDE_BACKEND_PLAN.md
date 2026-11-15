@@ -1602,3 +1602,125 @@ Done when:
 8. **Shared metrics:** may run metrics of every team member go to the
    shared store, also runs with memory off? (They hold no content, only
    numbers, names and ids.)
+
+---
+
+## 18. Insight memories (redesign, 2026-11-15)
+
+Decided with the user on 2026-11-15, after run
+`20261115T171901Z-86734b16`. Every memory made before this date (134) was
+quarantined on the user's request (CLAUDE.md, memory rules).
+
+### 18.1 Problem
+
+The bank stores **records, not lessons**. Each memory is a snapshot of one
+stage's output, made by a fixed template per agent (`retain._describe`):
+"Evaluation: INCONCLUSIVE, decision accept", "random_forest baseline script
+(reconstructed)". It says *what* an agent produced, never *why* a result was
+good or bad or under which conditions. Four effects:
+
+1. **Wrong lessons.** "Positive" means "approved and kept". An evaluation
+   that wrongly found no published metric (a parser bug) was stored as a
+   positive solution and recalled by later runs as a good example.
+2. **Facts with no lesson.** Every rerun records instructions, metrics
+   before/after, gap before/after and kept/reverted, and every script
+   version is stored. "XGBoost, 6% positives, 15k rows: n_estimators
+   100 -> 500 moved F1 from 0.10 to 0.23" is in the run database, but the
+   memory says only "Rerun of the Replication Agent: kept, with no gain".
+3. **The curator sees snapshots.** It reads 700-character excerpts of
+   snapshot memories, not experiments and outcomes, and its lessons stay
+   hidden until a person approves them or a second run supports them.
+4. **Recall is tuned to repeating one task** (same paper, DOI, dataset,
+   topic). A lesson that holds across papers ("oversampled imbalanced data
+   with recall 1.0 is a leakage sign") seldom reaches a different paper.
+
+The memories the user wants are discoveries: the Evaluation Agent keeps
+failing, investigates, and finds that the Parent Paper's own scores may
+come from leakage; the Replication Agent finds what made a model work
+(more trees or fewer, deeper or shallower).
+
+### 18.2 What an insight is
+
+An **insight** is a claim with its evidence, scope and measured effect:
+
+| Field | Meaning | Example |
+|-------|---------|---------|
+| claim | one sentence, what was learned | "Raising XGBClassifier n_estimators 100 -> 500 raised F1 by 12.9 points." |
+| change | what was varied (structured) | `[{"model": "XGBClassifier", "param": "n_estimators", "before": 100, "after": 500}]` |
+| effect | measured, from the records | metric deltas in points; gap before/after |
+| scope | when it applies (task features, 5.2) | model family, task type, data traits (rows, positive rate, anonymized columns) |
+| evidence | where the numbers come from | run id, rerun number, stage ids |
+| validity | was the result valid | no verified leakage after the change |
+| confidence | how often it held | runs that support it / contradict it (18.5) |
+
+Stored as the existing memory row (kind `lesson` or `failure`, task =
+scope, content = the structured insight), so the store, sync, scrubbing,
+states and recall need no schema change.
+
+### 18.3 Sources, cheapest and most reliable first
+
+1. **Setting changes, found by code (step 1).** For each applied rerun
+   that produced a new baseline, compare the scripts before and after with
+   Python's `ast`: every estimator, sampler, selector and preprocessor call
+   (`XGBClassifier(...)`, `RandomForestClassifier(...)`, `SMOTE(...)`,
+   `RFE(...)`, `KBinsDiscretizer(...)`), with its literal keyword
+   arguments. The difference (parameters changed, added or removed; calls
+   added or removed) joined with the rerun's metric and gap change is an
+   insight with no LLM call; every number is exact.
+   * Positive when the gap fell by at least 1 point (or, with no
+     measurable gap, the mean of the shared bounded metrics rose by at
+     least 1 point) and the new baseline has no verified leakage.
+     Negative when it moved the other way, or when the gain came with
+     verified leakage. No memory when nothing measurable changed or no
+     setting changed.
+   * One copy for the Replication Agent (it writes and revises scripts)
+     and one for the Experiment Agent (it chooses the next change).
+2. **Investigations (done for leakage).** A deterministic check that tests
+   a hypothesis and returns a verdict: the published-score leakage check
+   (`_published_leak_memories`), verified analyst findings, a failure with
+   the fix that worked.
+3. **Reflection (step 3).** At the end of a run, one LLM call per agent
+   that did real work gets that agent's own records and outcomes and is
+   asked what its future self should know. Each claim must quote numbers
+   that occur in the records (the Evaluation Agent's `_verify` rule);
+   a claim that fails is dropped. Replaces the snapshot-reading curator.
+
+### 18.4 Recall by scope (step 2)
+
+An insight is matched on its scope, not only on the same paper: model
+family overlap, task type, and data traits (row bucket, positive-rate
+bucket, anonymized columns). The paper and dataset still add relevance.
+The Replication Agent's query uses the model families in the script it is
+writing or revising; the Experiment Agent's uses the baseline script's.
+Snapshot memories (stage outputs) stay for fast mode and audit, but are
+not shown as lessons.
+
+### 18.5 Confidence from repeats (step 4)
+
+An insight from one run is labelled "seen once". The same change
+(model, parameter, direction) in the same scope in another run either
+supports it (same direction of effect) or contradicts it. Confidence =
+supporting runs / (supporting + contradicting); shown with the counts.
+This replaces the curator's "a person approves or a second run supports"
+gate: a contradicted insight is shown together with its contradiction,
+never hidden.
+
+### 18.6 Steps
+
+| Step | What | LLM calls | Status |
+|------|------|-----------|--------|
+| 0 | Published-score leakage warning (Validation, Experiment, Evaluation Agents) | none | done 2026-11-15 |
+| 1 | Setting-change insights from reruns (18.3.1): `src/memory/insights.py`, `retain._setting_change_memories` | none | done 2026-11-15 |
+| 2 | Recall by scope (18.4): `recall.trait_match`, `recall.is_snapshot`, `features.minority_share`, Cleaning Agent `label_counts` | none | done 2026-11-15; the retrieval benchmark (9.6) needs new cases, as all its labelled memories were quarantined |
+| 3 | Reflection per agent, number-checked (18.3.3): `src/memory/reflection.py`, replaces the curator (`MEMORY_REFLECTION`) | one per agent that ran (Data, Replication, Evaluation, Experiment; at most 4) | done 2026-11-15. Records are split into CONTEXT (not quotable), MEASURED, FACTS and PROPOSALS (fixes, instructions, hypotheses, opinions); each lesson has a basis (measured / observed / hypothesis). A lesson needs a fact quote of 4+ words, a measured lesson a MEASURED quote, and its numbers must be in the facts. Live failures that shaped this: a proposed "try 50 or 100 features" returned as a measured gain; an analyst's "most likely cause" returned as "directly caused"; the Data Agent quoted scope labels for lessons about the model |
+| 4 | Confidence from repeats (18.5): `src/memory/confirm.py`, after reflection in `retain_run` | none | done 2026-11-15. Setting-change insights compare by change key (area, step, setting, direction; values ignored); reflection lessons by agent, polarity and claim words (Jaccard >= 0.5); both need a compatible scope. Quality +0.1 per agreeing run, -0.2 per disagreeing run; a confirmed candidate becomes active; a disagreement is linked and shown, never hidden. Fixed op ids: a retried retain counts a run once |
+
+### 18.7 Risks
+
+| Risk | Mitigation |
+|------|------------|
+| A change is credited with an effect that came from another change in the same rerun | The insight lists every change of the rerun together, never one alone; confidence (18.5) needs repeats. |
+| A gain that came from leakage is taught as a success | Validity check on the new baseline: verified leakage makes it a negative insight. |
+| An LLM reflection states a plausible but false lesson | Every number must occur in the records; scope is explicit; "seen once" until repeated. |
+| Noise from one run (FreeLLMAPI models, seeds) | Effects below 1 point make no insight; confidence from repeats. |
+| The scope is too narrow to transfer, or too wide to be true | Scope is the task features of 5.2; recall weighs model family and data traits, and shows the scope with the claim. |

@@ -181,8 +181,11 @@ def _now() -> str:
 
 
 def _connect() -> sqlite3.Connection:
+    """A connection to the run database. Used as `with _connect() as conn:`;
+    it commits (or rolls back) and closes when the block ends."""
+    from src.memory.backends.sqlite import ClosingConnection
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
@@ -407,10 +410,18 @@ def _memory_snapshot() -> dict:
             # bank, without memories from runs on the test topics.
             info.update(memory_snapshot=plan["memory_snapshot"], comparison_group=plan["comparison_group"],
                         memory_holdout_topics=plan["held_out_topics"])
+            if plan.get("memory_bank_file"):
+                # Its ranking values are frozen too (review finding 1).
+                info["memory_bank_file"] = plan["memory_bank_file"]
+                if not comparison.bank_intact(plan):
+                    _warn("use the comparison's frozen memory bank",
+                          RuntimeError(f"{plan['memory_bank_file']} is missing or changed since the plan was written"))
         if MEMORY_MODE in ("read", "read_write") and memory.backend_name() != "off":
             sizes = {}
-            for m in memory.find_memories(states=("active",), limit=100_000):
-                if recall.visible(m, info):
+            bank = recall.frozen_bank(info)
+            for m in memory.find_memories(states=None if bank is not None else ("active",), limit=100_000):
+                m = recall.as_frozen(m, bank)
+                if m and m.get("state") == "active" and recall.visible(m, info):
                     sizes[m["agent"]] = sizes.get(m["agent"], 0) + 1
             info["memory_bank_size"] = sizes
         return info

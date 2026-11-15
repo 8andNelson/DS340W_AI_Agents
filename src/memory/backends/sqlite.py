@@ -24,6 +24,19 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class ClosingConnection(sqlite3.Connection):
+    """A connection that closes when its `with` block ends. sqlite3's own
+    context manager only commits or rolls back and leaves the file open
+    until garbage collection -- on Windows that blocks deleting or renaming
+    the database (review finding 12). The transaction behaviour is kept."""
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def encode(table: str, row: dict) -> dict:
     types = schema.TABLES[table]
     out = {}
@@ -66,7 +79,7 @@ class SqliteStore:
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, timeout=30)
+        conn = sqlite3.connect(self.path, timeout=30, factory=ClosingConnection)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -211,15 +224,69 @@ class SqliteStore:
         with self._connect() as conn:
             conn.execute("INSERT OR REPLACE INTO memory_meta (key, value) VALUES (?, ?)", (key, value))
 
-    def cache_memories(self, rows: list[dict]) -> None:
-        """Store memories read from the hosted store (their newest state and
-        counters replace the local copy)."""
+    @staticmethod
+    def _op_memory_ids(op: dict) -> list:
+        """The memories an op changes."""
+        if op.get("type") == "usage_outcome":
+            return [op.get("memory_id")]
+        if op.get("table") != "memories":
+            return []
+        if op.get("type") == "insert":
+            return [r.get("id") for r in op.get("rows") or []]
+        return [(op.get("key") or {}).get("id")]
+
+    def _pending_by_memory(self, conn) -> dict:
+        """memory id -> its pending (not yet sent) outbox ops, oldest first."""
+        out = {}
+        for r in conn.execute("SELECT op FROM outbox WHERE status = 'pending' ORDER BY seq"):
+            op = json.loads(r["op"])
+            for memory_id in self._op_memory_ids(op):
+                if memory_id:
+                    out.setdefault(memory_id, []).append(op)
+        return out
+
+    def pending_memory_ids(self) -> set:
         with self._connect() as conn:
+            return set(self._pending_by_memory(conn))
+
+    def pending_insert_ids(self) -> set:
+        """Memories inserted here and not sent yet (the hosted store does not have them)."""
+        with self._connect() as conn:
+            return {memory_id for memory_id, ops in self._pending_by_memory(conn).items()
+                    if any(op["type"] == "insert" for op in ops)}
+
+    @staticmethod
+    def _replay(conn, op: dict) -> None:
+        """Apply a pending op's effect on a memory row again (no op bookkeeping)."""
+        memory_id = SqliteStore._op_memory_ids(op)[0]
+        if op["type"] == "set_state":
+            conn.execute("UPDATE memories SET state = ?, superseded_by = COALESCE(?, superseded_by) WHERE id = ?",
+                         (op["state"], op.get("superseded_by"), memory_id))
+        elif op["type"] == "set_quality":
+            conn.execute("UPDATE memories SET quality = ?, quality_reasons = ? WHERE id = ?",
+                         (op["quality"], json.dumps(op["quality_reasons"], default=str), memory_id))
+        elif op["type"] == "usage_outcome":
+            column = "times_helped" if op["helped"] else "times_hurt"
+            conn.execute(f"UPDATE memories SET {column} = {column} + 1 WHERE id = ?", (memory_id,))
+        elif op["type"] == "increment":
+            sets = ", ".join(f"{c} = {c} + ?" for c in op["counters"])
+            conn.execute(f"UPDATE memories SET {sets} WHERE id = ?", [*op["counters"].values(), memory_id])
+
+    def cache_memories(self, rows: list[dict]) -> None:
+        """Store memories read from the hosted store. The hosted row replaces
+        the local copy, and then this machine's pending (unsent) changes to
+        that memory are applied to it again -- else a hosted read would undo
+        a local quarantine or counter until the next sync (review finding 2)."""
+        with self._connect() as conn:
+            pending = self._pending_by_memory(conn)
             for row in rows:
                 encoded = encode("memories", {k: v for k, v in row.items() if k in schema.TABLES["memories"]})
                 columns = list(encoded)
                 conn.execute(f"INSERT OR REPLACE INTO memories ({', '.join(columns)}) "
                              f"VALUES ({', '.join('?' * len(columns))})", [encoded[c] for c in columns])
+                for op in pending.get(row.get("id"), []):
+                    if op["type"] != "insert":
+                        self._replay(conn, op)
 
     def memory_ids(self) -> list[str]:
         with self._connect() as conn:
@@ -228,8 +295,19 @@ class SqliteStore:
     # --- Reads ---
 
     def fetch_memories(self, agent: str = None, kind: str = None, states: tuple = ("active",),
-                       ids: list = None, limit: int = 50, conn=None, content_shas: list = None) -> list[dict]:
+                       ids: list = None, limit: int = 50, conn=None, content_shas: list = None,
+                       created_before: str = None, polarities: tuple = None, exclude_run_id: str = None,
+                       offset: int = 0) -> list[dict]:
         where, params = [], []
+        if created_before:
+            where.append("created_at <= ?")
+            params.append(created_before)
+        if polarities:
+            where.append(f"polarity IN ({', '.join('?' * len(polarities))})")
+            params.extend(polarities)
+        if exclude_run_id:
+            where.append("(run_id IS NULL OR run_id != ?)")
+            params.append(exclude_run_id)
         if content_shas is not None:
             if not content_shas:
                 return []
@@ -250,9 +328,9 @@ class SqliteStore:
             where.append(f"id IN ({', '.join('?' * len(ids))})")
             params.extend(ids)
         sql = "SELECT * FROM memories" + (" WHERE " + " AND ".join(where) if where else "")
-        sql += " ORDER BY created_at DESC LIMIT ?"
+        sql += " ORDER BY created_at DESC, id LIMIT ? OFFSET ?"
         with self._connect() as conn:
-            return [decode("memories", r) for r in conn.execute(sql, [*params, limit])]
+            return [decode("memories", r) for r in conn.execute(sql, [*params, limit, offset])]
 
     def rows(self, table: str, order_by: str = None, **equals) -> list[dict]:
         """Rows of one table whose columns equal the given values (decoded)."""

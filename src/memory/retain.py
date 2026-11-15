@@ -27,9 +27,20 @@ Not covered, because the agents do not record them: datasets and
 repositories that were rejected, and column mappings (empty in every
 recorded run so far).
 
-A memory identical to one from another run (same agent and content hash)
-is not stored again: the existing memory's seen_count goes up. A run is
-retained once (memory_runs). For runs recorded before run recording
+A memory is one observation: its content AND its outcome (kind and
+polarity). The same observation from another run is not stored again --
+the existing memory's seen_count goes up -- but the same content with a
+different outcome is stored as its own memory (review finding 4): a script
+that was a kept solution and is later found leaky must not hide the new
+warning behind the old success. When the new observation contradicts an
+older one, the older positive memory is superseded by the new warning, and
+a positive that contradicts an older warning is linked to it
+(quality_reasons.contradicted_by), so recall shows the two together.
+
+A run is retained once (memory_runs), and only when every write succeeded
+(review finding 5): ids and the duplicate counters' op ids are
+deterministic, so retaining again after a failed write repairs the run
+without counting anything twice. For runs recorded before run recording
 (milestone M3) the lineage is derived from the stages, and is "unknown"
 where reruns may have replaced a result (plan section 10).
 
@@ -43,7 +54,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from src.memory import features, ranking
+from src.memory import features, insights, ranking
 from src.orchestration import run_store
 from src.orchestration.handoff import AGENT_PHASE
 
@@ -267,7 +278,11 @@ def _attempt_events(run: dict) -> dict:
 
 
 def _leakage(evaluation_output: dict | None) -> list:
-    return list(((evaluation_output or {}).get("review") or {}).get("static_findings") or [])
+    """Verified leakage: the deterministic checks' and the analyst review's
+    (evaluation_agent.verified_leakage -- one definition for the pipeline
+    and the memory bank)."""
+    from src.agents.evaluation_agent import verified_leakage
+    return verified_leakage(evaluation_output)
 
 
 def _gap(evaluation_output: dict | None):
@@ -345,6 +360,9 @@ def _outcome(run: dict, stage: dict, lineage: str) -> tuple[tuple, tuple]:
         if leaks:
             return ((0.5, "gap not counted: the baseline had verified leakage"),
                     (0.0, f"verified leakage: {_short(leaks[0].get('issue'))}"))
+        from src.agents.evaluation_agent import review_unavailable
+        if review_unavailable(evaluation["output"]):
+            return (0.5, "gap not counted: the analyst review was unavailable, so validity is unknown"), valid
         gap = _gap(evaluation["output"])
         if gap is None:
             return (0.5, "no metric stated by both the paper and the run"), valid
@@ -392,6 +410,8 @@ def _approved_warning(run: dict, agent: str, output: dict) -> tuple[str, str] | 
 
 def _approved_memory(run: dict, stage: dict, lineage: tuple, script: str = None) -> dict | None:
     agent, output = stage["agent"], stage["output"]
+    if agent == "Research Agent" and isinstance(output, list):
+        output = {"papers": output}  # the Research Agent returns its papers as a list (review finding 6)
     if not isinstance(output, dict):
         return None
     lin, lin_reason = lineage
@@ -670,6 +690,176 @@ def _finding_memories(run: dict, stage: dict, lineage: str) -> list:
     return out
 
 
+# --- Insights, step 1: setting changes from reruns (plan 18.3.1) ---
+
+SETTING_INSIGHT_AGENTS = ("Replication Agent", "Experiment Agent")  # who writes scripts / chooses the next change
+MIN_EFFECT_POINTS = 1.0  # a smaller change is noise (seeds, routed models), not a lesson
+# Scores where a rise is worse; a mean "gain" over metrics must not count them.
+LOWER_IS_BETTER = re.compile(r"brier|loss|error|mse|mae|fpr|falsepositive|falsenegative")
+
+
+def _points(value: float) -> float:
+    return value * 100 if abs(value) <= 1.0 else value
+
+
+def _effect(r: dict) -> tuple[str | None, dict, str]:
+    """(direction "better" / "worse" / None, per-metric deltas in points,
+    the effect in words) of one rerun, from its own record."""
+    from src.agents.evaluation_agent import _normalize_metric_name, is_bounded_score
+
+    before, after = insights.parse_metrics(r.get("metrics_before")), insights.parse_metrics(r.get("metrics_after"))
+    after_by_key = {_normalize_metric_name(k): (k, v) for k, v in after.items()}
+    deltas = {}
+    for name, value in before.items():
+        key = _normalize_metric_name(name)
+        if key in after_by_key and is_bounded_score(name) and not LOWER_IS_BETTER.search(key):
+            deltas[name] = round(_points(after_by_key[key][1]) - _points(value), 2)
+    gap_before, gap_after = r.get("gap_before"), r.get("gap_after")
+    if isinstance(gap_before, (int, float)) and isinstance(gap_after, (int, float)):
+        moved = gap_after - gap_before
+        direction = "better" if moved <= -MIN_EFFECT_POINTS else "worse" if moved >= MIN_EFFECT_POINTS else None
+        words = f"gap to the paper {gap_before} -> {gap_after} points"
+    elif deltas:
+        mean = sum(deltas.values()) / len(deltas)
+        direction = "better" if mean >= MIN_EFFECT_POINTS else "worse" if mean <= -MIN_EFFECT_POINTS else None
+        words = f"mean change {mean:+.1f} points over {len(deltas)} metric(s) (no measurable gap to the paper)"
+    else:
+        return None, deltas, "no measured effect"
+    shown = ", ".join(f"{k} {v:+.1f}" for k, v in deltas.items())
+    return direction, deltas, words + (f"; {shown} points" if shown else "")
+
+
+def _setting_change_memories(run: dict) -> list:
+    """For each evaluated rerun that changed the baseline script's settings:
+    what changed (insights.settings_diff), what it did to the metrics and
+    the gap, and whether the new baseline was valid -- one insight for the
+    Replication Agent and one for the Experiment Agent. A rerun is paired
+    with its script by its attempt numbers (Master Agent numbers rerun N's
+    attempts after N * MAX_ATTEMPTS); a rerun that cannot be paired makes
+    no memory, never a guessed one."""
+    from src.agents.master_agent import MAX_ATTEMPTS
+
+    replications = [s for s in run["stages"] if s["agent"] == "Replication Agent" and s["decision"] == "Approved"]
+    if len(replications) < 2:
+        return []
+    baseline = replications[0]
+    out = []
+    for r in sorted((r for r in run["reruns"] or [] if isinstance(r, dict)), key=lambda r: r.get("rerun") or 0):
+        low = (r.get("rerun") or 0) * MAX_ATTEMPTS
+        new = next((s for s in replications if s["id"] > baseline["id"] and low < s["attempt"] <= low + MAX_ATTEMPTS),
+                   None)
+        if new is None or "metrics_after" not in r:
+            continue  # no new script in this rerun, or it was undone before the evaluation
+        before, after = insights.model_settings(_script(run, baseline)), insights.model_settings(_script(run, new))
+        changes = insights.settings_diff(before, after) if before is not None and after is not None else []
+        kept = bool(r.get("applied"))
+        if changes:
+            out.extend(_setting_insights(run, r, new, changes, kept))
+        if kept:
+            baseline = new  # a reverted rerun leaves the earlier baseline in place
+    return out
+
+
+def _setting_insights(run: dict, r: dict, stage: dict, changes: list, kept: bool) -> list:
+    direction, deltas, effect = _effect(r)
+    leak = _leakage((_evaluation_of(run, stage) or {}).get("output"))
+    if direction is None and not leak:
+        return []  # nothing measurable changed: nothing to teach
+    script = _script(run, stage)
+    families = ", ".join(features.model_families(script)) if script else "unknown model"
+    areas = insights.changed_areas(changes)
+    changes = sorted(changes, key=lambda c: areas.index(c["area"]) if c.get("area") in areas else len(areas))
+    changed = [insights.describe_change(c) for c in changes]
+    head = "; ".join(insights.describe_change(c, brief=True) for c in changes[:2]) +         (f" (+{len(changed) - 2} more)" if len(changed) > 2 else "")
+    if leak:
+        polarity, verdict = "negative", (f"but the new baseline has verified leakage "
+                                         f"({_short(leak[0].get('issue'), 150)}), so the result is not valid")
+    elif direction == "better":
+        polarity, verdict = "positive", "the result moved the right way"
+    else:
+        polarity, verdict = "negative", "the result moved the wrong way"
+    traits = features.dataset_traits(run.get("cleaning"), run.get("dataset"))
+    scope = f"a {families} baseline" + (f" on data with {traits['rows']} rows" if traits.get("rows") else "")
+    summary = (f"In {scope}, rerun {r.get('rerun')} (requested by the {r.get('requested_by')}) changed: "
+               f"{'; '.join(changed)}. Areas changed: {', '.join(areas)}. Effect: {effect}; {verdict}. The new baseline was "
+               f"{'kept' if kept else 'reverted'}. Seen once; every change listed here was made together, so they "
+               "share the credit.")
+    out = []
+    for agent in SETTING_INSIGHT_AGENTS:
+        trust, trust_reason = _trust(run, agent)
+        if polarity == "positive":
+            quality, reasons = ranking.base_quality((1.0, f"measured: {effect}"), (1.0, "not applicable (an insight)"),
+                                                    (1.0, "no verified leakage in the new baseline"),
+                                                    _downstream(run, agent), trust)
+        else:
+            quality, reasons = ranking.warning_usefulness(f"{head}: {verdict}", None,
+                                                          f"settings:{families}:{direction or 'leakage'}", trust)
+        out.append(_memory(run, stage, "setting_change", key=agent, kind="lesson", polarity=polarity, agent=agent,
+                           title=f"{head}: {effect.split(';')[0]}",
+                           summary=summary,
+                           content=_json({"areas": areas, "changes": changes, "rerun": r.get("rerun"),
+                                          "requested_by": r.get("requested_by"),
+                                          "instructions": r.get("instructions"),
+                                          "metrics_before": r.get("metrics_before"),
+                                          "metrics_after": r.get("metrics_after"), "deltas_points": deltas,
+                                          "gap_before": r.get("gap_before"), "gap_after": r.get("gap_after"),
+                                          "kept": kept, "leakage": leak[:1]}),
+                           feats=features.task_features(run, agent, script=script),
+                           lineage="kept" if kept else "reverted", trust=trust, quality=quality,
+                           reasons={**reasons, "trust_note": trust_reason},
+                           outcome={"direction": direction, "kept": kept, "gap_before": r.get("gap_before"),
+                                    "gap_after": r.get("gap_after"), "valid": not leak}))
+    return out
+
+
+# What each agent should do with a Parent Paper whose published scores may
+# come from leakage (evaluation_agent's published_leakage_check).
+PUBLISHED_LEAK_GUIDANCE = {
+    "Validation Agent": "Treat this paper's reported scores as unreliable when choosing a Parent Paper: prefer a "
+                        "candidate whose results a correct split can reach, or expect a gap that cannot be closed.",
+    "Experiment Agent": "Do not chase this paper's score: a leak-free rerun cannot reach it. Stop, or aim for a valid "
+                        "improvement instead.",
+    "Evaluation Agent": "Expect a large gap to this paper; report it as possible leakage in the paper's own "
+                        "procedure, not as a reproduction defect.",
+}
+PUBLISHED_LEAK_SIGNATURE = "published_scores:leakage_suspected"
+
+
+def _published_leak_memories(run: dict) -> list:
+    """A warning for each agent that can act on it, when the run's Evaluation
+    Agent found that the Parent Paper's own scores are reached only with
+    leakage (CONSISTENT_WITH_LEAKAGE): the paper, the numbers, and what to do.
+    Negative, so recall shows it; one set per run (the last such evaluation)."""
+    stages = [s for s in run["stages"] if s["agent"] == "Evaluation Agent" and s["decision"] == "Approved"
+              and isinstance(s["output"], dict)
+              and (s["output"].get("published_leakage_check") or {}).get("status") == "CONSISTENT_WITH_LEAKAGE"]
+    if not stages:
+        return []
+    stage = stages[-1]
+    check = stage["output"]["published_leakage_check"]
+    paper = run["parent_paper"] or {}
+    title = paper.get("title") or "the Parent Paper"
+    numbers = "; ".join(f"{r['metric']}: paper {r['published_points']}, correct split {r['honest_points']}, "
+                        f"oversampled before the split {r['leaky_points']}"
+                        for r in check.get("metrics") or [] if r.get("explained_by_leakage"))
+    cause = (f"The published scores of '{_short(title, 150)}' may come from leakage: a standard model on the same "
+             "data reaches them only when the data is oversampled before the train/test split")
+    out = []
+    for agent, guidance in PUBLISHED_LEAK_GUIDANCE.items():
+        trust, trust_reason = _trust(run, agent)
+        quality, reasons = ranking.warning_usefulness(cause, None, PUBLISHED_LEAK_SIGNATURE, trust)
+        out.append(_memory(run, stage, "published_leak", key=agent, kind="failure", polarity="negative",
+                           agent=agent, title=f"Published scores may come from leakage: {_short(title, 120)}",
+                           summary=f"{cause} ({numbers} points). {guidance}",
+                           content=_json({"parent_paper": {k: paper.get(k) for k in ("title", "doi", "year", "venue")},
+                                          "check": check, "guidance": guidance}),
+                           feats=features.task_features(run, agent, failure=PUBLISHED_LEAK_SIGNATURE),
+                           lineage="kept", trust=trust, quality=quality,
+                           reasons={**reasons, "trust_note": trust_reason},
+                           outcome={"verdict": check["status"], "evaluation_attempt": stage["attempt"]}))
+    return out
+
+
 # An approved report (or its slides) holds this run's numbers; as a memory it could carry
 # them into another run's report. Its failures are still remembered.
 NOT_REMEMBERED_WHEN_APPROVED = ("Report Agent", "Presentation Agent")
@@ -694,6 +884,8 @@ def build_memories(run: dict) -> tuple[list, str]:
         else:
             memories.extend(_failure_memories(run, stage, payloads.get(stage["invocation_id"]) or {}))
     memories.extend(_rerun_memories(run))
+    memories.extend(_published_leak_memories(run))
+    memories.extend(_setting_change_memories(run))
     return memories, lineage_source
 
 
@@ -720,7 +912,7 @@ def retain_run(run_id: str, dry_run: bool = False) -> dict:
     Never raises."""
     from src import memory
     from src.config import MEMORY_MODE
-    report = {"run_id": run_id, "skipped": None, "written": [], "duplicates": [], "lineage": ""}
+    report = {"run_id": run_id, "skipped": None, "written": [], "duplicates": [], "failed": [], "lineage": ""}
     try:
         c = memory.client()
         if c is None or c.backend == "off":
@@ -742,35 +934,106 @@ def retain_run(run_id: str, dry_run: bool = False) -> dict:
         memories, report["lineage"] = build_memories(run)
         rows = [memory.build_memory(m) for m in memories]
         shas = sorted({r["content_sha"] for r in rows if r["content_sha"]})
-        existing = {}
+        existing, by_content = {}, {}
         # Duplicates are counted against memories still in use, not superseded or retired ones.
         for found in (c.fetch(content_shas=shas, states=("active", "candidate"), limit=10_000) if shas else []):
             if found.get("run_id") != run_id:
-                existing.setdefault((found["agent"], found["content_sha"]), found)
+                existing.setdefault(_observation(found), found)
+                by_content.setdefault((found["agent"], found["content_sha"]), []).append(found)
         seen = set()
         for row in rows:
-            key = (row["agent"], row["content_sha"])
+            key = _observation(row)
             if row["content_sha"] and key in seen:
-                continue  # the same content twice in one run is one memory
+                continue  # the same observation twice in one run is one memory
             seen.add(key)
             if row["content_sha"] and key in existing:
-                report["duplicates"].append({"of": existing[key]["id"], "title": row["title"], "agent": row["agent"]})
-                if not dry_run:
-                    memory.increment(existing[key]["id"], seen_count=1)
+                old = existing[key]
+                report["duplicates"].append({"of": old["id"], "title": row["title"], "agent": row["agent"]})
+                if not dry_run and not memory.increment(old["id"], op_id=_op_id(run_id, "seen", old["id"], row["id"]),
+                                                        seen_count=1):
+                    report["failed"].append({"id": old["id"], "write": "seen_count"})
+                continue
+            older = by_content.get((row["agent"], row["content_sha"]), []) if row["content_sha"] else []
+            _link_contradictions(row, older)
+            if not dry_run and memory.put_memory(row) is None:
+                report["failed"].append({"id": row["id"], "write": "memory"})
                 continue
             report["written"].append(row)
             if not dry_run:
-                memory.put_memory(row)
+                report["failed"].extend(_resolve_contradictions(run_id, row, older))
+            by_content.setdefault((row["agent"], row["content_sha"]), []).append(row)
         if not dry_run:
-            c.write({"op_id": str(uuid.uuid4()), "type": "insert", "table": "memory_runs",
+            if report["failed"]:
+                # No completion marker: the next retain_run repairs the run.
+                report["skipped"] = (f"incomplete: {len(report['failed'])} write(s) failed; the run is not marked "
+                                     "retained, so retaining it again repairs it")
+                print(f"[Memory] WARNING: run {run_id} retained incompletely ({len(report['failed'])} failed "
+                      "write(s)); it will be retried.")
+                return report
+            c.write({"op_id": _op_id(run_id, "retained"), "type": "insert", "table": "memory_runs",
                      "rows": [_run_row(run)]})
-            # Lessons from the new memories (one LLM call; candidates until confirmed).
-            from src.memory import curator
-            report["curator"] = curator.curate_run(run_id, report["written"])
+            # Lessons: each agent's reflection on its own records (plan 18.3.3), or
+            # with MEMORY_REFLECTION off the older curator (candidates until confirmed).
+            from src.config import MEMORY_REFLECTION
+            lessons = []
+            if MEMORY_REFLECTION:
+                from src.memory import reflection
+                report["reflection"] = reflection.reflect_run(run, report["written"])
+                lessons = report["reflection"].get("rows") or []
+            else:
+                from src.memory import curator
+                report["curator"] = curator.curate_run(run_id, report["written"])
+            # Confidence from repeats (plan 18.5): do earlier runs agree or disagree?
+            from src.memory import confirm
+            report["confirmation"] = confirm.confirm_run(run_id, report["written"] + lessons)
     except Exception as e:
         report["skipped"] = f"error: {type(e).__name__}: {e}"
         print(f"[Memory] WARNING: could not retain run {run_id}: {e}")
     return report
+
+
+def _observation(row: dict) -> tuple:
+    """What makes two memories the same observation: the same agent, the same
+    content AND the same outcome (review finding 4)."""
+    return row["agent"], row["content_sha"], row["kind"], row["polarity"]
+
+
+def _op_id(*parts) -> str:
+    """A deterministic op id: a retried write is applied once."""
+    return str(uuid.uuid5(NAMESPACE, "|".join(str(p) for p in parts)))
+
+
+def _link_contradictions(row: dict, older: list) -> None:
+    """A new positive memory whose content was an earlier warning names
+    that warning (quality_reasons.contradicted_by), before it is written."""
+    warnings = [m["id"] for m in older if m.get("polarity") == "negative"]
+    if row["polarity"] == "positive" and warnings:
+        reasons = row["quality_reasons"]
+        reasons["contradicted_by"] = sorted(set(reasons.get("contradicted_by") or []) | set(warnings))
+
+
+def _resolve_contradictions(run_id: str, row: dict, older: list) -> list:
+    """After a new memory is written: an older positive memory of the same
+    content is superseded by a new warning (the content was later found to be
+    a problem); an older warning is linked to a new positive one. Returns the
+    writes that failed."""
+    from src import memory
+    failed = []
+    for old in older:
+        if old.get("state") not in ("active", "candidate"):
+            continue
+        if row["polarity"] == "negative" and old.get("polarity") == "positive":
+            if not memory.set_state(old["id"], "superseded",
+                                    f"the same content was later found to be a problem (run {run_id}): "
+                                    f"{_short(row.get('summary'), 200)}", superseded_by=row["id"]):
+                failed.append({"id": old["id"], "write": "superseded"})
+        elif row["polarity"] == "positive" and old.get("polarity") == "negative":
+            reasons = dict(old.get("quality_reasons") or {})
+            reasons["contradicted_by"] = sorted(set(reasons.get("contradicted_by") or []) | {row["id"]})
+            if not memory.set_quality(old["id"], float(old.get("quality") or 0), reasons,
+                                      op_id=_op_id(run_id, "contradicted", old["id"], row["id"])):
+                failed.append({"id": old["id"], "write": "contradicted_by"})
+    return failed
 
 
 def _same(old: dict, new: dict) -> bool:
@@ -799,7 +1062,11 @@ def rescore_run(run_id: str, dry_run: bool = False) -> dict:
         if run is None:
             report["skipped"] = "no such run"
             return report
-        existing = {m["id"]: m for m in c.local.rows("memories", run_id=run_id)}
+        # Only the memories these rules made (their evidence has a rule_key):
+        # a curator lesson or a manual record is outside the rescorer's scope
+        # and is never retired by it (review finding 11).
+        existing = {m["id"]: m for m in c.local.rows("memories", run_id=run_id)
+                    if (m.get("evidence") or {}).get("rule_key")}
         memories, _ = build_memories(run)
         matched, seen = set(), set()
         reason = f"rescored with retain rules version {RULES_VERSION}"
@@ -819,13 +1086,18 @@ def rescore_run(run_id: str, dry_run: bool = False) -> dict:
                 if old["state"] in ("active", "candidate") and _same(old, row):
                     report["unchanged"] += 1
                     continue
+            if not dry_run and memory.put_memory(row) is None:
+                # Never supersede an old memory without its replacement (review finding 5).
+                report.setdefault("failed", []).append(row["id"])
+                continue
             report["new"].append(row)
             if old and old["state"] in ("active", "candidate"):
                 report["superseded"].append({"old": old, "new": row})
-            if not dry_run:
-                memory.put_memory(row)
-                if old and old["state"] in ("active", "candidate"):
+                if not dry_run:
                     memory.set_state(old["id"], "superseded", reason, superseded_by=row["id"])
+        if report.get("failed"):
+            report["skipped"] = f"incomplete: {len(report['failed'])} new memory write(s) failed; nothing retired"
+            return report
         for old in existing.values():
             if old["id"] not in matched and old["state"] in ("active", "candidate"):
                 report["retired"].append(old)

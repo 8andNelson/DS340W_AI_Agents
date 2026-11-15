@@ -98,6 +98,21 @@ def _history_lines(history: list) -> str:
     return "\n".join(lines) or "- none yet"
 
 
+def _published_leak(evaluation_result: dict) -> dict | None:
+    """The Evaluation Agent's check when it found that the paper's own score
+    is reached only with leakage (leakage_probe), else None."""
+    check = (evaluation_result or {}).get("published_leakage_check") or {}
+    return check if check.get("status") == "CONSISTENT_WITH_LEAKAGE" else None
+
+
+def _leakage_line(evaluation_result: dict) -> str:
+    check = _published_leak(evaluation_result)
+    if not check:
+        return ""
+    return ("WARNING -- the published result may come from leakage: " + check.get("reason", "")
+            + " A faithful, leak-free change cannot close this gap; do not chase it.\n")
+
+
 def _prompt(parent_paper: dict, paper: dict, replication_result: dict, script: str, stdout: str,
             evaluation_result: dict, code_discovery_result: dict, gap: float | None, history: list,
             feedback: list) -> str:
@@ -139,7 +154,7 @@ Paper text ({paper_label}):
 Published vs reproduced metrics (mean gap: {gap if gap is not None else 'not measurable'} percentage points):
 {metric_lines}
 
-Evaluation Agent's assessment: {review.get('assessment') or 'none'}
+{_leakage_line(evaluation_result)}Evaluation Agent's assessment: {review.get('assessment') or 'none'}
 Evaluation Agent's findings (automated leakage checks and its review):
 {finding_lines}
 Evaluation Agent's decision: {decision.get('action', '')} {('-- ' + decision.get('reason', '')) if decision.get('reason') else ''}
@@ -201,7 +216,12 @@ def _decide(raw: dict, corpus: str, gap: float | None, evaluation_result: dict) 
         target_entries = None
 
     published = [m for m in evaluation_result.get("metrics", []) if m.get("published_value") is not None]
-    if action == "rerun_agent" and not published:
+    if action == "rerun_agent" and _published_leak(evaluation_result):
+        notes.append("The published result may come from leakage (the Evaluation Agent's leakage check: "
+                     f"{_published_leak(evaluation_result).get('reason', '')}); a leak-free rerun cannot reach it, "
+                     "so the gap is not chased; stopping.")
+        action = "stop"
+    elif action == "rerun_agent" and not published:
         notes.append("No published metric was extracted from the paper, so there is no gap to close; stopping.")
         action = "stop"
     elif action == "rerun_agent" and gap is not None and gap <= EXACT_THRESHOLD_POINTS:

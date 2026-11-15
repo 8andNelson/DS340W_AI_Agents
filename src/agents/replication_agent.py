@@ -843,14 +843,18 @@ def _parse_generation(content: str) -> dict:
     }
 
 
-def _memory_context(parent_paper: dict, cleaning_result: dict = None, text: str = "", failure: str = None):
+def _memory_context(parent_paper: dict, cleaning_result: dict = None, text: str = "", failure: str = None,
+                    script: str = None):
     """Past cases for one of this agent's LLM calls (src/memory/recall.py):
     good and bad baseline scripts for the same model family and task, and --
     with a failure -- earlier failures and Master Agent diagnoses with the
-    same failure signature. None when agents do not use memory."""
+    same failure signature. The task is the run's own record (topic, task
+    type, dataset; recall.task_record) plus the current script when there is
+    one. None when agents do not use memory."""
     from src.memory import features, recall
-    task = features.task_features({"parent_paper": parent_paper or {}, "cleaning": cleaning_result,
-                                   "replication": {"source": "reconstructed"}}, "Replication Agent")
+    run = recall.task_record(parent_paper=parent_paper, cleaning=cleaning_result,
+                             replication={"source": "reconstructed"})
+    task = features.task_features(run, "Replication Agent", script=script)
     agents = ["Replication Agent", "Master Agent"] if failure else ["Replication Agent"]
     return recall.context_for("Replication Agent", task, text=text, search_agents=agents, failure=failure)
 
@@ -896,7 +900,7 @@ Then the full revised script:
 ```"""
     try:
         content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent",
-                           memory=_memory_context(parent_paper, text=" ".join(instructions or [])))
+                           memory=_memory_context(parent_paper, text=" ".join(instructions or []), script=code))
     except Exception as e:
         print(f"[Replication Agent] Revision call failed: {e}")
         return {}
@@ -992,7 +996,8 @@ Respond with the full fixed script in one fenced block and nothing else:
 
     try:
         content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, effort="high", agent="replication_agent",
-                           memory=_memory_context(parent_paper, text=(stderr or "")[-1500:], failure=stderr))
+                           memory=_memory_context(parent_paper, text=(stderr or "")[-1500:], failure=stderr,
+                                                  script=code))
     except Exception as e:
         print(f"[Replication Agent] Repair call failed: {e}")
         return ""
