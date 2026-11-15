@@ -104,6 +104,7 @@ const loaders = {
   datasets: loadDatasets,
   scripts: loadScripts,
   documents: loadDocuments,
+  report: loadReport,
   activity: loadActivity,
   runs: loadRuns,
   compare: loadCompare,
@@ -140,6 +141,9 @@ function resetRunScopedState() {
   selectedAgent = null;
   selectedScriptId = null;
   selectedDoc = null;
+  reportData = null;
+  deck = null;
+  slideIndex = 0;
   $("#dataset-preview").hidden = true;
   $("#console").textContent = "";
 }
@@ -796,7 +800,7 @@ async function loadDocuments() {
   try { documents = await api(withRun("/api/documents")); } catch (err) { $("#pdf-list").innerHTML = `<div class="muted">${esc(err.message)}</div>`; return; }
   if (!documents.length) {
     $("#pdf-list").innerHTML = "";
-    $("#pdf-detail").innerHTML = `<div class="empty">This run has no documents yet. Fetch a paper's open-access PDF from the Papers page; the report and slides will appear here once those agents exist.</div>`;
+    $("#pdf-detail").innerHTML = `<div class="empty">This run has no documents yet. Fetch a paper's open-access PDF from the Papers page; the report and slides are on the Report &amp; slides page.</div>`;
     return;
   }
   if (!documents.some((d) => d.view_url === selectedDoc)) selectedDoc = documents[0].view_url;
@@ -826,6 +830,310 @@ function showDocument(viewUrl) {
 $("#pdf-list").addEventListener("click", (e) => {
   const item = e.target.closest("[data-doc]");
   if (item) showDocument(item.dataset.doc);
+});
+
+// --- Report and slides ---
+
+let reportData = null;
+let reportTab = "report";
+let deck = null;
+let slideIndex = 0;
+
+// A small Markdown renderer for the Report Agent's report.md: headings,
+// paragraphs, tables, lists, quotes, links, figures and [P3] citations.
+// Everything is escaped first, so the file's text can never become markup.
+function mdInline(text, figures) {
+  const held = [];
+  const hold = (html) => `\u0000${held.push(html) - 1}\u0000`;
+  let s = esc(text);
+  s = s.replace(/`([^`]+)`/g, (_, c) => hold(`<code>${c}</code>`));
+  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, src) => {
+    const url = figures[src.split("/").pop()];
+    return hold(url ? `<figure><img src="${esc(url)}" alt="${alt}"><figcaption>${alt}</figcaption></figure>`
+      : `<span class="muted">[Figure not recorded by this run: ${alt}]</span>`);
+  });
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, url) =>
+    hold(`<a href="${url}" target="_blank" rel="noopener">${label}</a>`));
+  s = s.replace(/https?:\/\/[^\s<>"]+/g, (url) => {
+    const tail = (url.match(/[.,;:)]+$/) || [""])[0];
+    const clean = url.slice(0, url.length - tail.length);
+    return hold(`<a href="${clean}" target="_blank" rel="noopener">${clean}</a>`) + tail;
+  });
+  s = s.replace(/\[(P\d+)\]/g, (_, key) => hold(`<a class="cite" href="#" data-ref="${key}">[${key}]</a>`));
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,;:]|$)/g, "$1<em>$2</em>");
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => held[Number(i)]);
+}
+
+function mdCells(row) {
+  return row.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "").split(/(?<!\\)\|/)
+    .map((c) => c.trim().replace(/\\\|/g, "|"));
+}
+
+function renderMarkdown(md, figures) {
+  const lines = md.replace(/\r\n?/g, "\n").split("\n");
+  const html = [];
+  const toc = [];
+  const isBlockStart = (l) => /^(#{1,4}\s|\s*[-*]\s|\s*\d+\.\s|>|\s*\|)/.test(l);
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    let m;
+    if (!line.trim()) { i++; continue; }
+    if ((m = line.match(/^(#{1,4})\s+(.*)$/))) {
+      const level = m[1].length;
+      const id = `md-h${i}`;
+      if (level === 2) toc.push({ id, text: m[2] });
+      html.push(`<h${level} id="${id}">${mdInline(m[2], figures)}</h${level}>`);
+      i++;
+    } else if (/^\s*\|/.test(line) && /^\s*\|?\s*:?-{3,}/.test(lines[i + 1] || "")) {
+      const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]);
+      const cell = (c, tag) => `<${tag}${/^-?\d[\d.,]*%?$/.test(c) ? ' class="num"' : c.length > 120 ? ' class="long"' : ""}>${mdInline(c, figures)}</${tag}>`;
+      html.push(`<div class="table-wrap md-table"><table class="table">
+        <thead><tr>${mdCells(rows[0]).map((c) => cell(c, "th")).join("")}</tr></thead>
+        <tbody>${rows.slice(2).map((r) => `<tr>${mdCells(r).map((c) => cell(c, "td")).join("")}</tr>`).join("")}</tbody>
+      </table></div>`);
+    } else if (/^\s*([-*]|\d+\.)\s/.test(line)) {
+      const ordered = /^\s*\d+\.\s/.test(line);
+      const items = [];
+      while (i < lines.length && (ordered ? /^\s*\d+\.\s/ : /^\s*[-*]\s/).test(lines[i])) {
+        const body = lines[i++].replace(/^\s*([-*]|\d+\.)\s+/, "");
+        const ref = body.match(/^\[(P\d+)\]/);
+        items.push(`<li${ref ? ` id="ref-${ref[1]}"` : ""}>${mdInline(body, figures)}</li>`);
+      }
+      html.push(ordered ? `<ol>${items.join("")}</ol>` : `<ul>${items.join("")}</ul>`);
+    } else if (line.startsWith(">")) {
+      const quote = [];
+      while (i < lines.length && lines[i].startsWith(">")) quote.push(lines[i++].replace(/^>\s?/, ""));
+      html.push(`<blockquote>${mdInline(quote.join(" "), figures)}</blockquote>`);
+    } else {
+      const para = [];
+      while (i < lines.length && lines[i].trim() && !(para.length && isBlockStart(lines[i]))) para.push(lines[i++]);
+      html.push(`<p>${mdInline(para.join(" "), figures)}</p>`);
+    }
+  }
+  return { html: html.join("\n"), toc };
+}
+
+async function loadReport() {
+  try { reportData = await api(withRun("/api/report")); } catch (err) {
+    $("#report-pane").innerHTML = `<div class="note err">${esc(err.message)}</div>`;
+    return;
+  }
+  showReportTab(reportTab);
+}
+
+function showReportTab(tab) {
+  reportTab = tab;
+  document.querySelectorAll("#report-tabs .chip").forEach((c) => c.classList.toggle("active", c.dataset.tab === tab));
+  $("#report-pane").hidden = tab !== "report";
+  $("#slides-pane").hidden = tab !== "slides";
+  if (tab === "report") renderReport(); else loadSlides();
+}
+
+function missingNote(what, agent) {
+  const off = (reportData.turned_off || []).includes(agent);
+  return `<div class="empty">${off ? `The ${esc(agent)} was turned off for this run, so it has no ${what}.`
+    : `This run has no ${what} yet. The ${esc(agent)} makes it after the Evaluation and Experiment Agents finish.`}</div>`;
+}
+
+function outputMeta(item, extra = "") {
+  const warnings = (item.warnings || []).map((w) => `<div class="note">${esc(w)}</div>`).join("");
+  return `<div class="out-meta">
+      ${item.status ? `<span class="badge ${esc(item.status.toLowerCase())}">${esc(item.status)}</span>` : ""}
+      ${item.written_by ? `<span class="muted small">Text by ${esc(item.written_by)}</span>` : ""}
+      ${extra}
+      <span class="muted small mono">${esc(item.path)}</span>
+      ${warnings}
+    </div>`;
+}
+
+function renderReport() {
+  const pane = $("#report-pane");
+  const r = reportData && reportData.report;
+  if (!r) { pane.innerHTML = missingNote("report", "Report Agent"); return; }
+  const { html, toc } = renderMarkdown(r.text, r.figures || {});
+  const stored = r.source === "database"
+    ? `<span class="muted small">Shown from the run database: the file on disk has changed since this run.</span>` : "";
+  pane.innerHTML = `
+    <div class="card out-bar">
+      ${outputMeta(r, `<span class="muted small">${r.removed_claims} sentence(s) removed by the fact check</span>${stored}`)}
+      <div class="btn-group">
+        ${r.facts_download_url ? `<a class="btn sm ghost" href="${esc(r.facts_download_url)}">Facts (JSON)</a>` : ""}
+        <a class="btn sm primary" href="${esc(r.download_url)}">Download ${esc(r.name)}</a>
+      </div>
+    </div>
+    <div class="split report-split">
+      <nav class="list toc" aria-label="Report sections">
+        ${toc.map((t) => `<button class="list-item" data-jump="${t.id}">${esc(t.text.replace(/\*\*/g, ""))}</button>`).join("")}
+      </nav>
+      <article class="card md-doc">
+        ${r.truncated ? `<div class="note">The report is too long to show in full here. Download it to read the rest.</div>` : ""}
+        ${html}
+      </article>
+    </div>`;
+}
+
+$("#report-tabs").addEventListener("click", (e) => {
+  const chip = e.target.closest("[data-tab]");
+  if (chip) showReportTab(chip.dataset.tab);
+});
+
+$("#report-pane").addEventListener("click", (e) => {
+  const jump = e.target.closest("[data-jump]");
+  const cite = e.target.closest("[data-ref]");
+  if (!jump && !cite) return;
+  e.preventDefault();  // the address bar holds the page and the run, not an anchor
+  const target = document.getElementById(jump ? jump.dataset.jump : `ref-${cite.dataset.ref}`);
+  if (!target) return;
+  target.scrollIntoView({ behavior: "smooth", block: "start" });
+  target.classList.add("flash");
+  setTimeout(() => target.classList.remove("flash"), 1400);
+});
+
+// Slides: each shape is placed where the .pptx puts it (fractions of the
+// slide), and font sizes in points are scaled to the drawn slide's width,
+// so the large view and the thumbnails use the same drawing.
+
+const CHART_COLORS = ["#2A78D6", "#EB6834", "#1F8A4C", "#8A3FFC"];
+
+function slideFont(pt) { return pt ? `font-size:${(pt / deck.width_pt * 100).toFixed(3)}cqw;` : ""; }
+
+function slideParagraphs(paragraphs) {
+  return paragraphs.map((p) => {
+    const runs = p.runs.map((r) => `<span style="${slideFont(r.size)}${r.color ? `color:${r.color};` : ""}${
+      r.bold ? "font-weight:700;" : ""}${r.italic ? "font-style:italic;" : ""}">${esc(r.text)}</span>`).join("");
+    return `<p style="${p.align ? `text-align:${p.align};` : ""}${p.level ? `margin-left:${p.level * 4}cqw;` : ""}">${runs || "&nbsp;"}</p>`;
+  }).join("");
+}
+
+function slideChart(shape) {
+  const W = 600, H = 300, padL = 120, padR = 50, padT = shape.title ? 30 : 10, padB = shape.series.length > 1 ? 32 : 12;
+  const cats = shape.categories, series = shape.series;
+  const max = Math.max(...series.flatMap((s) => s.values).filter((v) => v != null), 0) || 1;  // the axis starts at zero
+  const band = (H - padT - padB) / Math.max(cats.length, 1);
+  const barH = (band * 0.7) / Math.max(series.length, 1);
+  const x = (v) => padL + (v / max) * (W - padL - padR);
+  const color = (s, si, ci) => (s.point_colors || [])[ci] || s.color || CHART_COLORS[si % CHART_COLORS.length];
+  let out = shape.title ? `<text x="${W / 2}" y="18" text-anchor="middle" class="ct">${esc(shape.title)}</text>` : "";
+  out += `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${H - padB}" class="ax"/>`;
+  cats.forEach((c, ci) => {
+    const y0 = padT + ci * band + band * 0.15;
+    out += `<text x="${padL - 8}" y="${y0 + band * 0.35}" text-anchor="end" dominant-baseline="middle" class="cl">${esc(c)}</text>`;
+    series.forEach((s, si) => {
+      const v = s.values[ci];
+      if (v == null) return;
+      const y = y0 + si * barH;
+      out += `<rect x="${padL}" y="${y}" width="${Math.max(x(v) - padL, 0)}" height="${barH * 0.9}" fill="${color(s, si, ci)}">
+        <title>${esc(s.name)}, ${esc(c)}: ${v}</title></rect>
+        <text x="${x(v) + 4}" y="${y + barH * 0.45}" dominant-baseline="middle" class="dl">${v}</text>`;
+    });
+  });
+  if (series.length > 1) {
+    out += series.map((s, si) => `<rect x="${padL + si * 160}" y="${H - 16}" width="10" height="10" fill="${s.color || CHART_COLORS[si % CHART_COLORS.length]}"/>
+      <text x="${padL + si * 160 + 14}" y="${H - 7}" class="cl">${esc(s.name)}</text>`).join("");
+  }
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="slide-chart" role="img" aria-label="${esc(shape.title || "Chart")}">${out}</svg>`;
+}
+
+function slideShape(shape) {
+  const box = `left:${shape.x * 100}%;top:${shape.y * 100}%;width:${shape.w * 100}%;height:${shape.h * 100}%;`;
+  if (shape.type === "table") {
+    const cols = shape.columns.map((w) => `<col style="width:${w * 100}%">`).join("");
+    const rows = shape.rows.map((row) => `<tr>${row.map((c) =>
+      `<td style="${c.fill ? `background:${c.fill};` : ""}">${slideParagraphs(c.paragraphs)}</td>`).join("")}</tr>`).join("");
+    return `<div class="s-shape s-table" style="${box}"><table><colgroup>${cols}</colgroup>${rows}</table></div>`;
+  }
+  if (shape.type === "chart") return `<div class="s-shape" style="${box}">${slideChart(shape)}</div>`;
+  let outline = "";
+  if (shape.geometry === "pentagon") {  // PowerPoint's arrow-tip pentagon: the tip is half the height deep
+    const depth = Math.min(50, (0.5 * shape.h * deck.height_pt) / (shape.w * deck.width_pt) * 100);
+    outline = `clip-path:polygon(0 0,${100 - depth}% 0,100% 50%,${100 - depth}% 100%,0 100%);`;
+  } else if (shape.geometry === "oval") outline = "border-radius:50%;";
+  else if ((shape.geometry || "").startsWith("rounded")) outline = "border-radius:8%;";
+  const anchor = { middle: "center", bottom: "flex-end" }[shape.anchor] || "flex-start";
+  return `<div class="s-shape s-text" style="${box}${shape.fill ? `background:${shape.fill};` : ""}${outline}justify-content:${anchor};">${
+    slideParagraphs(shape.paragraphs)}</div>`;
+}
+
+function slideHtml(slide) {
+  return `<div class="slide" style="aspect-ratio:${deck.width_pt} / ${deck.height_pt}">${slide.shapes.map(slideShape).join("")}</div>`;
+}
+
+async function loadSlides() {
+  const pane = $("#slides-pane");
+  const p = reportData && reportData.presentation;
+  if (!p) { pane.innerHTML = missingNote("slides", "Presentation Agent"); return; }
+  if (!deck || deck.url !== p.slides_url) {
+    pane.innerHTML = `<div class="muted small">Reading the slides…</div>`;
+    try { deck = { ...(await api(p.slides_url)), url: p.slides_url }; } catch (err) {
+      deck = null;
+      pane.innerHTML = `<div class="note err">${esc(err.message)}</div>
+        <a class="btn sm primary" href="${esc(p.download_url)}">Download ${esc(p.name)}</a>`;
+      return;
+    }
+    slideIndex = Math.min(slideIndex, deck.slides.length - 1);
+  }
+  const fallback = (p.fallback_slides || []).length
+    ? `<span class="muted small">${p.fallback_slides.length} slide(s) use the report's own sentences</span>` : "";
+  pane.innerHTML = `
+    <div class="card out-bar">
+      ${outputMeta(p, fallback)}
+      <div class="btn-group">
+        <button class="btn sm ghost" id="slide-full">Full screen</button>
+        <a class="btn sm primary" href="${esc(p.download_url)}">Download ${esc(p.name)}</a>
+      </div>
+    </div>
+    <div class="deck">
+      <div class="deck-main">
+        <div class="slide-stage" id="slide-stage"></div>
+        <div class="deck-nav">
+          <button class="btn sm" id="slide-prev">Previous</button>
+          <span class="muted small" id="slide-count"></span>
+          <button class="btn sm" id="slide-next">Next</button>
+        </div>
+        <div class="card slide-notes"><div class="label">Speaker notes</div><div id="slide-notes" class="muted small"></div></div>
+      </div>
+      <div class="thumbs" id="slide-thumbs">
+        ${deck.slides.map((s, i) => `<button class="thumb" data-slide="${i}" aria-label="Slide ${s.number}: ${esc(s.title)}">
+          ${slideHtml(s)}<span class="thumb-label">${s.number}. ${esc(s.title)}</span></button>`).join("")}
+      </div>
+    </div>`;
+  showSlide(slideIndex);
+}
+
+function showSlide(i) {
+  if (!deck || !$("#slide-stage")) return;
+  slideIndex = Math.max(0, Math.min(i, deck.slides.length - 1));
+  const slide = deck.slides[slideIndex];
+  $("#slide-stage").innerHTML = slideHtml(slide);
+  $("#slide-count").textContent = `Slide ${slideIndex + 1} of ${deck.slides.length}: ${slide.title}`;
+  $("#slide-notes").textContent = slide.notes || "No speaker notes.";
+  $("#slide-prev").disabled = slideIndex === 0;
+  $("#slide-next").disabled = slideIndex === deck.slides.length - 1;
+  document.querySelectorAll("#slide-thumbs .thumb").forEach((t) => {
+    const on = Number(t.dataset.slide) === slideIndex;
+    t.classList.toggle("active", on);
+    if (on) t.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
+}
+
+$("#slides-pane").addEventListener("click", (e) => {
+  const thumb = e.target.closest(".thumb");
+  if (e.target.closest("#slide-prev")) showSlide(slideIndex - 1);
+  else if (e.target.closest("#slide-next")) showSlide(slideIndex + 1);
+  else if (e.target.closest("#slide-full")) { const stage = $("#slide-stage"); if (stage.requestFullscreen) stage.requestFullscreen(); }
+  else if (thumb) showSlide(Number(thumb.dataset.slide));
+});
+
+document.addEventListener("keydown", (e) => {
+  if (currentView !== "report" || reportTab !== "slides" || !deck) return;
+  if (e.target.closest && e.target.closest("input, textarea, select")) return;
+  if (["ArrowRight", "PageDown", " "].includes(e.key)) { e.preventDefault(); showSlide(slideIndex + 1); }
+  else if (["ArrowLeft", "PageUp"].includes(e.key)) { e.preventDefault(); showSlide(slideIndex - 1); }
+  else if (e.key === "Home") showSlide(0);
+  else if (e.key === "End") showSlide(deck.slides.length - 1);
 });
 
 // --- Master Agent log ---

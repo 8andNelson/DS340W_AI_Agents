@@ -12,7 +12,9 @@ it. The dashboard:
   * only *reads* the pipeline's outputs through readers.py, which never
     locks a file or the database against the pipeline;
   * writes only to its own folder, dashboard_files/ (fetched paper PDFs,
-    script copies, run consoles).
+    script copies, run consoles);
+  * shows the Report Agent's report (Markdown, drawn in the page) and the
+    Presentation Agent's slides (read from the .pptx by slides.py).
 
 Everything is shown per run. The run database (database/project_runs.db,
 written by src/orchestration/run_store.py) records each run's agent
@@ -37,7 +39,7 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file
 from src import paper_input
 
-from src.dashboard import editor, insights, pdf_fetch, readers
+from src.dashboard import editor, insights, pdf_fetch, readers, slides
 from src.dashboard.freellmapi import FreeLLMAPIManager
 from src.dashboard.runner import CONSOLE_DIR, PipelineRunner, RunError, validate_topic
 
@@ -68,6 +70,9 @@ CODE_SUFFIXES = {".py", ".ipynb", ".r", ".sh"}
 # The text files run_store keeps from replication/ and experiments/.
 SCRIPT_TEXT_SUFFIXES = CODE_SUFFIXES | {".md", ".txt", ".cfg", ".toml", ".yml", ".yaml", ".json", ".ini"}
 TABLE_SUFFIXES = {".csv", ".tsv"}
+REPORT_MAX_BYTES = 4 * 1024 * 1024
+DECK_MAX_BYTES = 64 * 1024 * 1024
+_DECK_CACHE: dict[str, dict] = {}  # sha256 -> parsed deck (a recorded file never changes)
 # A run row still marked "running" with no new agent attempt for this long
 # is treated as a run that was killed before it could record its end.
 STALE_RUN_HOURS = 6
@@ -413,6 +418,50 @@ def _script_bytes(artifact_id: int) -> tuple[dict, bytes]:
         abort(404, "Script not found.")
     with handle:
         return record, handle.read()
+
+
+# --- Report and slides ---
+
+def _last_artifact(artifacts: list[dict], agent: str, kind: str) -> dict | None:
+    mine = [a for a in artifacts if a["agent"] == agent and a["kind"] == kind]
+    return mine[-1] if mine else None
+
+
+def _report_view(run: dict | None) -> dict:
+    """The run's report and slides: what each agent recorded, and where to read them."""
+    attempts, artifacts = _attempts(run), _artifacts(run)
+    out = {"report": None, "presentation": None,
+           "turned_off": sorted({e.get("target") for e in _run_log_entries(run) if e.get("decision") == "Skipped"}
+                                & {"Report Agent", "Presentation Agent"})}
+    report = _output(attempts, "Report Agent") or {}
+    md = _last_artifact(artifacts, "Report Agent", "report_path")
+    if md:
+        record, handle, source = _open_artifact(md["id"])
+        with handle:
+            content = handle.read(REPORT_MAX_BYTES + 1)
+        facts = _last_artifact(artifacts, "Report Agent", "facts_path")
+        figures = {Path(a["original_path"]).name: f"/api/artifacts/{a['id']}/view"
+                   for a in artifacts if a["agent"] == "Report Agent" and a["original_path"].lower().endswith(".svg")}
+        out["report"] = {
+            "id": md["id"], "name": Path(record["original_path"]).name, "path": _display_path(Path(record["original_path"])),
+            "text": content[:REPORT_MAX_BYTES].decode("utf-8", errors="replace"),
+            "truncated": len(content) > REPORT_MAX_BYTES, "source": source, "figures": figures,
+            "download_url": f"/api/artifacts/{md['id']}/download",
+            "facts_download_url": f"/api/artifacts/{facts['id']}/download" if facts else None,
+            "status": report.get("status", ""), "written_by": report.get("written_by", ""),
+            "removed_claims": len(report.get("removed_claims") or []), "warnings": report.get("warnings") or [],
+        }
+    deck = _output(attempts, "Presentation Agent") or {}
+    pptx = _last_artifact(artifacts, "Presentation Agent", "presentation_path")
+    if pptx:
+        out["presentation"] = {
+            "id": pptx["id"], "name": Path(pptx["original_path"]).name, "path": _display_path(Path(pptx["original_path"])),
+            "size_bytes": pptx["size_bytes"], "slides_url": f"/api/artifacts/{pptx['id']}/slides",
+            "download_url": f"/api/artifacts/{pptx['id']}/download",
+            "status": deck.get("status", ""), "written_by": deck.get("written_by", ""),
+            "fallback_slides": deck.get("fallback_slides") or [], "warnings": deck.get("warnings") or [],
+        }
+    return out
 
 
 def run_in_progress(runner: PipelineRunner) -> bool:
@@ -781,10 +830,38 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
     @app.get("/api/artifacts/<int:artifact_id>/view")
     def artifact_view(artifact_id: int):
         record, handle, _ = _open_artifact(artifact_id)
-        if not record["original_path"].lower().endswith(".pdf"):
+        name = record["original_path"].lower()
+        if name.endswith(".svg"):  # a report figure; scripts in it never run
+            response = send_file(handle, mimetype="image/svg+xml", download_name=Path(record["original_path"]).name)
+            response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            return response
+        if not name.endswith(".pdf"):
             handle.close()
-            abort(400, "Only PDF files can be viewed inline.")
+            abort(400, "Only PDF and SVG files can be viewed inline.")
         return send_file(handle, mimetype="application/pdf", download_name=Path(record["original_path"]).name)
+
+    @app.get("/api/artifacts/<int:artifact_id>/slides")
+    def artifact_slides(artifact_id: int):
+        record, handle, source = _open_artifact(artifact_id)
+        with handle:
+            if not record["original_path"].lower().endswith(".pptx"):
+                abort(400, "Only .pptx files can be shown as slides.")
+            if record["sha256"] not in _DECK_CACHE:
+                data = handle.read(DECK_MAX_BYTES + 1)
+                if len(data) > DECK_MAX_BYTES:
+                    abort(413, "This deck is too large to show here. Download it instead.")
+                try:
+                    _DECK_CACHE[record["sha256"]] = slides.read_deck(data)
+                except Exception as e:  # a damaged file: the download still works
+                    abort(422, f"The slides could not be read ({type(e).__name__}). Download the file instead.")
+        return jsonify({**_DECK_CACHE[record["sha256"]], "source": source})
+
+    # --- Report and slides of this run ---
+
+    @app.get("/api/report")
+    def report_and_slides():
+        return jsonify(_report_view(_resolve_run(current_runner())))
 
     # --- Scripts this run wrote ---
 

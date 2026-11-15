@@ -817,3 +817,107 @@ def test_an_agent_turned_off_in_a_run_shows_as_turned_off(client, repo):
     live = {a["name"]: a["live"] for a in client.get(f"/api/status?run={run_id}").get_json()["agents"]}
     assert live["Report Agent"] == {"status": "skipped", "summary": "Turned off for this run."}
     assert live["Presentation Agent"] is None
+
+
+# --- Report and slides ---
+
+def _deck(path):
+    """A small deck shaped like the Presentation Agent's: a named title box, a table and a bar chart."""
+    from pptx import Presentation
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_CHART_TYPE
+    from pptx.util import Inches, Pt
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    title = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(12), Inches(0.8))
+    title.name = "Slide title: Comparison"
+    title.text_frame.text = "Comparison"
+    title.text_frame.paragraphs[0].runs[0].font.size = Pt(30)
+    table = slide.shapes.add_table(2, 2, Inches(0.5), Inches(1.5), Inches(6), Inches(1)).table
+    for c, (head, value) in enumerate((("Metric", "accuracy"), ("Reproduced", "0.94"))):
+        table.cell(0, c).text, table.cell(1, c).text = head, value
+    data = CategoryChartData()
+    data.categories = ["accuracy"]
+    data.add_series("Published", (0.95,))
+    data.add_series("Reproduced", (0.94,))
+    slide.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, Inches(7), Inches(1.5), Inches(5.5), Inches(4), data)
+    slide.notes_slide.notes_text_frame.text = "Source: evaluation.metrics."
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(path)
+
+
+@pytest.fixture
+def finished_run(repo):
+    """A run whose Report and Presentation Agents finished. reports/ is not one of
+    the dashboard's file roots here, so the files are served from the run database."""
+    out = repo / "reports" / "paper"
+    _write(out / "report.md", "# Reproducing Paper\n\n## 1. Abstract\n\nWe cite [P1] and **bold** "
+                              "<script>x</script> text.\n\n| Metric | Reproduced |\n|---|---|\n| a\\|b | 0.94 |\n\n"
+                              "![Published vs reproduced metrics](figures/metrics.svg)\n\n## 16. References\n\n"
+                              "- [P1] A. Author (2024). Paper. https://doi.org/10.1/x.\n")
+    _write(out / "report_facts.json", "{}")
+    _write(out / "figures" / "metrics.svg", '<svg xmlns="http://www.w3.org/2000/svg"></svg>')
+    _deck(repo / "presentations" / "paper" / "slides.pptx")
+    run_id = run_store.start_run("topic R")
+    run_store.record_stage(run_id, "Report Agent", 1, "Approved",
+                           {"status": "OK", "report_path": str(out / "report.md"),
+                            "facts_path": str(out / "report_facts.json"),
+                            "metrics_figure_path": str(out / "figures" / "metrics.svg"),
+                            "written_by": "model/a", "removed_claims": [{"sentence": "x"}], "warnings": []}, "")
+    run_store.record_stage(run_id, "Presentation Agent", 1, "Approved",
+                           {"status": "OK", "presentation_path": str(repo / "presentations" / "paper" / "slides.pptx"),
+                            "written_by": "model/b", "fallback_slides": [], "warnings": []}, "")
+    run_store.finish_run(run_id, "success", "COMPLETE")
+    return run_id
+
+
+def test_report_view_shows_the_runs_report_and_slides(client, finished_run):
+    body = client.get(f"/api/report?run={finished_run}").get_json()
+    report, deck = body["report"], body["presentation"]
+    assert report["text"].startswith("# Reproducing Paper")
+    assert report["source"] == "database"
+    assert report["written_by"] == "model/a" and report["removed_claims"] == 1
+    assert set(report["figures"]) == {"metrics.svg"}
+    assert client.get(report["download_url"]).data.startswith(b"# Reproducing Paper")
+    assert client.get(report["facts_download_url"]).data == b"{}"
+    assert deck["name"] == "slides.pptx" and deck["written_by"] == "model/b"
+    assert client.get(deck["download_url"]).data[:2] == b"PK"
+
+
+def test_report_figure_is_served_as_an_image_that_cannot_run_scripts(client, finished_run):
+    url = client.get(f"/api/report?run={finished_run}").get_json()["report"]["figures"]["metrics.svg"]
+    response = client.get(url)
+    assert response.mimetype == "image/svg+xml"
+    assert "default-src 'none'" in response.headers["Content-Security-Policy"]
+    response.close()
+
+
+def test_slides_are_read_from_the_pptx(client, finished_run):
+    deck = client.get(client.get(f"/api/report?run={finished_run}").get_json()["presentation"]["slides_url"]).get_json()
+    assert round(deck["width_pt"]) == 960 and round(deck["height_pt"]) == 540
+    [slide] = deck["slides"]
+    assert slide["title"] == "Comparison" and slide["notes"] == "Source: evaluation.metrics."
+    by_type = {s["type"]: s for s in slide["shapes"]}
+    assert by_type["text"]["paragraphs"][0]["runs"][0]["size"] == 30
+    assert [[c["paragraphs"][0]["runs"][0]["text"] for c in row] for row in by_type["table"]["rows"]] == \
+        [["Metric", "Reproduced"], ["accuracy", "0.94"]]
+    chart = by_type["chart"]
+    assert chart["horizontal"] and chart["categories"] == ["accuracy"]
+    assert [(s["name"], s["values"]) for s in chart["series"]] == [("Published", [0.95]), ("Reproduced", [0.94])]
+    assert 0 < by_type["chart"]["x"] < 1 and 0 < by_type["chart"]["w"] < 1
+
+
+def test_only_pptx_files_are_read_as_slides(client, finished_run):
+    report_id = client.get(f"/api/report?run={finished_run}").get_json()["report"]["id"]
+    assert client.get(f"/api/artifacts/{report_id}/slides").status_code == 400
+
+
+def test_run_without_report_has_none_and_names_turned_off_agents(client, two_runs, repo):
+    _write(repo / "logs" / "master_agent_log.json", json.dumps([
+        {"action": "Approval", "target": "Report Agent", "decision": "Skipped", "timestamp": "2026-01-01T10:30:00+00:00"},
+    ]))
+    assert client.get(f"/api/report?run={two_runs['a']}").get_json() == \
+        {"report": None, "presentation": None, "turned_off": ["Report Agent"]}
+    assert client.get("/api/report").get_json()["turned_off"] == []

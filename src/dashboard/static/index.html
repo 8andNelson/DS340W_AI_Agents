@@ -35,6 +35,7 @@
       <a href="#datasets" data-view="datasets">Datasets</a>
       <a href="#scripts" data-view="scripts">Scripts</a>
       <a href="#documents" data-view="documents">Documents</a>
+      <a href="#report" data-view="report">Report &amp; slides</a>
       <a href="#activity" data-view="activity">Master Agent log</a>
       <a href="#runs" data-view="runs" class="nav-runs">Run history</a>
       <a href="#compare" data-view="compare">Compare runs</a>
@@ -183,6 +184,20 @@
         <div class="list" id="pdf-list"></div>
         <div class="detail pdf-detail" id="pdf-detail"></div>
       </div>
+    </section>
+
+    <!-- Report and slides -->
+    <section class="view" id="view-report" hidden>
+      <header class="view-head">
+        <h1>Report &amp; slides</h1>
+        <p class="muted">The final report the Report Agent wrote and the slides the Presentation Agent built for this run, exactly as the run recorded them.</p>
+      </header>
+      <div class="filters" id="report-tabs">
+        <button class="chip active" data-tab="report">Report</button>
+        <button class="chip" data-tab="slides">Slides</button>
+      </div>
+      <div id="report-pane"></div>
+      <div id="slides-pane" hidden></div>
     </section>
 
     <!-- Activity -->
