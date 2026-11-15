@@ -48,6 +48,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -58,12 +59,12 @@ import pandas as pd
 from src import llm
 from src.agents.evaluation_agent import METRIC_LINE_FORMAT, parse_metric_lines
 from src.search import paper_fulltext
+from src.orchestration import repo_dependencies, repo_review
 from src.orchestration.handoff import request as handoff_request
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 REPLICATION_DIR = REPO_ROOT / "replication"
 
-CLONE_TIMEOUT_SECONDS = 120
 VENV_TIMEOUT_SECONDS = 120
 INSTALL_TIMEOUT_SECONDS = 600
 REPLICATION_TIMEOUT_SECONDS = 1800
@@ -76,6 +77,22 @@ PROFILE_SAMPLE_ROWS = 2000
 PROFILE_MAX_COLUMNS = 60
 STDERR_FEEDBACK_CHARS = 3000
 PAPER_EXCERPT_CHARS = 12000
+
+# When a cloned repository's pinned dependencies do not install on the
+# pipeline's own Python (a live run: pandas==2.2.3 has no wheel for Python
+# 3.14, so pip built it from source and failed), its venv is made again
+# with each older Python installed here, newest first.
+FALLBACK_PYTHON_VERSIONS = ("3.13", "3.12", "3.11", "3.10")
+
+# A cloned repository that fails gets ONE repair (missing packages, then one
+# checked LLM-proposed fix from a fixed menu) and one more run; after that
+# the baseline is reconstructed from the paper (run()).
+MAX_FIX_ACTIONS = 5
+MAX_MISSING_MODULE_INSTALLS = 5
+DATA_SPLITS = ("train", "test", "validation", "master")
+SHELL_CHARACTERS = re.compile(r"[;&|<>`$\n\r]")
+ALLOWED_MODULES = ("jupyter", "nbconvert")
+DEPENDENCY_FILENAMES = ("requirements.txt", "pyproject.toml", "setup.py", "environment.yml", "Pipfile")
 
 ENTRY_POINT_CANDIDATES = ("train.py", "main.py", "run.py", "run_experiment.py")
 README_FILENAMES = ("README.md", "README.rst", "README.txt", "readme.md")
@@ -124,6 +141,9 @@ _RESULT_DEFAULTS = {
     "revision_round": 0,           # 0 = first baseline; n = revised on an Evaluation Agent request
     "revision_instructions": [],
     "fast_mode_from": None,        # memory id of a past script adapted in fast mode (src/memory/recall.py)
+    "repository_review": None,     # Master Agent's review of a cloned repository: {"verdict", "commit_sha", "summary"}
+    "repository_failed": False,    # a cloned repository did not run, even after one repair
+    "repository_fallback": None,   # {"repo_url", "commit_sha", "reason", "warnings"} when it did not, and the baseline was reconstructed
     "warnings": [],
     "notes": "",
 }
@@ -162,9 +182,11 @@ def _run_bounded(cmd: list, cwd: Path = None, timeout: int = REPLICATION_TIMEOUT
 
     The child runs in UTF-8 mode: on Windows a piped child otherwise
     encodes stdout as cp1252 and crashes on the first non-ASCII character
-    a generated script prints."""
+    a generated script prints. It never gets the project's secrets
+    (repo_review.child_environment): it may be code from the internet, pip
+    running a setup.py, or an LLM-written script."""
     start = time.monotonic()
-    child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", **(env or {})}
+    child_env = repo_review.child_environment({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", **(env or {})})
     try:
         proc = subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, timeout=timeout,
@@ -193,17 +215,34 @@ def _as_text(output) -> str:
     return output or ""
 
 
-def _clone_repo(repo_url: str, dest: Path) -> dict:
-    clone_result = _run_bounded(["git", "clone", "--depth", "1", repo_url, str(dest)], timeout=CLONE_TIMEOUT_SECONDS)
-    if clone_result["exit_code"] != 0:
-        return {"ok": False, "error": clone_result["stderr"] or clone_result["stdout"], "commit_sha": ""}
-    sha_result = _run_bounded(["git", "rev-parse", "HEAD"], cwd=dest, timeout=30)
-    commit_sha = sha_result["stdout"].strip() if sha_result["exit_code"] == 0 else ""
-    return {"ok": True, "error": "", "commit_sha": commit_sha}
+def _remove_tree(path: Path) -> None:
+    """shutil.rmtree that also deletes read-only files. git marks the files
+    under .git/objects/ read-only, and on Windows a plain rmtree then fails
+    with "Access is denied" (a live run lost 4 of its 5 attempts to this)."""
+    def _make_writable_and_retry(func, target, _exc):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    shutil.rmtree(path, onexc=_make_writable_and_retry)
 
 
-def _create_venv(venv_dir: Path) -> dict:
-    return _run_bounded([sys.executable, "-m", "venv", str(venv_dir)], timeout=VENV_TIMEOUT_SECONDS)
+def _create_venv(venv_dir: Path, python: str = None) -> dict:
+    return _run_bounded([python or sys.executable, "-m", "venv", str(venv_dir)], timeout=VENV_TIMEOUT_SECONDS)
+
+
+def _find_python(version: str) -> str:
+    """The path of an installed Python <version>, or "" if there is none."""
+    if os.name == "nt":
+        found = _run_bounded(["py", f"-{version}", "-c", "import sys; print(sys.executable)"], timeout=30)
+        return found["stdout"].strip() if found["exit_code"] == 0 else ""
+    return shutil.which(f"python{version}") or ""
+
+
+def _fallback_pythons() -> list:
+    """[(version, path)] of the installed Pythons older than this one, from
+    FALLBACK_PYTHON_VERSIONS, newest first."""
+    older = [v for v in FALLBACK_PYTHON_VERSIONS if tuple(map(int, v.split("."))) < sys.version_info[:2]]
+    return [(v, path) for v in older if (path := _find_python(v))]
 
 
 def _pip_install(venv_dir: Path, cwd: Path, install_args: list) -> dict:
@@ -328,66 +367,331 @@ def _write_notes_doc(recon_dir: Path, inferred_assumptions: list) -> None:
     (recon_dir / "RECONSTRUCTION_NOTES.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def _get_repository_code(repository: dict, dest: Path) -> dict:
+    """A copy of the clone Master Agent reviewed (repo_review), never a new
+    download: the files that run are the files that were checked. Returns
+    {"ok", "error", "commit_sha"}."""
+    review = (repository or {}).get("review") or {}
+    if review.get("verdict") not in repo_review.APPROVED_VERDICTS:
+        return {"ok": False, "commit_sha": "",
+                "error": f"Master Agent has not approved this repository ({review.get('verdict') or 'not reviewed'}"
+                         + (f": {review['summary']}" if review.get("summary") else "") + ")."}
+    source = Path(review.get("clone_dir") or "")
+    if not review.get("clone_dir") or not source.is_dir():
+        return {"ok": False, "commit_sha": "", "error": f"The reviewed clone {source} is missing."}
+    shutil.copytree(source, dest, symlinks=True)
+    sha = _run_bounded(["git", "rev-parse", "HEAD"], cwd=dest, timeout=30)
+    commit_sha = sha["stdout"].strip() if sha["exit_code"] == 0 else ""
+    if not commit_sha or commit_sha != review.get("commit_sha"):
+        return {"ok": False, "commit_sha": commit_sha,
+                "error": f"The copy is at commit {commit_sha or 'unknown'}, not the reviewed {review.get('commit_sha')}."}
+    return {"ok": True, "error": "", "commit_sha": commit_sha}
+
+
+def _declared_dependency_files(repo_dir: Path) -> list:
+    """The dependency files in the copy itself (Code Discovery's GitHub
+    listing can be out of date)."""
+    return [name for name in DEPENDENCY_FILENAMES if (repo_dir / name).is_file()]
+
+
+def _install_relaxed_requirements(venv_dir: Path, repo_dir: Path) -> tuple:
+    """Install requirements.txt one line at a time; a pinned line that fails
+    is installed without its pin. Returns (ok, modifications, failed lines)."""
+    modifications, failed = [], []
+    for req in repo_dependencies.parse_requirements(repo_dir / "requirements.txt"):
+        if req["kind"] != "pypi":
+            failed.append(req["line"])
+            continue
+        if _pip_install(venv_dir, repo_dir, ["install", req["line"]])["exit_code"] == 0:
+            continue
+        if req["spec"] and _pip_install(venv_dir, repo_dir, ["install", req["name"]])["exit_code"] == 0:
+            modifications.append(f"Installed {req['name']} without the pin '{req['line']}': the pinned version "
+                                 "does not install in this environment.")
+            continue
+        failed.append(req["line"])
+    return not failed, modifications, failed
+
+
+def _setup_repository_environment(repo_dir: Path, venv_dir: Path, repository: dict) -> dict:
+    """A new venv with everything the repository needs: its declared
+    dependencies, then the packages its code imports but does not declare.
+
+    Declared dependencies are tried in this order, stopping at the first
+    that installs:
+      1. pre-built wheels only (--only-binary=:all:) on this Python, then on
+         each older installed Python (FALLBACK_PYTHON_VERSIONS) -- a pin with
+         no wheel fails in seconds, not after a long source build (a live
+         run spent minutes compiling pandas 2.2.3 for Python 3.14);
+      2. a normal install on this Python (source builds allowed);
+      3. requirements.txt one line at a time, a pin that cannot install
+         relaxed (recorded, not hidden).
+    A project install (pip install .) has no wheel-only step.
+    Returns {"ok", "error", "python", "install", "modifications", "warnings"}."""
+    env = {"ok": False, "error": "", "python": sys.executable, "install": "", "modifications": [], "warnings": []}
+    current = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    def fresh_venv(python: str = None) -> bool:
+        if venv_dir.exists():
+            _remove_tree(venv_dir)
+        return _create_venv(venv_dir, python)["exit_code"] == 0
+
+    if _create_venv(venv_dir)["exit_code"] != 0:
+        env["error"] = "Virtualenv creation failed."
+        return env
+
+    install_args, not_installed = _select_dependency_install(_declared_dependency_files(repo_dir))
+    if install_args is None:
+        env["warnings"].append(f"{not_installed} The packages the code imports are installed instead.")
+    else:
+        env["install"] = " ".join(install_args)
+        requirements = install_args[:2] == ["install", "-r"]
+        pythons = [(current, sys.executable)] + _fallback_pythons()
+        if requirements:
+            attempts = [(v, py, ["install", "--only-binary=:all:", *install_args[1:]]) for v, py in pythons] \
+                + [(current, sys.executable, install_args)]
+        else:
+            attempts = [(v, py, install_args) for v, py in pythons]
+        install_result = None
+        for i, (version, python, args) in enumerate(attempts):
+            if i and not fresh_venv(None if python == sys.executable else python):
+                continue
+            install_result = _pip_install(venv_dir, repo_dir, args)
+            if install_result["exit_code"] == 0:
+                if python != sys.executable:
+                    env["python"] = python
+                    env["modifications"].append(
+                        f"Made the environment with Python {version} ({python}): the repository's dependencies "
+                        f"do not install on Python {current}.")
+                break
+            if i + 1 < len(attempts):
+                following = attempts[i + 1]
+                how = "with source builds allowed" if "--only-binary=:all:" not in following[2] else "from wheels"
+                env["warnings"].append(f"Dependency installation failed on Python {version}; trying Python "
+                                       f"{following[0]} {how}.")
+                print(f"[Replication Agent] {env['warnings'][-1]}")
+        stderr = (install_result or {}).get("stderr") or ""
+        if (install_result or {}).get("exit_code") != 0 and requirements:
+            env["warnings"].append("Dependency installation still failed; installing the requirements one at a "
+                                   "time and relaxing pins that cannot install.")
+            print(f"[Replication Agent] {env['warnings'][-1]}")
+            if not venv_dir.exists() and _create_venv(venv_dir)["exit_code"] != 0:
+                env["error"] = "Virtualenv creation failed."
+                return env
+            ok, relaxed, failed = _install_relaxed_requirements(venv_dir, repo_dir)
+            env["modifications"] += relaxed
+            if not ok:
+                env["error"] = f"Dependency installation failed for: {', '.join(failed)}. {stderr[-1500:]}"
+                return env
+        elif (install_result or {}).get("exit_code") != 0:
+            env["error"] = f"Dependency installation failed: {stderr[-2000:] or 'no environment could be made'}"
+            return env
+
+    declared = {r["name"] for r in repo_dependencies.declared_requirements(repo_dir) if r["name"]}
+    imported, unknown = repo_dependencies.imported_packages(repo_dir)
+    for package in [p for p in imported if repo_dependencies.normalize(p) not in declared]:
+        if _pip_install(venv_dir, repo_dir, ["install", package])["exit_code"] == 0:
+            env["modifications"].append(f"Installed {package}: the code imports it, but the repository does not "
+                                        "declare it.")
+        else:
+            env["warnings"].append(f"Could not install {package}, which the code imports.")
+    if unknown:
+        env["warnings"].append(f"Imports with no known package, not installed: {', '.join(unknown[:20])}.")
+    env["ok"] = True
+    return env
+
+
+def _run_installing_missing_modules(command: list, repo_dir: Path, venv_dir: Path, env: dict,
+                                    modifications: list) -> dict:
+    """Run the command; when it stops on a ModuleNotFoundError for a known
+    package, install that package and run again (at most
+    MAX_MISSING_MODULE_INSTALLS times)."""
+    tried = set()
+    while True:
+        result = _run_bounded(command, cwd=repo_dir, timeout=REPLICATION_TIMEOUT_SECONDS, env=env)
+        if result["exit_code"] == 0 or result["timed_out"] or len(tried) >= MAX_MISSING_MODULE_INSTALLS:
+            return result
+        package = repo_dependencies.IMPORT_TO_PACKAGE.get(repo_dependencies.missing_module(result["stderr"]))
+        if not package or package in tried:
+            return result
+        tried.add(package)
+        print(f"[Replication Agent] The run needs {package}; installing it and running again.")
+        if _pip_install(venv_dir, repo_dir, ["install", package])["exit_code"] != 0:
+            return result
+        modifications.append(f"Installed {package}: the run stopped on a ModuleNotFoundError for it.")
+
+
+def _repo_file_list(repo_dir: Path, limit: int = 200) -> list:
+    return sorted("/".join(p.relative_to(repo_dir).parts) for p in repo_dir.rglob("*")
+                  if p.is_file() and ".git" not in p.relative_to(repo_dir).parts)[:limit]
+
+
+def _propose_repository_fix(paper_title: str, repo_dir: Path, command: list, failure: str,
+                            cleaning_result: dict) -> dict:
+    """One LLM call: what change from a fixed menu would make the authors'
+    code run? Returns {"diagnosis", "actions"}; every action is then
+    checked by _check_fix_actions before anything is applied."""
+    splits = {split: (cleaning_result or {}).get(f"{split}_csv_path") for split in DATA_SPLITS}
+    prompt = f"""You are making a research paper's own code repository run, without changing its method.
+
+Paper: "{paper_title}"
+Command that was run: {command or "none -- no entry point was found"}
+Failure (stderr/stdout tail):
+{(failure or '')[-STDERR_FEEDBACK_CHARS:]}
+
+Repository files:
+{chr(10).join(_repo_file_list(repo_dir))}
+
+README:
+{_read_readme(repo_dir) or "(none)"}
+
+The project's prepared data (CSV files you may copy into the repository): {splits}
+
+Choose at most {MAX_FIX_ACTIONS} actions, only from these types:
+  {{"type": "install", "packages": ["pypi-name", ...]}}  -- a missing third-party package
+  {{"type": "command", "command": ["python", "path/in/repo.py", "--arg", "value"]}}  -- the right script/arguments
+  {{"type": "copy_data", "split": "train|test|validation|master", "dest": "relative/path/in/repo.csv"}}  -- put the data where the code reads it
+Never edit the repository's code, never change the model or its hyperparameters, never use a shell.
+Return ONLY JSON: {{"diagnosis": "one sentence", "actions": [...]}} (actions [] if no listed action can fix it)."""
+    try:
+        content = llm.chat(prompt, timeout=GENERATION_TIMEOUT_SECONDS, agent="replication_agent")
+    except Exception as e:
+        return {"diagnosis": f"The fix could not be proposed ({type(e).__name__}: {e}).", "actions": []}
+    data = llm.parse_json(content, default={})
+    data = data if isinstance(data, dict) else {}
+    actions = data.get("actions") if isinstance(data.get("actions"), list) else []
+    return {"diagnosis": str(data.get("diagnosis") or ""), "actions": actions[:MAX_FIX_ACTIONS]}
+
+
+def _inside(repo_dir: Path, relative: str) -> Path | None:
+    """repo_dir/relative when it stays inside the repository (and out of .git)."""
+    if not relative or Path(relative).is_absolute() or Path(relative).drive:
+        return None
+    target = (repo_dir / relative).resolve()
+    root = repo_dir.resolve()
+    if target != root and root not in target.parents:
+        return None
+    if ".git" in target.relative_to(root).parts:
+        return None
+    return target
+
+
+def _check_fix_actions(actions: list, repo_dir: Path, cleaning_result: dict) -> tuple:
+    """(accepted, rejected reasons). Deterministic: a package must be a known
+    one (never a guessed name), a command must run the venv's Python on a
+    script inside the repository (or jupyter nbconvert) with no shell
+    characters, and data may be copied only to a .csv inside it."""
+    accepted, rejected = [], []
+    data_paths = {str((cleaning_result or {}).get(f"{s}_csv_path") or "") for s in DATA_SPLITS} - {""}
+    known = {repo_dependencies.normalize(k) for k in repo_dependencies.KNOWN_PACKAGES}
+    for action in actions:
+        kind = action.get("type") if isinstance(action, dict) else None
+        if kind == "install":
+            packages = [str(p) for p in action.get("packages") or []]
+            unknown = [p for p in packages if repo_dependencies.normalize(p) not in known]
+            if not packages or unknown:
+                rejected.append(f"install {packages}: not a known package ({', '.join(unknown) or 'none given'})")
+            else:
+                accepted.append({"type": "install", "packages": packages})
+        elif kind == "command":
+            command = [str(a) for a in action.get("command") or []]
+            ok = len(command) >= 2 and command[0] in ("python", "python3") and not any(
+                SHELL_CHARACTERS.search(a) for a in command)
+            if ok and command[1] == "-m":
+                ok = len(command) >= 3 and command[2] in ALLOWED_MODULES
+            elif ok:
+                script = _inside(repo_dir, command[1])
+                ok = bool(script and script.is_file() and script.suffix == ".py")
+            ok = ok and all(not Path(a).is_absolute() or a in data_paths for a in command[1:])
+            if ok:
+                accepted.append({"type": "command", "command": command})
+            else:
+                rejected.append(f"command {command}: not the venv's Python on a script inside the repository")
+        elif kind == "copy_data":
+            split, dest = str(action.get("split") or ""), str(action.get("dest") or "")
+            target = _inside(repo_dir, dest)
+            source = (cleaning_result or {}).get(f"{split}_csv_path")
+            if split in DATA_SPLITS and source and Path(source).is_file() and target and target.suffix == ".csv":
+                accepted.append({"type": "copy_data", "split": split, "dest": dest})
+            else:
+                rejected.append(f"copy_data {split} -> {dest}: not a prepared split copied to a .csv in the repository")
+        else:
+            rejected.append(f"{action}: not an allowed action type")
+    return accepted, rejected
+
+
+def _apply_fix_actions(actions: list, repo_dir: Path, venv_dir: Path, cleaning_result: dict,
+                       command: list) -> tuple:
+    """Apply checked actions. Returns (command, modifications)."""
+    modifications = []
+    for action in actions:
+        if action["type"] == "install":
+            for package in action["packages"]:
+                if _pip_install(venv_dir, repo_dir, ["install", package])["exit_code"] == 0:
+                    modifications.append(f"Repair: installed {package}.")
+        elif action["type"] == "command":
+            command = [str(_venv_python(venv_dir)), *action["command"][1:]]
+            modifications.append(f"Repair: ran {' '.join(action['command'])} instead.")
+        elif action["type"] == "copy_data":
+            target = _inside(repo_dir, action["dest"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(cleaning_result[f"{action['split']}_csv_path"], target)
+            modifications.append(f"Repair: copied the {action['split']} split to {action['dest']}.")
+    return command, modifications
+
+
 def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_result: dict) -> dict:
+    """Run the authors' code. Any failure (code not approved, environment,
+    no entry point, a failing run) gets one repair -- missing packages are
+    installed, then one checked LLM-proposed fix -- and one more run. A
+    repository that still does not run is marked repository_failed, and run()
+    reconstructs the baseline from the paper instead."""
     paper_title = (parent_paper or {}).get("title", "")
     repo_url = repository.get("repo_url", "")
     slug_dir = REPLICATION_DIR / _slugify(paper_title or repo_url)
     repo_dir = slug_dir / "repo"
     venv_dir = slug_dir / "venv"
     warnings = []
+    review = repository.get("review") or {}
+    base = {"source": "cloned_repository", "repo_url": repo_url, "replication_dir": str(slug_dir),
+            "repository_review": {k: review.get(k) for k in ("verdict", "commit_sha", "summary")} if review else None}
 
-    print(f"\n[Replication Agent] Cloning {repo_url} for baseline replication...")
+    def failed(notes: str, warning: str, **extra) -> dict:
+        print(f"[Replication Agent] {notes} {warning}")
+        return _default_result(status=extra.pop("status", "BLOCKED"), **base, warnings=warnings + [warning],
+                               notes=notes, repository_failed=True, **extra)
+
+    print(f"\n[Replication Agent] Preparing the reviewed copy of {repo_url} for baseline replication...")
     slug_dir.mkdir(parents=True, exist_ok=True)
     if repo_dir.exists():
-        shutil.rmtree(repo_dir)
+        _remove_tree(repo_dir)
+    # A venv left by an earlier attempt can come from another Python (see
+    # FALLBACK_PYTHON_VERSIONS); its packages would look installed and fail
+    # at run time, so every attempt starts from a new venv.
+    if venv_dir.exists():
+        _remove_tree(venv_dir)
 
-    clone = _clone_repo(repo_url, repo_dir)
-    if not clone["ok"]:
-        print(f"[Replication Agent] Clone failed: {clone['error']}")
-        return _default_result(
-            status="BLOCKED", source="cloned_repository", repo_url=repo_url, replication_dir=str(slug_dir),
-            warnings=[f"Clone failed: {clone['error']}"], notes="Could not clone the discovered repository.",
-        )
+    code = _get_repository_code(repository, repo_dir)
+    if not code["ok"]:
+        return failed("The repository's code cannot be used.", code["error"], commit_sha=code["commit_sha"])
+    commit = {"commit_sha": code["commit_sha"]}
 
-    venv_result = _create_venv(venv_dir)
-    if venv_result["exit_code"] != 0:
-        return _default_result(
-            status="BLOCKED", source="cloned_repository", repo_url=repo_url, commit_sha=clone["commit_sha"],
-            replication_dir=str(slug_dir),
-            warnings=[f"Virtualenv creation failed: {venv_result['stderr'] or venv_result['stdout']}"],
-            notes="Could not create an isolated environment for the cloned repo.",
-        )
-
-    install_args, blocked_reason = _select_dependency_install(repository.get("dependency_files", []))
-    if install_args is None:
-        return _default_result(
-            status="BLOCKED", source="cloned_repository", repo_url=repo_url, commit_sha=clone["commit_sha"],
-            replication_dir=str(slug_dir), warnings=[blocked_reason],
-            notes="Dependency installation could not proceed.",
-        )
-
-    install_result = _pip_install(venv_dir, repo_dir, install_args)
+    env = _setup_repository_environment(repo_dir, venv_dir, repository)
+    warnings += env["warnings"]
     pip_freeze_path = slug_dir / "pip_freeze.txt"
-    pip_freeze_path.write_text(_pip_freeze(venv_dir), encoding="utf-8")
-    if install_result["exit_code"] != 0:
-        return _default_result(
-            status="BLOCKED", source="cloned_repository", repo_url=repo_url, commit_sha=clone["commit_sha"],
-            replication_dir=str(slug_dir), pip_freeze_path=str(pip_freeze_path),
-            warnings=[f"Dependency installation failed: {(install_result['stderr'] or '')[-2000:]}"],
-            notes="pip install failed for the discovered dependency file.",
-        )
+    pip_freeze_path.write_text(_pip_freeze(venv_dir) if venv_dir.exists() else "", encoding="utf-8")
+    if not env["ok"]:
+        return failed("The repository's environment could not be set up.", env["error"], **commit,
+                      pip_freeze_path=str(pip_freeze_path), modifications=env["modifications"])
 
     entry_point = _detect_entry_point_by_convention(repo_dir)
     entry_point_source = "convention" if entry_point else ""
     command = [str(_venv_python(venv_dir)), entry_point] if entry_point else None
-
     if not command:
         readme_command = _extract_entry_point_from_readme(repo_dir, paper_title)
         if readme_command:
             # The LLM returns a bare "python"/"python3" token -- substitute
             # the isolated venv's own interpreter so the dependencies just
-            # installed into it are actually the ones used, same as the
-            # convention-detected case above.
+            # installed into it are actually the ones used.
             if readme_command[0] in ("python", "python3"):
                 command = [str(_venv_python(venv_dir)), *readme_command[1:]]
             else:
@@ -395,44 +699,60 @@ def _replicate_from_repository(parent_paper: dict, repository: dict, cleaning_re
             entry_point = " ".join(readme_command)
             entry_point_source = "readme_llm"
 
-    if not command:
-        return _default_result(
-            status="BLOCKED", source="cloned_repository", repo_url=repo_url, commit_sha=clone["commit_sha"],
-            replication_dir=str(slug_dir), pip_freeze_path=str(pip_freeze_path),
-            warnings=["No entry point could be determined (no conventional filename, nothing documented in the README)."],
-            notes="Could not determine how to run this repository.",
-        )
-
-    modifications = _wire_dataset_into_repo(repo_dir, cleaning_result)
-    if not modifications:
+    wired = _wire_dataset_into_repo(repo_dir, cleaning_result)
+    modifications = env["modifications"] + wired
+    if not wired:
         warnings.append("No conventional data/ directory found in the repo; running unmodified -- "
-                         "dataset path may need manual wiring if the run fails.")
+                        "dataset path may need manual wiring if the run fails.")
+    run_env = data_env(cleaning_result)
 
-    print(f"[Replication Agent] Running: {' '.join(command)}")
-    run_result = _run_bounded(command, cwd=repo_dir, timeout=REPLICATION_TIMEOUT_SECONDS)
-    stdout_path, stderr_path = _save_run_output(slug_dir, run_result)
+    run_result = None
+    if command:
+        print(f"[Replication Agent] Running: {' '.join(command)}")
+        run_result = _run_installing_missing_modules(command, repo_dir, venv_dir, run_env, modifications)
+    if run_result is None or (run_result["exit_code"] != 0 and not run_result["timed_out"]):
+        failure = (run_result["stderr"] or run_result["stdout"]) if run_result else \
+            "No entry point could be determined (no conventional filename, nothing documented in the README)."
+        print("[Replication Agent] The repository did not run; trying one repair.")
+        fix = _propose_repository_fix(paper_title, repo_dir, command, failure, cleaning_result)
+        actions, rejected = _check_fix_actions(fix["actions"], repo_dir, cleaning_result)
+        warnings += [f"Repair action rejected: {r}" for r in rejected]
+        if fix["diagnosis"]:
+            warnings.append(f"Repair diagnosis: {fix['diagnosis']}")
+        if actions:
+            command, applied = _apply_fix_actions(actions, repo_dir, venv_dir, cleaning_result, command)
+            modifications += applied
+            if any(a["type"] == "command" for a in actions):
+                entry_point, entry_point_source = " ".join(command[1:]), "repair_llm"
+        if command and actions:
+            print(f"[Replication Agent] Running again after the repair: {' '.join(command)}")
+            run_result = _run_installing_missing_modules(command, repo_dir, venv_dir, run_env, modifications)
+
     _write_environment_doc(slug_dir, {
-        "Source": "cloned_repository", "Repository": repo_url, "Commit": clone["commit_sha"],
-        "Entry point": entry_point, "Command": " ".join(command), "Dependency install": " ".join(install_args),
+        "Source": "cloned_repository", "Repository": repo_url, "Commit": code["commit_sha"],
+        "Master Agent review": review.get("summary", ""), "Entry point": entry_point,
+        "Command": " ".join(command or []), "Dependency install": env["install"] or "none declared",
+        "Venv Python": env["python"], "Modifications": "; ".join(modifications) or "none",
     })
+    if run_result is None:
+        return failed("Could not determine how to run this repository.",
+                      "No entry point could be determined, and the repair found none.", **commit,
+                      pip_freeze_path=str(pip_freeze_path), modifications=modifications)
 
+    stdout_path, stderr_path = _save_run_output(slug_dir, run_result)
+    result = dict(**commit, entry_point=entry_point, entry_point_source=entry_point_source, command=command,
+                  exit_code=run_result["exit_code"], stdout_path=stdout_path, stderr_path=stderr_path,
+                  duration_seconds=run_result["duration_seconds"], pip_freeze_path=str(pip_freeze_path),
+                  modifications=modifications)
     if run_result["timed_out"]:
-        status = "TIMEOUT"
-    elif run_result["exit_code"] == 0:
-        status = "OK"
-    else:
-        status = "BLOCKED"
-        warnings.append(f"Entry point exited with code {run_result['exit_code']}.")
+        return failed("The repository's run timed out.",
+                      f"No result within {REPLICATION_TIMEOUT_SECONDS}s.", status="TIMEOUT", **result)
+    if run_result["exit_code"] != 0:
+        return failed("The repository still fails after one repair.",
+                      f"Entry point exited with code {run_result['exit_code']}.", **result)
 
-    print(f"[Replication Agent] Done. status={status}, exit_code={run_result['exit_code']}.")
-
-    return _default_result(
-        status=status, source="cloned_repository", repo_url=repo_url, commit_sha=clone["commit_sha"],
-        replication_dir=str(slug_dir), entry_point=entry_point, entry_point_source=entry_point_source,
-        command=command, exit_code=run_result["exit_code"], stdout_path=stdout_path, stderr_path=stderr_path,
-        duration_seconds=run_result["duration_seconds"], pip_freeze_path=str(pip_freeze_path),
-        modifications=modifications, warnings=warnings,
-    )
+    print(f"[Replication Agent] Done. status=OK, exit_code={run_result['exit_code']}.")
+    return _default_result(status="OK", **base, warnings=warnings, **result)
 
 
 def _dataset_profile(cleaning_result: dict) -> str:
@@ -873,6 +1193,11 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
     )
 
 
+# Repositories that did not run in this process, by (replication folder,
+# URL, reviewed commit) -> their repository_fallback record.
+_FAILED_REPOSITORIES = {}
+
+
 def run(parent_paper: dict, code_discovery_result: dict, cleaning_result: dict, revision: dict = None) -> dict:
     """
     Establish the baseline reproduction: run the discovered repository if
@@ -886,12 +1211,44 @@ def run(parent_paper: dict, code_discovery_result: dict, cleaning_result: dict, 
     defects; with reuse_script (after the Data Agent collected more data),
     the same script runs again on the new data. A cloned repository is
     never revised (it is the authors' code); it is simply run again.
+
+    A cloned repository that does not run, even after one repair (see
+    _replicate_from_repository), is not usable code, so the baseline is
+    reconstructed from the paper instead (CLAUDE.md's Preferred
+    Implementation Order, step 6); the repository's failure is kept in
+    repository_fallback and the warnings. A repository that failed once is
+    not tried again in this process: Master Agent's later attempts go
+    straight to the reconstruction.
     """
     code_discovery_result = code_discovery_result or {}
     cleaning_result = cleaning_result or {}
-    if code_discovery_result.get("status") == "FOUND" and code_discovery_result.get("repository"):
-        result = _replicate_from_repository(parent_paper, code_discovery_result["repository"], cleaning_result)
-        if revision and revision.get("instructions"):
+    repository = code_discovery_result.get("repository")
+    if code_discovery_result.get("status") == "FOUND" and repository:
+        key = (str(REPLICATION_DIR), repository.get("repo_url", ""),
+               (repository.get("review") or {}).get("commit_sha", ""))
+        repository_fallback = _FAILED_REPOSITORIES.get(key)
+        result = None
+        if repository_fallback is None:
+            result = _replicate_from_repository(parent_paper, repository, cleaning_result)
+            if result.get("repository_failed"):
+                repository_fallback = {"repo_url": result["repo_url"], "commit_sha": result["commit_sha"],
+                                       "reason": result["notes"], "warnings": list(result["warnings"])}
+                _FAILED_REPOSITORIES[key] = repository_fallback
+                # The reconstruction reuses this venv; the repository's pinned
+                # packages (or an older Python) must not carry over into it.
+                failed_venv = Path(result["replication_dir"]) / "venv"
+                if result.get("replication_dir") and failed_venv.exists():
+                    _remove_tree(failed_venv)
+        if repository_fallback is not None:
+            print(f"[Replication Agent] The repository does not run ({repository_fallback['reason']}); "
+                  "reconstructing the baseline from the paper instead.")
+            result = _replicate_by_reconstruction(parent_paper, cleaning_result, revision)
+            result["repository_fallback"] = repository_fallback
+            result["warnings"] = [
+                f"The discovered repository {repository_fallback['repo_url']} did not run "
+                f"({repository_fallback['reason']}), so the baseline was reconstructed from the paper."
+            ] + repository_fallback["warnings"] + list(result.get("warnings") or [])
+        elif revision and revision.get("instructions"):
             result["warnings"] = list(result.get("warnings") or []) + [
                 "Revision not applied: the cloned repository is the authors' own code and is preserved as the "
                 "baseline. Requested fixes: " + "; ".join(map(str, revision["instructions"]))]

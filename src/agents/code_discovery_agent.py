@@ -26,14 +26,21 @@ dependency files pulled from GitHub's public REST API (no token
 required); non-GitHub matches (Kaggle, GitLab, Papers with Code) are
 recorded with whatever the search result itself provided, since this
 agent's job is identification, not deep repo inspection.
+
+A search hit (or a cached one) is accepted only with deterministic
+provenance (_check_provenance): the Parent Paper's own text cites the
+repository's URL, or the GitHub owner is one of the paper's authors. The
+LLM match alone is not enough -- in a live run it accepted another
+student's course project that "re-runs" the paper as the authors' code.
 """
 import json
 import re
+import unicodedata
 
 import requests
 
 from src import llm
-from src.search import web_search
+from src.search import paper_fulltext, web_search
 from src.orchestration import code_discovery_cache
 from src.agents.validation_agent import _check_url_reachable
 from src.orchestration.handoff import request as handoff_request
@@ -61,8 +68,14 @@ _REPO_DEFAULTS = {
     "has_setup_instructions": False,
     "stars": None,
     "default_branch": "",
+    "provenance": "",              # "paper_stated" | "cited_in_paper" | "author_owned" | "" (none found)
+    "provenance_evidence": "",
     "notes": "",
 }
+
+# An author name is matched against a GitHub login only when the joined
+# first+last name is at least this long ("liwei" in a login is too weak).
+MIN_LOGIN_NAME_CHARS = 6
 
 
 def _default_repo(**overrides) -> dict:
@@ -158,6 +171,87 @@ def _enrich_github_repo(repo_dict: dict, owner: str, repo: str) -> None:
     repo_dict["has_setup_instructions"] = has_readme and bool(repo_dict["dependency_files"])
 
 
+def _fetch_github_owner_name(owner: str) -> str:
+    """The display name on a GitHub user/org profile. Never raises;
+    returns "" on any failure."""
+    try:
+        resp = requests.get(
+            f"https://api.github.com/users/{owner}",
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=GITHUB_API_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return ""
+        return resp.json().get("name") or ""
+    except Exception:
+        return ""
+
+
+def _paper_text(parent_paper: dict) -> str:
+    """The Parent Paper's full text (or stored metadata), fail-soft."""
+    try:
+        return paper_fulltext.get_parent_paper_text(parent_paper or {}).get("text", "") or ""
+    except Exception:
+        return ""
+
+
+def _fold(text: str) -> str:
+    """Lowercase ASCII: "Özaltın" -> "ozaltin"."""
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
+
+
+def _author_names(parent_paper: dict) -> list:
+    names = []
+    for author in (parent_paper or {}).get("authors") or []:
+        if isinstance(author, dict):
+            author = author.get("name") or author.get("display_name") or ""
+        if isinstance(author, str) and author.strip():
+            names.append(author.strip())
+    return names
+
+
+def _check_provenance(candidate: dict, parent_paper: dict, paper_text: str) -> tuple:
+    """Deterministic evidence that a candidate is the paper's own code.
+    Returns (provenance, evidence); provenance is "" when none is found.
+
+    1. cited_in_paper: the repository URL occurs in the paper's text. PDF
+       text often spaces out URLs ("g i t h u b . c o m / ..."), so all
+       whitespace is removed from both sides before comparing.
+    2. author_owned: the GitHub owner's profile name holds an author's first
+       and last name as whole words, or the login holds them joined
+       ("kushalkar" does not match author "Karadağ")."""
+    repo_url = candidate.get("repo_url", "") or ""
+    parsed = _parse_github_repo(repo_url)
+    if parsed:
+        key = f"github.com/{parsed[0]}/{parsed[1]}".lower()
+    else:
+        key = re.sub(r"^https?://(www\.)?", "", repo_url.lower()).rstrip("/")
+    if key and key in re.sub(r"\s+", "", paper_text or "").lower():
+        return "cited_in_paper", f"The Parent Paper's text cites {key}."
+
+    authors = _author_names(parent_paper)
+    if not parsed:
+        return "", "The Parent Paper's text does not cite this link, and it is not a GitHub repository."
+    if not authors:
+        return "", "The Parent Paper's text does not cite this repository, and no author names are recorded."
+
+    owner = parsed[0]
+    login = re.sub(r"[^a-z]", "", _fold(owner))
+    profile_words = set(re.findall(r"[a-z]+", _fold(_fetch_github_owner_name(owner))))
+    for author in authors:
+        words = re.findall(r"[a-z]+", _fold(author))
+        if len(words) < 2:
+            continue
+        first, last = words[0], words[-1]
+        joined = (first + last, last + first)
+        if {first, last} <= profile_words or (
+                len(joined[0]) >= MIN_LOGIN_NAME_CHARS and any(j in login for j in joined)):
+            return "author_owned", f"GitHub owner '{owner}' matches the paper's author '{author}'."
+    return "", (f"The Parent Paper's text does not cite this repository, and GitHub owner '{owner}' "
+                f"does not match any author ({', '.join(authors)}).")
+
+
 def _extract_repo_candidates_from_results(results: list, paper_title: str, scope_description: str) -> list:
     """LLM call verifying which search results are plausibly THIS paper's
     own implementation, not just a similarly-named repo -- mirrors
@@ -236,31 +330,45 @@ def run(parent_paper: dict, use_cache: bool = True) -> dict:
     paper_title = (parent_paper or {}).get("title", "")
     print(f"\n[Code Discovery Agent] Locating implementation for '{paper_title}'...")
 
+    stated_url = (parent_paper or {}).get("code_url", "") or ""
+    paper_text = None  # read only when a candidate needs a provenance check
+    warnings = []
+
     cached = code_discovery_cache.get_cached_repo(paper_title) if use_cache else None
     if cached:
-        print(f"[Code Discovery Agent] Using cached repository: {cached.get('repo_url', '')}.")
-        return {
-            "status": "FOUND",
-            "repository": {**cached, "verification_method": "cache_hit"},
-            "candidates_considered": [cached],
-            "source_stage": "cache_hit",
-            "warnings": [],
-            "notes": "",
-        }
+        # A cached hit predates the provenance check, so it is checked again.
+        if cached.get("source") == "paper_stated" and stated_url and cached.get("repo_url") == stated_url:
+            provenance, evidence = "paper_stated", "The Parent Paper's record states this code_url."
+        else:
+            paper_text = _paper_text(parent_paper)
+            provenance, evidence = _check_provenance(cached, parent_paper, paper_text)
+        if provenance:
+            print(f"[Code Discovery Agent] Using cached repository: {cached.get('repo_url', '')}.")
+            cached = {**cached, "provenance": provenance, "provenance_evidence": evidence}
+            return {
+                "status": "FOUND",
+                "repository": {**cached, "verification_method": "cache_hit"},
+                "candidates_considered": [cached],
+                "source_stage": "cache_hit",
+                "warnings": [],
+                "notes": "",
+            }
+        warnings.append(f"Cached repository {cached.get('repo_url', '')} was not used: {evidence}")
+        print(f"[Code Discovery Agent] {warnings[-1]}")
 
     scope_description = _scope_description(parent_paper)
     candidates_considered = []
-    warnings = []
     chosen = None
     source_stage = "none"
 
     # --- Stage 1: author-stated code, if any ---
-    stated_url = (parent_paper or {}).get("code_url", "") or ""
     if stated_url:
         candidate = _verify_single_match(stated_url, paper_title, scope_description)
         if candidate:
             candidate["source"] = "paper_stated"
             candidate["verification_method"] = "llm_match"
+            candidate["provenance"] = "paper_stated"
+            candidate["provenance_evidence"] = "The Parent Paper's record states this code_url."
             reachable, _ = _check_url_reachable(candidate["repo_url"] or stated_url)
             candidate["reachable"] = reachable
             candidates_considered.append(candidate)
@@ -288,7 +396,19 @@ def run(parent_paper: dict, use_cache: bool = True) -> dict:
             candidate["verification_method"] = "llm_match"
             candidates_considered.append(candidate)
 
-        verified_matches = [c for c in found_candidates if c["matches_parent_paper"] and c["reachable"]]
+        verified_matches = []
+        for c in found_candidates:
+            if not (c["matches_parent_paper"] and c["reachable"]):
+                continue
+            if paper_text is None:
+                paper_text = _paper_text(parent_paper)
+            c["provenance"], c["provenance_evidence"] = _check_provenance(c, parent_paper, paper_text)
+            if c["provenance"]:
+                verified_matches.append(c)
+            else:
+                warnings.append(f"Rejected {c['repo_url']}: no evidence it is the authors' code. "
+                                f"{c['provenance_evidence']}")
+                print(f"[Code Discovery Agent] {warnings[-1]}")
         github_matches = [c for c in verified_matches if "github.com" in c["repo_url"].lower()]
         other_matches = [c for c in verified_matches if "github.com" not in c["repo_url"].lower()]
 

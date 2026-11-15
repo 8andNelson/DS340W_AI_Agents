@@ -100,25 +100,6 @@ class TestRunBounded(unittest.TestCase):
         self.assertNotIn("shell", kwargs)
 
 
-class TestCloneRepo(unittest.TestCase):
-    def test_clone_failure_returns_not_ok(self):
-        with patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=1, stderr="fatal")):
-            result = replication_agent._clone_repo("https://github.com/a/b", Path("/tmp/x"))
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error"], "fatal")
-
-    def test_clone_success_captures_commit_sha(self):
-        def fake_run(cmd, cwd=None, timeout=None):
-            if cmd[:2] == ["git", "clone"]:
-                return run_result(exit_code=0)
-            return run_result(exit_code=0, stdout="abc123\n")
-
-        with patch.object(replication_agent, "_run_bounded", side_effect=fake_run):
-            result = replication_agent._clone_repo("https://github.com/a/b", Path("/tmp/x"))
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["commit_sha"], "abc123")
-
-
 class TestSelectDependencyInstall(unittest.TestCase):
     def test_prefers_requirements_txt(self):
         args, reason = replication_agent._select_dependency_install(["requirements.txt", "setup.py"])
@@ -213,116 +194,6 @@ class TestWireDatasetIntoRepo(ReplicationAgentTestCase):
             repo_dir, {"train_csv_path": str(Path(self._tmpdir.name) / "train.csv")}
         )
         self.assertEqual(modifications, [])
-
-
-class TestReplicateFromRepository(ReplicationAgentTestCase):
-    def test_clone_failure_returns_blocked(self):
-        with patch.object(replication_agent, "_clone_repo", return_value={"ok": False, "error": "fatal", "commit_sha": ""}):
-            result = replication_agent._replicate_from_repository(make_paper(), make_repository(), make_cleaning_result())
-
-        self.assertEqual(result["status"], "BLOCKED")
-        self.assertEqual(result["source"], "cloned_repository")
-        self.assertIn("Clone failed", result["warnings"][0])
-
-    def test_venv_failure_returns_blocked(self):
-        with patch.object(replication_agent, "_clone_repo",
-                           return_value={"ok": True, "error": "", "commit_sha": "abc"}), \
-             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=1, stderr="no venv")):
-            result = replication_agent._replicate_from_repository(make_paper(), make_repository(), make_cleaning_result())
-
-        self.assertEqual(result["status"], "BLOCKED")
-        self.assertIn("Virtualenv creation failed", result["warnings"][0])
-
-    def test_conda_only_dependency_file_blocks_without_execution(self):
-        with patch.object(replication_agent, "_clone_repo",
-                           return_value={"ok": True, "error": "", "commit_sha": "abc"}), \
-             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_run_bounded") as run_mock:
-            result = replication_agent._replicate_from_repository(
-                make_paper(), make_repository(dependency_files=["environment.yml"]), make_cleaning_result(),
-            )
-
-        self.assertEqual(result["status"], "BLOCKED")
-        run_mock.assert_not_called()
-
-    def test_successful_run_with_convention_entry_point(self):
-        repo_dir = replication_agent.REPLICATION_DIR / replication_agent._slugify(make_paper()["title"]) / "repo"
-
-        def fake_run_bounded(cmd, cwd=None, timeout=None):
-            # _create_venv and _pip_install are mocked separately below, so
-            # the only real _run_bounded calls left are git clone/rev-parse
-            # and the final execution of the cloned repo's entry point.
-            if cmd[:2] == ["git", "clone"]:
-                repo_dir.mkdir(parents=True, exist_ok=True)
-                (repo_dir / "train.py").write_text("print('training')")
-                return run_result(exit_code=0)
-            if cmd[:2] == ["git", "rev-parse"]:
-                return run_result(exit_code=0, stdout="abc123\n")
-            return run_result(exit_code=0, stdout="accuracy: 0.9")
-
-        with patch.object(replication_agent, "_run_bounded", side_effect=fake_run_bounded), \
-             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_pip_freeze", return_value="pandas==2.0.0"):
-            result = replication_agent._replicate_from_repository(make_paper(), make_repository(), make_cleaning_result())
-
-        self.assertEqual(result["status"], "OK")
-        self.assertEqual(result["entry_point"], "train.py")
-        self.assertEqual(result["entry_point_source"], "convention")
-        self.assertEqual(result["commit_sha"], "abc123")
-
-    def test_readme_llm_command_uses_the_isolated_venvs_python_not_bare_python(self):
-        """The dependencies just installed into the isolated venv must
-        actually be the ones used -- a bare "python" token from the
-        README-LLM extraction would instead resolve to whatever "python"
-        means on PATH, silently defeating the venv isolation."""
-        venv_dir = replication_agent.REPLICATION_DIR / replication_agent._slugify(make_paper()["title"]) / "venv"
-
-        with patch.object(replication_agent, "_clone_repo",
-                           return_value={"ok": True, "error": "", "commit_sha": "abc"}), \
-             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_pip_freeze", return_value=""), \
-             patch.object(replication_agent, "_detect_entry_point_by_convention", return_value=""), \
-             patch.object(replication_agent, "_extract_entry_point_from_readme",
-                           return_value=["python", "src/train.py", "--epochs", "10"]), \
-             patch.object(replication_agent, "_wire_dataset_into_repo", return_value=[]), \
-             patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=0)) as run_mock:
-            result = replication_agent._replicate_from_repository(make_paper(), make_repository(), make_cleaning_result())
-
-        self.assertEqual(result["status"], "OK")
-        executed_command = run_mock.call_args.args[0]
-        self.assertEqual(executed_command, [str(replication_agent._venv_python(venv_dir)), "src/train.py", "--epochs", "10"])
-        self.assertNotIn("python", executed_command)
-
-    def test_no_entry_point_found_blocks_without_executing(self):
-        repo_dir = replication_agent.REPLICATION_DIR / replication_agent._slugify(make_paper()["title"]) / "repo"
-        repo_dir.mkdir(parents=True, exist_ok=True)
-
-        with patch.object(replication_agent, "_clone_repo",
-                           return_value={"ok": True, "error": "", "commit_sha": "abc"}), \
-             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_pip_freeze", return_value=""), \
-             patch.object(replication_agent, "_extract_entry_point_from_readme", return_value=[]), \
-             patch.object(replication_agent, "_run_bounded") as run_mock:
-            result = replication_agent._replicate_from_repository(make_paper(), make_repository(), make_cleaning_result())
-
-        self.assertEqual(result["status"], "BLOCKED")
-        run_mock.assert_not_called()
-
-    def test_timeout_during_execution_is_reported(self):
-        with patch.object(replication_agent, "_clone_repo",
-                           return_value={"ok": True, "error": "", "commit_sha": "abc"}), \
-             patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)), \
-             patch.object(replication_agent, "_pip_freeze", return_value=""), \
-             patch.object(replication_agent, "_detect_entry_point_by_convention", return_value="train.py"), \
-             patch.object(replication_agent, "_wire_dataset_into_repo", return_value=[]), \
-             patch.object(replication_agent, "_run_bounded", return_value=run_result(timed_out=True)):
-            result = replication_agent._replicate_from_repository(make_paper(), make_repository(), make_cleaning_result())
-
-        self.assertEqual(result["status"], "TIMEOUT")
 
 
 class TestReplicateByReconstruction(ReplicationAgentTestCase):
@@ -584,3 +455,391 @@ class TestRevision(ReplicationAgentTestCase):
         prompt = chat.call_args.args[0]
         self.assertIn("SMOTE is applied before the split.", prompt)
         self.assertIn("fitted on the\nTRAINING data only", prompt)
+
+
+def approved_review(clone_dir="", commit_sha="abc") -> dict:
+    return {"verdict": "APPROVED", "commit_sha": commit_sha, "clone_dir": str(clone_dir), "summary": "APPROVED."}
+
+
+class RepositoryTestCase(ReplicationAgentTestCase):
+    """The repository path, with the reviewed clone replaced by files the
+    test writes (no git, no network)."""
+    files = {"train.py": "print('training')\n"}
+
+    def setUp(self):
+        super().setUp()
+        self.slug_dir = replication_agent.REPLICATION_DIR / replication_agent._slugify(make_paper()["title"])
+        self.repo_dir = self.slug_dir / "repo"
+        replication_agent._FAILED_REPOSITORIES.clear()
+
+    def tearDown(self):
+        replication_agent._FAILED_REPOSITORIES.clear()
+        super().tearDown()
+
+    def _code(self, files=None):
+        def fake(repository, dest):
+            dest.mkdir(parents=True, exist_ok=True)
+            for name, text in (self.files if files is None else files).items():
+                (dest / name).parent.mkdir(parents=True, exist_ok=True)
+                (dest / name).write_text(text)
+            return {"ok": True, "error": "", "commit_sha": "abc"}
+        return patch.object(replication_agent, "_get_repository_code", side_effect=fake)
+
+    def _env(self, **overrides):
+        env = {"ok": True, "error": "", "python": "py", "install": "install -r requirements.txt",
+               "modifications": [], "warnings": []}
+        env.update(overrides)
+        return patch.object(replication_agent, "_setup_repository_environment", return_value=env)
+
+    def _repository(self):
+        return make_repository(review=approved_review())
+
+
+class TestGetRepositoryCode(ReplicationAgentTestCase):
+    def _git_repo(self) -> tuple:
+        source = Path(self._tmpdir.name) / "reviewed"
+        source.mkdir()
+        (source / "train.py").write_text("print(1)\n")
+        git = ["git", "-c", "user.email=t@example.com", "-c", "user.name=t"]
+        for args in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "x"]):
+            subprocess.run(git + args, cwd=source, check=True, capture_output=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True).stdout.strip()
+        return source, sha
+
+    def test_copies_the_reviewed_clone_at_the_reviewed_commit(self):
+        source, sha = self._git_repo()
+        dest = Path(self._tmpdir.name) / "repo"
+        result = replication_agent._get_repository_code({"review": approved_review(source, sha)}, dest)
+
+        self.assertTrue(result["ok"], result["error"])
+        self.assertEqual(result["commit_sha"], sha)
+        self.assertTrue((dest / "train.py").is_file())
+
+    def test_a_different_commit_is_refused(self):
+        source, _sha = self._git_repo()
+        result = replication_agent._get_repository_code({"review": approved_review(source, "0" * 40)},
+                                                         Path(self._tmpdir.name) / "repo")
+        self.assertFalse(result["ok"])
+        self.assertIn("not the reviewed", result["error"])
+
+    def test_a_repository_master_agent_did_not_approve_is_never_copied(self):
+        dest = Path(self._tmpdir.name) / "repo"
+        for review in (None, {"verdict": "REJECTED", "summary": "REJECTED: obfuscated_exec"}):
+            result = replication_agent._get_repository_code({"review": review}, dest)
+            self.assertFalse(result["ok"])
+            self.assertIn("has not approved", result["error"])
+        self.assertFalse(dest.exists())
+
+
+class TestRepositoryEnvironment(ReplicationAgentTestCase):
+    """Live run 20261114T203359Z: pandas==2.2.3 did not install on Python 3.14."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo_dir = Path(self._tmpdir.name) / "repo"
+        self.repo_dir.mkdir()
+        self.venv_dir = Path(self._tmpdir.name) / "venv"
+
+    def _setup(self, pip_results, pythons=(), venvs=None):
+        venvs = [] if venvs is None else venvs
+        installs = []
+
+        def fake_pip(venv_dir, cwd, args):
+            installs.append(args)
+            return pip_results(args)
+
+        with patch.object(replication_agent, "_create_venv",
+                          side_effect=lambda d, python=None: venvs.append(python) or run_result(exit_code=0)), \
+             patch.object(replication_agent, "_fallback_pythons", return_value=list(pythons)), \
+             patch.object(replication_agent, "_pip_install", side_effect=fake_pip):
+            env = replication_agent._setup_repository_environment(self.repo_dir, self.venv_dir, make_repository())
+        return env, installs
+
+    def test_install_failure_retries_with_an_older_python(self):
+        (self.repo_dir / "requirements.txt").write_text("pandas==2.2.3\n")
+        attempts = iter([1, 0])
+        venvs = []
+        env, installs = self._setup(lambda args: run_result(exit_code=next(attempts)),
+                                    pythons=[("3.12", "C:/py312/python.exe")], venvs=venvs)
+
+        self.assertTrue(env["ok"])
+        self.assertEqual(venvs, [None, "C:/py312/python.exe"])
+        # Wheels only first, so a pin with no wheel fails fast instead of compiling.
+        self.assertEqual(installs[:2], [["install", "--only-binary=:all:", "-r", "requirements.txt"]] * 2)
+        self.assertEqual(env["python"], "C:/py312/python.exe")
+        self.assertIn("Python 3.12", env["modifications"][0])
+
+    def test_a_pin_that_cannot_install_is_relaxed_and_recorded(self):
+        (self.repo_dir / "requirements.txt").write_text("pandas==2.2.3\nnumpy==2.2.6\n")
+
+        def pip(args):
+            return run_result(exit_code=1 if "-r" in args or args == ["install", "pandas==2.2.3"] else 0)
+
+        env, installs = self._setup(pip)
+
+        self.assertTrue(env["ok"])
+        self.assertIn(["install", "pandas"], installs)
+        self.assertIn("without the pin 'pandas==2.2.3'", " ".join(env["modifications"]))
+        self.assertNotIn("numpy", " ".join(env["modifications"]))
+
+    def test_a_source_build_is_tried_only_after_every_wheel_install(self):
+        (self.repo_dir / "requirements.txt").write_text("oldpkg==0.1\n")
+        venvs = []
+        env, installs = self._setup(lambda args: run_result(exit_code=1 if "--only-binary=:all:" in args else 0),
+                                    pythons=[("3.12", "C:/py312/python.exe")], venvs=venvs)
+
+        self.assertTrue(env["ok"])
+        self.assertEqual(installs[-1], ["install", "-r", "requirements.txt"])
+        self.assertEqual(venvs, [None, "C:/py312/python.exe", None])
+        self.assertEqual(env["modifications"], [])  # this Python, the declared versions
+
+    def test_a_requirement_that_never_installs_fails_the_setup(self):
+        (self.repo_dir / "requirements.txt").write_text("pandas==2.2.3\n")
+        env, _ = self._setup(lambda args: run_result(exit_code=1, stderr="boom"))
+
+        self.assertFalse(env["ok"])
+        self.assertIn("pandas==2.2.3", env["error"])
+
+    def test_packages_the_code_imports_but_does_not_declare_are_installed(self):
+        (self.repo_dir / "requirements.txt").write_text("numpy\n")
+        (self.repo_dir / "train.py").write_text("import numpy\nimport sklearn.ensemble\nimport helpers\n"
+                                                "import os\nimport strange_lib\n")
+        (self.repo_dir / "helpers.py").write_text("x = 1\n")
+        env, installs = self._setup(lambda args: run_result(exit_code=0))
+
+        self.assertIn(["install", "scikit-learn"], installs)
+        self.assertNotIn(["install", "numpy"], installs)  # declared: installed by -r
+        self.assertNotIn(["install", "helpers"], installs)  # the repository's own module
+        self.assertIn("strange_lib", " ".join(env["warnings"]))  # unknown: logged, never installed
+        self.assertFalse(any("strange_lib" in " ".join(a) for a in installs))
+
+    def test_no_dependency_file_is_not_a_failure(self):
+        (self.repo_dir / "train.py").write_text("import pandas\n")
+        env, installs = self._setup(lambda args: run_result(exit_code=0))
+
+        self.assertTrue(env["ok"])
+        self.assertEqual(installs, [["install", "pandas"]])
+
+
+class TestRepositoryRun(RepositoryTestCase):
+    def _run(self, run_results, fix=None):
+        results = iter(run_results)
+        fix = fix or {"diagnosis": "", "actions": []}
+        with self._code(), self._env(), \
+             patch.object(replication_agent, "_pip_freeze", return_value=""), \
+             patch.object(replication_agent, "_pip_install", return_value=run_result(exit_code=0)) as pip, \
+             patch.object(replication_agent, "_wire_dataset_into_repo", return_value=[]), \
+             patch.object(replication_agent, "_extract_entry_point_from_readme", return_value=[]), \
+             patch.object(replication_agent, "_propose_repository_fix", return_value=fix) as propose, \
+             patch.object(replication_agent, "_run_bounded", side_effect=lambda *a, **k: next(results)) as runs:
+            result = replication_agent._replicate_from_repository(make_paper(), self._repository(),
+                                                                  make_cleaning_result())
+        return result, runs, propose, pip
+
+    def test_successful_run(self):
+        result, runs, propose, _ = self._run([run_result(exit_code=0, stdout="accuracy: 0.9")])
+
+        self.assertEqual(result["status"], "OK")
+        self.assertFalse(result["repository_failed"])
+        self.assertEqual(result["entry_point"], "train.py")
+        self.assertEqual(result["repository_review"]["verdict"], "APPROVED")
+        self.assertIn("TRAIN_CSV", runs.call_args.kwargs["env"])
+        propose.assert_not_called()
+
+    def test_a_missing_module_is_installed_and_the_run_repeated(self):
+        result, runs, propose, pip = self._run([
+            run_result(exit_code=1, stderr="ModuleNotFoundError: No module named 'sklearn'"),
+            run_result(exit_code=0)])
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(runs.call_count, 2)
+        pip.assert_called_once()
+        self.assertEqual(pip.call_args.args[2], ["install", "scikit-learn"])
+        self.assertIn("ModuleNotFoundError", " ".join(result["modifications"]))
+        propose.assert_not_called()
+
+    def test_an_unknown_missing_module_is_never_installed(self):
+        result, _, _, pip = self._run([
+            run_result(exit_code=1, stderr="ModuleNotFoundError: No module named 'evil_pkg'"),
+            run_result(exit_code=1, stderr="ModuleNotFoundError: No module named 'evil_pkg'")])
+
+        pip.assert_not_called()
+        self.assertTrue(result["repository_failed"])
+
+    def test_a_failing_run_gets_one_checked_repair_and_runs_again(self):
+        self.files = {"train.py": "x\n", "src/main.py": "x\n"}
+        fix = {"diagnosis": "train.py is a stub; src/main.py is the experiment.",
+               "actions": [{"type": "command", "command": ["python", "src/main.py", "--seed", "1"]}]}
+        result, runs, _, _ = self._run([run_result(exit_code=1, stderr="error"), run_result(exit_code=0)], fix)
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["entry_point_source"], "repair_llm")
+        self.assertEqual(runs.call_args.args[0][1:], ["src/main.py", "--seed", "1"])
+        self.assertIn("Repair: ran python src/main.py --seed 1 instead.", result["modifications"])
+
+    def test_still_failing_after_the_repair_marks_the_repository_failed(self):
+        fix = {"diagnosis": "d", "actions": [{"type": "install", "packages": ["xgboost"]}]}
+        result, runs, _, _ = self._run([run_result(exit_code=1, stderr="e1"), run_result(exit_code=1, stderr="e2")],
+                                       fix)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertTrue(result["repository_failed"])
+        self.assertEqual(runs.call_count, 2)  # one run, one run after the repair -- no more
+
+    def test_a_repair_with_no_valid_action_does_not_run_again(self):
+        fix = {"diagnosis": "d", "actions": [{"type": "command", "command": ["bash", "-c", "rm -rf /"]}]}
+        result, runs, _, _ = self._run([run_result(exit_code=1, stderr="e1")], fix)
+
+        self.assertTrue(result["repository_failed"])
+        self.assertEqual(runs.call_count, 1)
+        self.assertIn("Repair action rejected", " ".join(result["warnings"]))
+
+    def test_no_entry_point_asks_for_a_repair(self):
+        self.files = {"experiment.py": "x\n"}
+        fix = {"diagnosis": "d", "actions": [{"type": "command", "command": ["python", "experiment.py"]}]}
+        result, runs, propose, _ = self._run([run_result(exit_code=0)], fix)
+
+        propose.assert_called_once()
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["entry_point"], "experiment.py")
+
+    def test_a_timeout_is_not_repaired(self):
+        result, runs, propose, _ = self._run([run_result(timed_out=True, exit_code=None)])
+
+        self.assertEqual(result["status"], "TIMEOUT")
+        self.assertTrue(result["repository_failed"])
+        propose.assert_not_called()
+
+    def test_an_unapproved_repository_is_never_set_up(self):
+        with patch.object(replication_agent, "_setup_repository_environment") as setup:
+            result = replication_agent._replicate_from_repository(
+                make_paper(), make_repository(review={"verdict": "REJECTED", "summary": "REJECTED: malware"}),
+                make_cleaning_result())
+
+        setup.assert_not_called()
+        self.assertTrue(result["repository_failed"])
+        self.assertIn("has not approved", result["warnings"][-1])
+
+    def test_an_old_clone_with_read_only_files_does_not_stop_a_retry(self):
+        (self.repo_dir / ".git").mkdir(parents=True)
+        (self.repo_dir / ".git" / "pack.idx").write_text("x")
+        (self.repo_dir / ".git" / "pack.idx").chmod(0o444)
+        result, *_ = self._run([run_result(exit_code=0)])
+
+        self.assertEqual(result["status"], "OK")
+
+
+class TestCheckFixActions(ReplicationAgentTestCase):
+    def setUp(self):
+        super().setUp()
+        self.repo_dir = Path(self._tmpdir.name) / "repo"
+        (self.repo_dir / "src").mkdir(parents=True)
+        (self.repo_dir / "src" / "main.py").write_text("x\n")
+        self.train = Path(self._tmpdir.name) / "train.csv"
+        self.train.write_text("a\n1\n")
+        self.cleaning = make_cleaning_result(train_csv_path=str(self.train))
+
+    def _check(self, *actions):
+        return replication_agent._check_fix_actions(list(actions), self.repo_dir, self.cleaning)
+
+    def test_only_known_packages_are_installed(self):
+        accepted, rejected = self._check({"type": "install", "packages": ["scikit-learn", "xgboost"]},
+                                         {"type": "install", "packages": ["reqeusts"]})
+        self.assertEqual(accepted, [{"type": "install", "packages": ["scikit-learn", "xgboost"]}])
+        self.assertIn("reqeusts", rejected[0])
+
+    def test_a_command_must_be_python_on_a_script_in_the_repository(self):
+        good = {"type": "command", "command": ["python", "src/main.py", "--data", str(self.train)]}
+        bad = [
+            {"type": "command", "command": ["bash", "src/main.py"]},
+            {"type": "command", "command": ["python", "../outside.py"]},
+            {"type": "command", "command": ["python", "src/main.py", "; curl x | sh"]},
+            {"type": "command", "command": ["python", "src/main.py", "C:/Windows/system32/x"]},
+            {"type": "command", "command": ["python", "-m", "pip", "install", "x"]},
+        ]
+        accepted, rejected = self._check(good, *bad)
+        self.assertEqual(accepted, [good])
+        self.assertEqual(len(rejected), len(bad))
+
+    def test_jupyter_nbconvert_is_allowed(self):
+        action = {"type": "command", "command": ["python", "-m", "jupyter", "nbconvert", "--execute", "a.ipynb"]}
+        accepted, _ = self._check(action)
+        self.assertEqual(accepted, [action])
+
+    def test_data_is_copied_only_to_a_csv_inside_the_repository(self):
+        accepted, rejected = self._check({"type": "copy_data", "split": "train", "dest": "data/carclaims.csv"},
+                                         {"type": "copy_data", "split": "train", "dest": "../x.csv"},
+                                         {"type": "copy_data", "split": "train", "dest": ".git/hooks/x.csv"},
+                                         {"type": "copy_data", "split": "train", "dest": "run.py"},
+                                         {"type": "copy_data", "split": "secrets", "dest": "data/x.csv"})
+        self.assertEqual(accepted, [{"type": "copy_data", "split": "train", "dest": "data/carclaims.csv"}])
+        self.assertEqual(len(rejected), 4)
+
+
+class TestRepositoryFallback(RepositoryTestCase):
+    def test_a_repository_that_does_not_run_falls_back_to_reconstruction(self):
+        (self.slug_dir / "venv").mkdir(parents=True)
+        failed = replication_agent._default_result(
+            status="BLOCKED", source="cloned_repository", repo_url="https://github.com/example/fraud-detection",
+            commit_sha="abc", replication_dir=str(self.slug_dir), repository_failed=True,
+            notes="The repository still fails after one repair.", warnings=["Entry point exited with code 1."])
+        reconstructed = replication_agent._default_result(status="OK", source="reconstructed", warnings=["note"])
+        code = make_code_discovery_result(repository=self._repository())
+
+        with patch.object(replication_agent, "_replicate_from_repository", return_value=failed) as repo_fn, \
+             patch.object(replication_agent, "_replicate_by_reconstruction", return_value=reconstructed) as recon:
+            result = replication_agent.run(make_paper(), code, make_cleaning_result())
+            # Master Agent's next attempt goes straight to the reconstruction.
+            replication_agent.run(make_paper(), code, make_cleaning_result())
+
+        repo_fn.assert_called_once()
+        self.assertEqual(recon.call_count, 2)
+        self.assertFalse((self.slug_dir / "venv").exists())  # the repository's packages do not carry over
+        self.assertEqual(result["source"], "reconstructed")
+        self.assertEqual(result["repository_fallback"]["repo_url"], "https://github.com/example/fraud-detection")
+        self.assertIn("did not run", result["warnings"][0])
+        self.assertIn("Entry point exited with code 1.", result["warnings"])
+        self.assertIn("note", result["warnings"])
+
+    def test_a_repository_that_runs_does_not_fall_back(self):
+        ok = replication_agent._default_result(status="OK", source="cloned_repository")
+        with patch.object(replication_agent, "_replicate_from_repository", return_value=ok), \
+             patch.object(replication_agent, "_replicate_by_reconstruction") as recon:
+            result = replication_agent.run(make_paper(), make_code_discovery_result(), make_cleaning_result())
+
+        recon.assert_not_called()
+        self.assertEqual(result["source"], "cloned_repository")
+
+
+class TestChildEnvironment(unittest.TestCase):
+    def test_a_child_process_never_gets_the_projects_secrets(self):
+        secrets = {"OPENROUTER_API_KEY": "sk-1", "SLACK_BOT_TOKEN": "xoxb", "KAGGLE_KEY": "k",
+                   "MEMORY_DATABASE_URL": "postgres://u:p@h/db", "FREELLMAPI_API_KEY": "f"}
+        with patch.dict(replication_agent.os.environ, {**secrets, "PATH_EXTRA_OK": "1"}), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
+            replication_agent._run_bounded(["python", "train.py"], env={"TRAIN_CSV": "t.csv"})
+
+        child = run.call_args.kwargs["env"]
+        self.assertFalse(set(secrets) & set(child))
+        self.assertEqual((child["PATH_EXTRA_OK"], child["TRAIN_CSV"], child["PYTHONUTF8"]), ("1", "t.csv", "1"))
+
+
+class TestRemoveTreeAndPythons(ReplicationAgentTestCase):
+    def test_remove_tree_deletes_read_only_files(self):
+        target = Path(self._tmpdir.name) / "repo" / ".git" / "objects" / "pack"
+        target.mkdir(parents=True)
+        pack = target / "pack-1.idx"
+        pack.write_text("x")
+        pack.chmod(0o444)
+
+        replication_agent._remove_tree(Path(self._tmpdir.name) / "repo")
+
+        self.assertFalse((Path(self._tmpdir.name) / "repo").exists())
+
+    def test_fallback_pythons_are_older_than_this_one(self):
+        with patch.object(replication_agent.sys, "version_info", (3, 12, 0)), \
+             patch.object(replication_agent, "_find_python", side_effect=lambda v: f"/py{v}") as find:
+            found = replication_agent._fallback_pythons()
+
+        self.assertEqual(found, [("3.11", "/py3.11"), ("3.10", "/py3.10")])
+        self.assertNotIn("3.13", [c.args[0] for c in find.call_args_list])

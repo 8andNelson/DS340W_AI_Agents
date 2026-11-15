@@ -23,6 +23,14 @@ def llm_response(candidates_json: str) -> MagicMock:
     return response
 
 
+# A paper text that cites every repository the search tests accept, so they
+# pass the provenance check (_check_provenance) without a GitHub user lookup.
+CITING_PAPER_TEXT = (
+    "Code: https://github.com/author/fraud-detection, https://github.com/a/low-star-repo, "
+    "https://github.com/b/high-star-repo, https://github.com/a/repo, https://kaggle.com/code/author/notebook."
+)
+
+
 def github_api_response(status_code: int = 200, json_data=None) -> MagicMock:
     response = MagicMock()
     response.status_code = status_code
@@ -34,12 +42,17 @@ class CodeDiscoveryAgentTestCase(unittest.TestCase):
     """Every test here skips the cache (no prior successful run for this
     paper title) unless a test is specifically about caching."""
 
+    paper_text = CITING_PAPER_TEXT
+
     def setUp(self):
         self._cache_patch = patch.object(code_discovery_cache, "get_cached_repo", return_value=None)
         self._cache_patch.start()
+        self._text_patch = patch.object(code_discovery_agent, "_paper_text", return_value=self.paper_text)
+        self._text_patch.start()
 
     def tearDown(self):
         self._cache_patch.stop()
+        self._text_patch.stop()
 
 
 class TestPaperStatedCodeUrl(CodeDiscoveryAgentTestCase):
@@ -348,6 +361,79 @@ class TestNotFoundNeverBlocks(CodeDiscoveryAgentTestCase):
 
         self.assertEqual(result["status"], "NOT_FOUND")
         self.assertIn("Code search failed", " ".join(result["warnings"]))
+
+
+class TestProvenance(CodeDiscoveryAgentTestCase):
+    """The LLM match alone is not enough: a repository must be cited by the
+    paper or owned by one of its authors (a live run accepted a student's
+    course project that re-ran the paper)."""
+    paper_text = "We used the Vehicle Insurance Fraud Detection repository on GitHub."
+    authors = ["Öznur Özaltın", "Övgücan Karadağ Erdemir"]
+
+    def _run_with_match(self, repo_url, owner_name=""):
+        paper = make_paper(code_url="", authors=self.authors)
+        response = llm_response(
+            f'[{{"repo_url": "{repo_url}", "matches_parent_paper": true, '
+            '"match_explanation": "Re-runs the paper.", "source": "github_search"}]'
+        )
+        with patch("requests.post", return_value=response),              patch.object(web_search, "search_code_sites",
+                          return_value=[{"title": "repo", "url": repo_url, "description": ""}]),              patch.object(code_discovery_agent, "_check_url_reachable", return_value=(True, 200)),              patch.object(code_discovery_agent, "_fetch_github_owner_name", return_value=owner_name),              patch.object(code_discovery_agent, "_fetch_github_metadata", return_value={}),              patch.object(code_discovery_agent, "_fetch_github_contents_listing", return_value=[]):
+            return code_discovery_agent.run(paper)
+
+    def test_llm_match_without_provenance_is_rejected(self):
+        result = self._run_with_match("https://github.com/kushalkar6362/DS-340W-Repo", owner_name="Kushal Kar")
+
+        self.assertEqual(result["status"], "NOT_FOUND")
+        self.assertIsNone(result["repository"])
+        self.assertIn("no evidence it is the authors' code", " ".join(result["warnings"]))
+        self.assertEqual(result["candidates_considered"][0]["provenance"], "")
+
+    def test_repository_owned_by_an_author_is_accepted(self):
+        result = self._run_with_match("https://github.com/oozaltin/pdfs-pso", owner_name="Öznur Özaltın")
+
+        self.assertEqual(result["status"], "FOUND")
+        self.assertEqual(result["repository"]["provenance"], "author_owned")
+
+    def test_spaced_out_url_in_the_paper_text_counts_as_cited(self):
+        repo = code_discovery_agent._default_repo(repo_url="https://github.com/Rashmi-77/Vehicle-Insurance-Fraud-Detection")
+        text = ("GitHub repository: h t t p s : / / g i t h u b . c o m / R a s h m i - 7 7 / V e h i c l e - "
+                "I n s u r a n c e - F r a u d - D e t\ne c t i o n")
+        provenance, evidence = code_discovery_agent._check_provenance(repo, make_paper(), text)
+
+        self.assertEqual(provenance, "cited_in_paper")
+        self.assertIn("rashmi-77", evidence)
+
+    def test_author_names_match_whole_words_only(self):
+        """"Kar" is in "Karadag", but it is not the author's name."""
+        repo = code_discovery_agent._default_repo(repo_url="https://github.com/kushalkar6362/repo")
+        with patch.object(code_discovery_agent, "_fetch_github_owner_name", return_value="Kushal Kar"):
+            provenance, _ = code_discovery_agent._check_provenance(repo, make_paper(authors=self.authors), "")
+        self.assertEqual(provenance, "")
+
+    def test_login_holding_an_authors_joined_name_is_accepted(self):
+        repo = code_discovery_agent._default_repo(repo_url="https://github.com/ovgucanerdemir/repo")
+        with patch.object(code_discovery_agent, "_fetch_github_owner_name", return_value=""):
+            provenance, _ = code_discovery_agent._check_provenance(repo, make_paper(authors=self.authors), "")
+        self.assertEqual(provenance, "author_owned")
+
+    def test_no_authors_means_no_github_user_lookup(self):
+        repo = code_discovery_agent._default_repo(repo_url="https://github.com/someone/repo")
+        with patch.object(code_discovery_agent, "_fetch_github_owner_name") as lookup:
+            provenance, _ = code_discovery_agent._check_provenance(repo, make_paper(authors=[]), "")
+        lookup.assert_not_called()
+        self.assertEqual(provenance, "")
+
+    def test_cached_repository_without_provenance_is_not_used(self):
+        cached_repo = code_discovery_agent._default_repo(
+            repo_url="https://github.com/kushalkar6362/DS-340W-Repo", source="github_search",
+            matches_parent_paper=True, reachable=True,
+        )
+        with patch.object(code_discovery_cache, "get_cached_repo", return_value=cached_repo),              patch.object(code_discovery_agent, "_fetch_github_owner_name", return_value="Kushal Kar"),              patch("requests.post", return_value=llm_response("[]")),              patch.object(web_search, "search_code_sites", return_value=[]) as search_mock:
+            result = code_discovery_agent.run(make_paper(authors=self.authors))
+
+        search_mock.assert_called_once()
+        self.assertEqual(result["status"], "NOT_FOUND")
+        self.assertIn("Cached repository", " ".join(result["warnings"]))
 
 
 if __name__ == "__main__":

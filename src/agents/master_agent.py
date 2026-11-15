@@ -622,14 +622,13 @@ def _check_code_discovery(result: dict) -> list:
 
 def _check_replication(result: dict) -> list:
     """
-    Unlike Code Discovery, Replication Agent IS blocked on anything other
-    than a clean "OK" -- CLAUDE.md's Baseline Replication Rule means the
-    pipeline genuinely needs a working, executed baseline before
-    advancing to evaluation/experimentation. BLOCKED (install/entry-point/
-    execution failure) and TIMEOUT both trigger Master Agent's normal
-    diagnose-and-retry, which matters especially for the reconstruction
-    path, where a retry re-generates the script with the diagnosis (the
-    earlier traceback and what to change) in its prompt.
+    Anything other than a clean "OK" is a failed attempt: BLOCKED
+    (install/entry-point/execution failure) and TIMEOUT both trigger Master
+    Agent's normal diagnose-and-retry, which matters especially for the
+    reconstruction path, where a retry re-generates the script with the
+    diagnosis (the earlier traceback and what to change) in its prompt.
+    After the last attempt the pipeline does not halt: it continues with
+    the failed baseline recorded (_continue_without_baseline).
     """
     if result.get("status") != "OK":
         return [_log_entry(
@@ -803,7 +802,8 @@ def _diagnose(agent_name: str, attempt: int, failure: str, report_text: str, ear
 
 
 def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int = MAX_ATTEMPTS,
-               attempt_offset: int = 0, notes: list = None):
+               attempt_offset: int = 0, notes: list = None,
+               final_next: str = "Halting pipeline; manual review required."):
     """
     Invoke run_fn() until its output passes checker_fn, at most
     max_attempts times. After each failed attempt (failed checks, or an
@@ -821,7 +821,8 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
     (see _rerun_loop) after its earlier ones, so its reports and run
     database rows do not overwrite or duplicate them. notes are given to
     every attempt's LLM prompts from the start: a rerun request's
-    instructions, relayed by Master Agent.
+    instructions, relayed by Master Agent. final_next is what the last
+    rejection says happens next (a failed Replication Agent does not halt).
     """
     from src import llm
 
@@ -858,7 +859,7 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
                 "Correction", agent_name,
                 f"{agent_name} raised an exception on attempt {attempt}: {e}.",
                 "Retrying" if attempt < last else "Rejected",
-                "Diagnose the failure and re-run the agent." if attempt < last else "Halting pipeline.",
+                "Diagnose the failure and re-run the agent." if attempt < last else final_next,
             )]
         else:
             report_text = report_fn(output)
@@ -921,7 +922,7 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
                 f"{agent_name} still failing after {max_attempts} error(s), each diagnosed and retried. "
                 f"See the issues above and the reports in {REPORT_DIR}.",
                 "Rejected",
-                "Halting pipeline; manual review required.",
+                final_next,
             )
             _print_entry(final)
             _append_log([final])
@@ -1385,6 +1386,10 @@ def _after_stage(agent_name: str, output, ctx: dict, drive: dict) -> None:
         update_state({"papers": output["all"], "parent_paper": ctx["parent_paper"],
                       "parent_paper_approved": True, "phase": "MASTER_APPROVAL"})
         dataset_cache.cache_validated_papers(ctx["ranked_pool"])
+    elif agent_name == "Code Discovery Agent":
+        _review_repository(output)  # before any of its code can be installed or run
+        if not drive["rerun"]:
+            update_state({**_stage_state(agent_name, output), "phase": AGENT_PHASE[agent_name]})
     elif not drive["rerun"] and agent_name != "Experiment Agent":
         update_state({**_stage_state(agent_name, output), "phase": AGENT_PHASE[agent_name]})
 
@@ -1399,6 +1404,45 @@ def _after_stage(agent_name: str, output, ctx: dict, drive: dict) -> None:
             drive["relay_pending"] = True
         else:
             _relay_and_apply(ctx, ctx["ranked_pool"], drive["floor_ts"])
+
+
+def _review_repository(result: dict) -> None:
+    """
+    Master Agent's review of the repository the Code Discovery Agent found,
+    before the Replication Agent may install or run any of it
+    (src/orchestration/repo_review.py: valid for the pipeline, malware
+    patterns, dependency sources, typosquats, known-malicious and vulnerable
+    packages; nothing in it is executed). The review is stored on the
+    repository (result["repository"]["review"]); the Replication Agent runs
+    only an approved, reviewed clone. A rejection is a Correction to the
+    Code Discovery Agent, and the baseline is then reconstructed from the
+    paper -- the repository's code is never installed or run.
+    """
+    from src.orchestration import repo_review
+
+    repository = (result or {}).get("repository")
+    if (result or {}).get("status") != "FOUND" or not repository:
+        return
+    review = repo_review.review_repository(repository)
+    repository["review"] = review
+    attempt = run_store.last_stage_attempt(_current_run_id, "Repository Review") + 1
+    text = repo_review.format_review(review)
+    path = _write_report("Repository Review", attempt, text)
+    decision = "Rejected" if review["verdict"] == "REJECTED" else "Approved"
+    with _stage_record_lock:
+        run_store.record_stage(_current_run_id, "Repository Review", attempt, decision, review, text)
+    if decision == "Rejected":
+        entry = _log_entry("Correction", "Code Discovery Agent",
+                           f"Repository {review['repo_url']} rejected: {review['summary']} Report: {path}.",
+                           "Rejected", "Do not install or run this repository; the Replication Agent reconstructs "
+                                       "the baseline from the Parent Paper.")
+    else:
+        entry = _log_entry("Approval", "Code Discovery Agent",
+                           f"Repository {review['repo_url']} (commit {review['commit_sha']}) passed Master Agent's "
+                           f"review: {review['summary']} Report: {path}.",
+                           "Approved", "The Replication Agent may run the reviewed copy in a new venv.")
+    _print_entry(entry)
+    _append_log([entry])
 
 
 def _halt(agent_name: str, output, blockers: list, ctx: dict, drive: dict) -> None:
@@ -1503,8 +1547,12 @@ def _run_stage(target: str, request: dict, ctx: dict, drive: dict):
     else:
         offset, notes = 0, None
     checker, report = (globals()[name] for name in STAGE_CHECKS[target])
+    extra = {}
+    if target == "Replication Agent":
+        extra["final_next"] = ("Undo the rerun and keep the closest baseline so far." if rerun else
+                               "Continue without a working baseline: the failure is evaluated and reported.")
     return _supervise(target, _stage_call(target, request, ctx, drive), checker, report,
-                      attempt_offset=offset, notes=notes)
+                      attempt_offset=offset, notes=notes, **extra)
 
 
 # --- Opening and closing a rerun ---
@@ -1652,7 +1700,34 @@ def _decline(request: dict, target: str, sender: str, reason: str, ctx: dict, dr
 
 def _new_drive(floor_ts: str = None, evaluated: bool = False) -> dict:
     return {"history": [], "experiment_results": [], "feedback": [], "declined_in_a_row": 0, "rerun": None,
-            "evaluated": evaluated, "end_reason": "", "phase": None, "blockers": [], "floor_ts": floor_ts}
+            "evaluated": evaluated, "end_reason": "", "phase": None, "blockers": [], "floor_ts": floor_ts,
+            "baseline_failed": False}
+
+
+def _continue_without_baseline(output, blockers: list, drive: dict) -> dict:
+    """A Replication Agent that failed every attempt does not halt the
+    pipeline: a failed reproduction is still research information
+    (CLAUDE.md, Results Integrity). Its failed result goes on to the
+    Evaluation Agent -- whose review can still request a revision through
+    the rerun loop -- and to the report, marked baseline_failed so it is
+    never presented as a reproduction."""
+    from src.agents import replication_agent
+
+    if not output:
+        output = replication_agent._default_result(
+            status="BLOCKED", warnings=[b["issue"] for b in blockers],
+            notes="The Replication Agent raised an exception on every attempt.")
+    output = {**output, "baseline_failed": True}
+    drive["baseline_failed"] = True
+    entry = _log_entry(
+        "Correction", "Replication Agent",
+        f"No working baseline after {MAX_ATTEMPTS} attempt(s) (status={output.get('status', '')}, "
+        f"source={output.get('source', '')}). The pipeline continues with the failure recorded; the result is "
+        "never presented as a reproduction.",
+        "Rejected", "Run the Evaluation Agent on the failed baseline, then the report and slides.")
+    _print_entry(entry)
+    _append_log([entry])
+    return output
 
 
 def _drive_initial(ctx: dict, requests: list, drive: dict, sender: str):
@@ -1721,7 +1796,9 @@ def _drive_initial(ctx: dict, requests: list, drive: dict, sender: str):
                         continue
                     target, origin = running.pop(future)
                     output, blockers = future.result()
-                    if blockers:
+                    if blockers and target == "Replication Agent":
+                        output = _continue_without_baseline(output, blockers, drive)
+                    elif blockers:
                         _halt(target, output, blockers, ctx, drive)
                         return [], target  # executor drains active peers; no dependent work starts
                     ctx[RESULT_KEY[target]] = output
@@ -2016,7 +2093,8 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
                   rerun_end_reason=drive["end_reason"], experiment_results=drive["experiment_results"],
                   experiment_result=drive["experiment_results"][-1] if drive["experiment_results"] else None,
                   report_result=None, presentation_result=None, agents_off=sorted(_agents_off),
-                  skipped_agents=drive.get("skipped", []), blockers=drive["blockers"])
+                  skipped_agents=drive.get("skipped", []), blockers=drive["blockers"],
+                  baseline_failed=drive["baseline_failed"])
     if drive["blockers"]:
         return result
 

@@ -702,6 +702,53 @@ class TestCodeDiscoveryAgentPipelineWiring(MasterAgentTestCase):
         code_discovery_run.assert_called_once_with(ranked_pool[0])
 
 
+class TestRepositoryReview(MasterAgentTestCase):
+    """Master Agent reviews a found repository before the Replication Agent
+    may install or run any of it (repo_review)."""
+
+    def _review(self, verdict):
+        return {"verdict": verdict, "repo_url": "https://github.com/example/fraud-detection", "commit_sha": "abc",
+                "clone_dir": "", "findings": [], "counts": {}, "stats": {}, "notes": [],
+                "summary": f"{verdict}: obfuscated_exec in train.py" if verdict == "REJECTED" else f"{verdict}."}
+
+    def test_an_approved_repository_carries_its_review(self):
+        result = make_code_discovery_result(found=True)
+        with patch("src.orchestration.repo_review.review_repository", return_value=self._review("APPROVED")):
+            master_agent._review_repository(result)
+
+        self.assertEqual(result["repository"]["review"]["verdict"], "APPROVED")
+        entry = json.loads(master_agent.LOG_FILE.read_text())[-1]
+        self.assertEqual((entry["action"], entry["target"], entry["decision"]),
+                         ("Approval", "Code Discovery Agent", "Approved"))
+        self.assertTrue((master_agent.REPORT_DIR / "repository_review_attempt1.txt").is_file())
+
+    def test_a_rejection_is_a_correction_posted_to_the_errors_channel(self):
+        result = make_code_discovery_result(found=True)
+        with patch("src.orchestration.repo_review.review_repository", return_value=self._review("REJECTED")), \
+             patch.object(master_agent.slack_client, "post_error_message") as post_error:
+            master_agent._review_repository(result)
+
+        entry = json.loads(master_agent.LOG_FILE.read_text())[-1]
+        self.assertEqual((entry["action"], entry["target"], entry["decision"]),
+                         ("Correction", "Code Discovery Agent", "Rejected"))
+        self.assertIn("obfuscated_exec", entry["issue"])
+        self.assertIn("reconstructs", entry["next"])
+        post_error.assert_called_once()
+
+    def test_nothing_is_reviewed_when_no_repository_was_found(self):
+        with patch("src.orchestration.repo_review.review_repository") as review:
+            master_agent._review_repository(make_code_discovery_result(found=False))
+        review.assert_not_called()
+
+    def test_the_replication_agent_receives_the_reviewed_repository(self):
+        data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
+        with patch("src.orchestration.repo_review.review_repository", return_value=self._review("APPROVED")):
+            result, *_ = TestDataAgentPipelineWiring._run(
+                self, data_result, code_discovery_result=make_code_discovery_result(found=True))
+
+        self.assertEqual(result["code_discovery_result"]["repository"]["review"]["verdict"], "APPROVED")
+
+
 class TestReplicationChecks(MasterAgentTestCase):
     """_check_replication blocks on anything other than a clean OK --
     unlike Code Discovery, a working baseline is a hard requirement per
@@ -739,15 +786,28 @@ class TestReplicationAgentPipelineWiring(MasterAgentTestCase):
         self.assertEqual(result["phase"], "COMPLETE")
         self.assertEqual(result["replication_result"], replication_result)
 
-    def test_halts_when_replication_is_blocked(self):
+    def test_a_failed_baseline_does_not_halt_the_pipeline(self):
+        """After every attempt fails, the failed baseline goes on to the
+        Evaluation Agent and the report, marked as failed."""
         data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
         replication_result = make_replication_result(status="BLOCKED")
         result, *_ = self._run(data_result, replication_result=replication_result)
 
-        self.assertFalse(result["success"])
-        self.assertEqual(result["phase"], "BASELINE_REPLICATION")
-        self.assertTrue(result["blockers"])
-        self.assertEqual(result["blockers"][0]["target"], "Replication Agent")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["phase"], "COMPLETE")
+        self.assertEqual(result["blockers"], [])
+        self.assertTrue(result["baseline_failed"])
+        self.assertTrue(result["replication_result"]["baseline_failed"])
+        self.assertEqual(result["replication_result"]["status"], "BLOCKED")
+        log = json.loads(master_agent.LOG_FILE.read_text())
+        last = [e for e in log if e["target"] == "Replication Agent"][-1]
+        self.assertIn("continues with the failure recorded", last["issue"])
+        self.assertNotIn("Halting", " ".join(e["next"] for e in log if e["target"] == "Replication Agent"))
+
+    def test_a_working_baseline_is_not_marked_failed(self):
+        data_result = make_data_result(selected_datasets=[make_dataset_candidate(entry_count=12000)])
+        result, *_ = self._run(data_result, replication_result=make_replication_result(status="OK"))
+        self.assertFalse(result["baseline_failed"])
 
     def test_called_with_parent_paper_code_discovery_and_cleaning_results(self):
         ranked_pool = [
