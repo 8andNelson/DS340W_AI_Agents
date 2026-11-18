@@ -314,7 +314,7 @@ Outputs:
 | `reports/<slug>/report.md` | final report, with `figures/*.svg` |
 | `presentations/<slug>/slides.pptx` | slide deck |
 | `data/processed/master_dataset.csv` | merged dataset and train/test/validation splits |
-| `replication/<slug>/` | baseline code, `ENVIRONMENT.md`, run output |
+| `replication/<slug>/` | baseline code, `ENVIRONMENT.md`, `pip_freeze.txt`, run output (the baseline's venv is deleted when the run ends) |
 | `logs/` | project state, Master Agent log, per-attempt agent reports, LLM and search call logs |
 | `database/project_runs.db` | permanent record of every run |
 

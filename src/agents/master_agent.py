@@ -2015,6 +2015,10 @@ def run_pipeline(topic: str, parent_paper_input: str | Path | None = None, agent
         _current_run_id = None
         _agents_off = frozenset()
         raise
+    finally:
+        # No agent needs a reconstructed baseline's venv after the run.
+        from src.agents import replication_agent
+        replication_agent.remove_run_venvs()
 
     _agents_off = frozenset()
     if _current_run_id:

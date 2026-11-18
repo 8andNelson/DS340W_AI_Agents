@@ -239,8 +239,35 @@ def _remove_tree(path: Path) -> None:
     shutil.rmtree(path, onexc=_make_writable_and_retry)
 
 
+# Reconstructed baselines' venvs made in this process (one run). Master
+# Agent deletes them when the run ends (remove_run_venvs): each paper's venv
+# is several hundred MB, and pip_freeze.txt keeps the exact packages.
+_RUN_VENVS: set = set()
+
+
 def _create_venv(venv_dir: Path, python: str = None) -> dict:
+    _RUN_VENVS.add(Path(venv_dir))
     return _run_bounded([python or sys.executable, "-m", "venv", str(venv_dir)], timeout=VENV_TIMEOUT_SECONDS)
+
+
+def remove_run_venvs() -> list:
+    """Delete the venvs this run made. Only a folder with pyvenv.cfg is
+    deleted. Never raises: a venv that cannot be deleted is reported and
+    left. Returns the deleted folders."""
+    removed = []
+    for venv_dir in sorted(_RUN_VENVS):
+        if not (venv_dir / "pyvenv.cfg").is_file():
+            continue
+        try:
+            _remove_tree(venv_dir)
+            removed.append(str(venv_dir))
+        except OSError as e:
+            print(f"[Replication Agent] Could not delete the venv {venv_dir}: {e}")
+    _RUN_VENVS.clear()
+    if removed:
+        print(f"[Replication Agent] Deleted {len(removed)} venv(s) at the end of the run; "
+              f"pip_freeze.txt records their packages.")
+    return removed
 
 
 def _pip_install(venv_dir: Path, cwd: Path, install_args: list) -> dict:
@@ -1181,7 +1208,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
     stdout_path, stderr_path = _save_run_output(slug_dir, run_result)
     _write_environment_doc(slug_dir, {
         "Source": "reconstructed", "Entry point": "train.py", "Command": " ".join(command),
-        "Venv": str(venv_dir),
+        "Venv": f"{venv_dir} (deleted when the run ends; pip_freeze.txt lists its packages)",
         "Data environment": ", ".join(f"{k}={v}" for k, v in env.items()) or "none",
         "Libraries installed": ", ".join(installed_libs) or "none",
         "Script generated/repaired by (in order)": ", ".join(generated_by) or "unknown",
