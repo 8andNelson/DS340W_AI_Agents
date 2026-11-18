@@ -1,174 +1,415 @@
- How to Use This GitHub Repo
+# DS340W AI Agents
 
-  1. Get the code
+A multi-agent research pipeline. You give it a machine learning or data
+topic. A **Master Agent** then supervises specialized agents that:
 
-  git clone https://github.com/8andNelson/DS340W_AI_Agents.git
+1. find at least 5 peer-reviewed papers (2022 to now) and pick one **Parent Paper**,
+2. download and merge the Parent Paper's dataset,
+3. find the authors' code (or rebuild it from the paper),
+4. run the baseline and compare it with the paper's published results,
+5. request reruns to close the gap,
+6. write a report (`reports/`) and slides (`presentations/`).
 
-  2. Navigate into the cloned folder and set up a virtual environment
+Agent progress and Master Agent corrections go to Slack. A local dashboard
+shows every run.
 
-  The .venv folder is intentionally left out of the repo (it's in .gitignore), so it has to be created locally after
-  cloning:
+This guide takes you from an empty machine to a working copy. Do the steps in order.
 
-  cd DS340W_AI_Agents
-  python -m venv .venv
+---
 
-  3. Activate the virtual environment
+## 0. What you need
 
-  Windows (PowerShell):
-  .venv\Scripts\Activate.ps1
+| Tool | Why | Get it |
+|---|---|---|
+| **Git** | clone this repo and FreeLLMAPI | https://git-scm.com/downloads |
+| **Python 3.11 or newer** (tested on 3.14) | runs the pipeline | https://www.python.org/downloads/ (Windows: select **"Add python.exe to PATH"**) |
+| **Docker Desktop** | runs FreeLLMAPI and the sandbox for cloned repositories | https://www.docker.com/products/docker-desktop/ |
+| VS Code (optional) | the dashboard's "Open in VS Code" button | https://code.visualstudio.com/ |
 
-  macOS/Linux (bash/zsh):
-  source .venv/bin/activate
+About 5 GB of free disk space is enough for Docker images, the Camoufox
+browser, and datasets.
 
-  4. Install dependencies
+---
 
-  pip install -r requirements.txt
+## 1. Install Docker Desktop
 
-  5. Configure secrets
+1. Download and run the installer from https://www.docker.com/products/docker-desktop/.
+   - Windows: keep **"Use WSL 2 instead of Hyper-V"** selected. If Windows asks
+     for WSL, run `wsl --install` in an administrator PowerShell, then restart.
+     (Guide: https://docs.docker.com/desktop/setup/install/windows-install/)
+   - macOS: https://docs.docker.com/desktop/setup/install/mac-install/
+   - Linux: https://docs.docker.com/desktop/setup/install/linux/
+2. Start Docker Desktop and wait until it shows **"Engine running"**.
+3. Check it in a new terminal:
 
-  Windows:
-  Copy-Item .env.example .env
-  notepad .env
+   ```powershell
+   docker --version
+   docker run --rm hello-world
+   ```
 
-  macOS/Linux:
-  cp .env.example .env
-  nano .env
+   You should see "Hello from Docker!".
 
-  Fill in:
-  OPENROUTER_API_KEY=
-  SERPENT_API_KEY=
-  BRAVE_API_KEY=
-  SLACK_BOT_TOKEN=
-  SLACK_CHANNEL_ID=
+Docker is used two ways:
 
-  6. Run the project
+- **FreeLLMAPI** (step 3) runs as a Docker container.
+- **Repository sandbox:** when the pipeline finds the authors' code, it
+  installs and runs it only inside a locked-down Docker container
+  (`python:<version>-slim`, no network at run time, no secrets). Without
+  Docker, the pipeline never runs a cloned repository; it rebuilds the
+  baseline from the paper instead.
 
-  python run.py
+---
 
-  With a topic passed directly:
-  python run.py "machine learning for detecting credit card fraud"
+## 2. Clone this repo and set up Python
 
-  Reset saved project state and start fresh:
-  python run.py --reset "new topic"
+```powershell
+git clone https://github.com/8andNelson/DS340W_AI_Agents.git
+cd DS340W_AI_Agents
+python -m venv .venv
+```
 
-  7. Run tests
+Activate the virtual environment (`.venv` is gitignored, so each person makes their own):
 
-  pytest
+```powershell
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+```
 
-  Run a single test:
-  pytest tests/test_file.py::test_function_name
+```bash
+# macOS / Linux
+source .venv/bin/activate
+```
 
-  8. When done, deactivate the virtual environment
+If PowerShell refuses to run the script, run this once and try again:
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
 
-  deactivate
+Install the packages and the Camoufox browser (a free local browser for
+pages that block plain requests; it is downloaded once):
 
-## Start modeling from a fixed Parent Paper
+```powershell
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python -m camoufox fetch
+```
+
+---
+
+## 3. Set up FreeLLMAPI (free LLM router)
+
+[FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi) is a self-hosted,
+OpenAI-compatible router. It pools the free tiers of many LLM providers and
+switches to another provider on rate limits. This is the recommended
+provider for full runs, because one run makes many LLM calls.
+
+Clone it **outside** this repo (for example next to it), then make its
+`.env` with an encryption key and start it.
+
+**Windows (PowerShell):**
+
+```powershell
+cd ..
+git clone https://github.com/tashfeenahmed/freellmapi.git
+cd freellmapi
+$Bytes = New-Object Byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($Bytes)
+$KEY = -join ($Bytes | ForEach-Object { "{0:x2}" -f $_ })
+[IO.File]::WriteAllText("$PWD\.env", "ENCRYPTION_KEY=$KEY`nPORT=3001`n")
+docker compose up -d
+```
+
+(`WriteAllText` writes the file without a byte-order mark, so the first
+variable is read correctly.)
+
+**macOS / Linux:**
+
+```bash
+cd ..
+git clone https://github.com/tashfeenahmed/freellmapi.git
+cd freellmapi
+printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$(openssl rand -hex 32)" > .env
+docker compose up -d
+```
+
+Then:
+
+1. Open http://localhost:3001 in a browser.
+2. On the **Keys** page, add free API keys for the providers it lists.
+   Each provider's page links to where you sign up. More providers means
+   fewer rate-limit stops.
+3. Copy the **unified API key** shown in the header of the Keys page. It
+   goes in this repo's `.env` as `FREELLMAPI_API_KEY` (step 5).
+4. Note the full path of the `freellmapi` folder (for example
+   `C:\Users\you\Desktop\freellmapi`). It goes in `.env` as
+   `FREELLMAPI_COMPOSE_DIR`, so the dashboard can start and stop the router for you.
+
+Useful commands (run in the `freellmapi` folder):
+
+```powershell
+docker compose ps                   # is it running?
+docker compose logs -f freellmapi   # server log
+docker compose down                 # stop it (keeps your keys)
+```
+
+Do **not** run `docker compose down -v` unless you want to delete all its saved keys.
+
+Install guide: https://github.com/tashfeenahmed/freellmapi/blob/main/docs/en/install/01-install.md
+
+Go back to this repo when you are done: `cd ..\DS340W_AI_Agents`
+
+---
+
+## 4. Get the API keys
+
+Only the LLM provider and one search key are required. The rest are optional.
+
+| Variable | Required? | What it is | Where to get it |
+|---|---|---|---|
+| `FREELLMAPI_API_KEY` | **Yes** (if `LLM_PROVIDER=freellmapi`) | unified key from FreeLLMAPI | Keys page at http://localhost:3001 (step 3) |
+| `OPENROUTER_API_KEY` | **Yes** (if `LLM_PROVIDER=openrouter`) | OpenRouter key | https://openrouter.ai/settings/keys |
+| `ANTHROPIC_API_KEY` | only for `LLM_PROVIDER=anthropic` | Claude API key | https://console.anthropic.com/settings/keys |
+| `BRAVE_API_KEY` | **Yes** (or SerpApi) | Brave Search API, first search provider | https://brave.com/search/api/ → keys at https://api-dashboard.search.brave.com/app/keys |
+| `SERPENT_API_KEY` | Recommended | SerpApi (Google results), used when Brave fails or hits its limit | https://serpapi.com/manage-api-key |
+| `SLACK_BOT_TOKEN` | Optional | Slack bot token (`xoxb-...`) | https://api.slack.com/apps (see below) |
+| `SLACK_CHANNEL_ID` | Optional | channel for agent status | Slack: channel name → **View channel details** → ID at the bottom |
+| `SLACK_ERRORS_CHANNEL_ID` | Optional | channel for Master Agent corrections and errors | same as above |
+| `KAGGLE_USERNAME`, `KAGGLE_KEY` | Optional | lets the Data Agent search and download Kaggle datasets | https://www.kaggle.com/settings → **API** → **Create New Token** (the downloaded `kaggle.json` has both values) |
+
+Free-tier limits to know:
+
+- **OpenRouter** without credits: 50 free-model requests per day. One full
+  run makes about 30–60 requests, so the free tier may not finish a run.
+  This is why FreeLLMAPI is recommended.
+- **Brave Search:** 1,000 requests per month, reset on the 1st.
+
+**Slack bot setup** (optional; the pipeline runs without Slack):
+
+1. https://api.slack.com/apps → **Create New App** → **From scratch**, pick your workspace.
+2. **OAuth & Permissions** → **Bot Token Scopes**: add `chat:write` and
+   `channels:history` (add `groups:history` for a private channel).
+3. **Install to Workspace**, then copy the **Bot User OAuth Token** (`xoxb-...`).
+4. In each Slack channel, type `/invite @<your app name>`.
+
+---
+
+## 5. Make your `.env` file
+
+Copy the template. `.env` is gitignored, so your keys are never committed.
+
+```powershell
+# Windows
+Copy-Item .env.example .env
+notepad .env
+```
+
+```bash
+# macOS / Linux
+cp .env.example .env
+nano .env
+```
+
+Minimum working `.env` with FreeLLMAPI (recommended):
+
+```ini
+LLM_PROVIDER=freellmapi
+FREELLMAPI_API_KEY=<unified key from the FreeLLMAPI Keys page>
+FREELLMAPI_BASE_URL=http://localhost:3001/v1
+FREELLMAPI_COMPOSE_DIR=C:\Users\you\Desktop\freellmapi
+BRAVE_API_KEY=<your Brave key>
+SERPENT_API_KEY=<your SerpApi key>
+```
+
+Or with OpenRouter instead:
+
+```ini
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=<your OpenRouter key>
+BRAVE_API_KEY=<your Brave key>
+SERPENT_API_KEY=<your SerpApi key>
+```
+
+Leave the other values at their defaults. `.env.example` explains each one.
+Useful optional settings:
+
+- `MEMORY_CONTRIBUTOR=<your short name>`: recorded with each run's metrics.
+- `MEMORY_BACKEND=sqlite` (default, local only), `postgres` (the team's
+  hosted store; needs `MEMORY_DATABASE_URL` from the team), or `off`.
+- `AGENTS_OFF=experiment,report,presentation`: skip optional agents for a faster test run.
+- `CAMOUFOX_ENABLED=false`: turn off the browser fallback.
+
+Never put real keys in `.env.example`, code, or commits.
+
+---
+
+## 6. Check the install
+
+Run the test suite. It is offline: all network and LLM calls are mocked,
+so it does not use your keys or quota. It takes about 4–5 minutes.
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q        # Windows
+```
+
+```bash
+.venv/bin/python -m pytest -q                # macOS / Linux
+```
+
+Run one test:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_file.py::test_function_name
+```
+
+Check that FreeLLMAPI answers (if you use it):
+
+```powershell
+curl.exe http://localhost:3001/api/ping
+```
+
+---
+
+## 7. Start the dashboard
+
+```powershell
+python -m src.dashboard
+```
+
+Open http://127.0.0.1:8050. With `LLM_PROVIDER=freellmapi`, the dashboard
+starts Docker Desktop and the FreeLLMAPI router for you (from
+`FREELLMAPI_COMPOSE_DIR`) and stops the router when you press Ctrl+C,
+unless a run is still active.
+
+Options:
+
+```powershell
+python -m src.dashboard --port 8060          # other port
+python -m src.dashboard --no-freellmapi      # do not start/stop the router
+python -m src.dashboard --keep-freellmapi    # do not stop the router on exit
+```
+
+The dashboard lets you enter a topic and start a run, watch each agent live,
+and open the papers, datasets, scripts, report, and slides of every past run.
+It listens only on 127.0.0.1.
+
+---
+
+## 8. Run the pipeline
+
+From the dashboard (Overview page), or from the command line:
+
+```powershell
+python run.py                                                      # asks for a topic
+python run.py "machine learning for detecting credit card fraud"   # topic as argument
+python run.py --reset "new topic"                                  # clear saved state first
+python run.py --agents-off report,presentation "topic"             # skip optional agents
+```
+
+A full run can take a long time (paper search, dataset downloads,
+training, reruns). It runs unattended. Only one run at a time: two runs
+overwrite each other's files.
+
+Outputs:
+
+| Where | What |
+|---|---|
+| `reports/<slug>/report.md` | final report, with `figures/*.svg` |
+| `presentations/<slug>/slides.pptx` | slide deck |
+| `data/processed/master_dataset.csv` | merged dataset and train/test/validation splits |
+| `replication/<slug>/` | baseline code, `ENVIRONMENT.md`, run output |
+| `logs/` | project state, Master Agent log, per-attempt agent reports, LLM and search call logs |
+| `database/project_runs.db` | permanent record of every run |
+
+All of these are gitignored.
+
+Inspect past runs from the command line:
+
+```powershell
+python -m src.orchestration.run_store list
+python -m src.orchestration.run_store show <run_id>
+```
+
+---
+
+## 9. Your working copy: final checklist
+
+You have a working copy when all of these are true:
+
+- [ ] `docker run --rm hello-world` prints "Hello from Docker!"
+- [ ] `.venv` is active and `pip install -r requirements.txt` finished without errors
+- [ ] `python -m camoufox fetch` finished
+- [ ] http://localhost:3001 opens, and the Keys page has at least one provider key (FreeLLMAPI users)
+- [ ] `.env` has `LLM_PROVIDER`, its key, and `BRAVE_API_KEY` and/or `SERPENT_API_KEY`
+- [ ] `python -m pytest -q` passes
+- [ ] `python -m src.dashboard` opens at http://127.0.0.1:8050
+- [ ] a test run, for example
+      `python run.py --reset --agents-off experiment,report,presentation "machine learning for detecting credit card fraud"`,
+      gets past Research and Validation and approves a Parent Paper
+
+When you are done working:
+
+```powershell
+deactivate
+```
+
+To update later: `git pull`, then `pip install -r requirements.txt` again.
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `Activate.ps1 cannot be loaded` | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
+| `docker: command not found` / engine not running | start Docker Desktop and wait for "Engine running"; open a new terminal |
+| dashboard says the router is down | check `FREELLMAPI_COMPOSE_DIR`, then run `docker compose up -d` in that folder |
+| LLM calls fail with 401 | wrong `FREELLMAPI_API_KEY` / `OPENROUTER_API_KEY`; copy it again |
+| `DailyQuotaExceeded` | OpenRouter free limit reached; wait for the reset or switch to FreeLLMAPI |
+| every search fails | check `BRAVE_API_KEY` and `SERPENT_API_KEY`; Brave resets monthly |
+| no Slack messages | invite the bot to the channel; check the channel IDs and scopes |
+| Kaggle datasets skipped | set `KAGGLE_USERNAME` and `KAGGLE_KEY` |
+| a found repository is not run | Docker is not running; the baseline is rebuilt from the paper instead |
+
+---
+
+## More details
+
+### Start from your own Parent Paper
 
 On the dashboard Overview page, enter the topic and select **Start from my
 Parent Paper PDF**. Choose a text-based PDF (up to 50 MB), enter its printed
-title, and give the prediction-target keywords, such as `fraud`. Start the
-run normally. This skips Intake, Research, and paper selection and begins
-Data and Code Discovery in parallel. The supplied paper remains the Parent
-Paper throughout the run; Data, Replication, and Evaluation read its exact
-uploaded bytes. A missing or changed upload stops the stage instead of
-searching for a replacement paper. Scanned PDFs need OCR before upload.
+title, and give the prediction-target keywords, such as `fraud`. This skips
+Intake, Research, and paper selection, and starts Data and Code Discovery in
+parallel. The supplied paper stays the Parent Paper for the whole run.
+Scanned PDFs need OCR before upload. Supplying a paper selects it; it does
+not certify peer review or scientific validity.
 
-Reuse the same PDF, topic, title, and target for memory-on/off comparisons.
-The dashboard records a fixed input ID and PDF SHA-256. The PDF and input
-manifest live under `dashboard_files/parent_papers/` and are archived with
-each run. Papers and Documents can open the run's archived copy. The
-comparison tool groups supplied-paper runs by their exact input ID,
-including runs that crash before producing a final result. Dataset choices,
-splits, code, models, and resource limits still need to be controlled when
-testing modeling improvements. Supplying a paper selects it; it does not
-certify peer review or scientific validity.
-
-The saved input can also be reused from the command line:
+The saved input (under `dashboard_files/parent_papers/`) can be reused from
+the command line, for example for memory-on/off comparisons with the same paper:
 
 ```powershell
 python run.py --parent-paper-input "dashboard_files/parent_papers/<input-id>.json" "machine learning for detecting credit card fraud"
 ```
 
-## Agent handoffs and parallel work
+### How the agents work together
 
-Agents return a list of requests from `handoff(result, context)`. Master
-Agent reviews each request, supervises retries, and schedules independent
-first-pass stages concurrently (up to three agents). After Parent Paper
-approval, Data and Code Discovery start together. Cleaning starts as soon
-as Data is approved; Replication waits for both Cleaning and Code Discovery.
-Matching requests from joining branches run once. Missing prerequisites
-wait for other requested work, and unresolved or conflicting requests halt
-the pipeline. Reruns execute serially to preserve the baseline's files.
+Agents never run each other. Each agent returns a request (`handoff`) to
+the Master Agent, which checks it, runs the next agent, checks its output,
+and on a failure diagnoses it and retries (up to 5 attempts). Independent
+stages run in parallel (up to three agents): after the Parent Paper is
+approved, Data and Code Discovery start together; Replication waits for
+Cleaning and Code Discovery. Reruns requested by the Evaluation and
+Experiment Agents run one at a time, so the known-good baseline is
+always kept. Each agent attempt records its own start and finish time.
 
-Retry notes are scoped to each invocation and explicitly inherited by
-Research and Validation workers. Stage reports, run records, and Slack
-start/finish messages still identify each agent independently. Project-state
-updates happen in the coordinator; Slack data-expansion requests wait until
-active branches finish before changing shared data files.
+### Search and paper access
 
-## Agent execution timing
+Searches go to Brave first, then SerpApi. Result pages are fetched directly;
+CAPTCHA, login, and rate-limit pages are detected even with HTTP 200. Blocked
+public pages can use the local Camoufox browser (no key, proxy, or
+subscription). Fetch attempts are logged in `logs/page_fetch_calls.jsonl`.
+A search snippet is never accepted as paper access, and a paper that cannot
+be verified stays `UNVERIFIED`.
 
-Each agent attempt records its own invocation ID, UTC start/finish times,
-and elapsed seconds from a monotonic clock. Execution timing covers the
-agent call, including its internal workers, and stops when it returns or
-raises. Supervisor checks, reporting, artifact capture, and retry diagnosis
-are outside that duration; total run time includes this overhead.
+### Project documentation
 
-The dashboard shows every concurrent invocation, using the database even
-without console output. Finished execution is shown as Checking until the
-supervisor records its decision. An unfinished invocation in a stopped or
-crashed run is Interrupted, with an unknown final duration. Agent output
-details show the selected attempt's measured execution time.
-
-Metrics version 2 sums measured execution durations across each agent's
-attempts and reruns. Overlapping durations may sum to more than the whole
-run's elapsed time. Old metric versions remain unchanged. Historical
-completion-gap estimates are labeled and stored as `agent_seconds_estimate`;
-their `agent_seconds` is unknown. Missing finish records also stay unknown,
-so they cannot silently enter comparisons as zero or a peer's completion gap.
-
-## Search and paper access
-
-Agents search through Brave first (Brave's own index), then SerpAPI
-(Google results) if Brave is unavailable. Set BRAVE_API_KEY and
-SERPENT_API_KEY in .env.
-
-Result pages are fetched directly. CAPTCHA, login, and rate-limit pages are
-detected even when the server returns HTTP 200. For blocked public pages,
-Camoufox runs locally as a fallback, with up to two security-checkbox
-interactions. Login pages, rate limits, and authenticated requests stay direct.
-Browser content is checked again before it is accepted. If access still fails,
-paper validation can seek a verified alternate source through SerpAPI.
-Fetch attempts and their providers are recorded in logs/page_fetch_calls.jsonl.
-
-Install the browser once after installing requirements:
-
-```powershell
-python -m camoufox fetch
-```
-
-No browser API key, subscription, or paid proxy is required. Set
-CAMOUFOX_ENABLED=false to disable the fallback, or CAMOUFOX_TIMEOUT_SECONDS
-to adjust its default 180-second overall deadline (including browser launch
-and downloads). At most two browsers run concurrently; each worker runs in
-its own process and its process tree is terminated if the deadline expires.
-Browser responses/downloads are limited to 50 MB. The tested versions are
-Camoufox Python 0.5.9 and browser 158.0.1-beta.41. Installation needs space
-for the browser package; it is not downloaded on an agent request.
-
-Paper validation fetches content rather than trusting HEAD or HTTP status.
-It checks the retrieved title or DOI and records reachability evidence,
-attempts, the source URL, and LANDING_PAGE versus FULL_TEXT. If the original
-cannot be verified, it fetches up to three SerpAPI alternatives and applies
-the same checks and prohibited-source rules. A search snippet never proves
-paper access. Inaccessible papers remain UNVERIFIED even if the LLM
-accepts their metadata. A reachable landing page does not prove full-text
-availability or peer review; those are separate checks.
-
-Full-text retrieval follows individual View PDF links and citation PDF metadata
-from accessible article HTML. It excludes full-issue/bulk downloads and checks
-ScienceDirect links against the requested article's PII. This uses HTTP link
-following; when a page is blocked, Camoufox preserves the session while following
-the individual article's PDF link. Full-text extraction still verifies the paper
-identity, and persistent challenges remain failures. The separately run dashboard
-PDF downloader is unchanged.
+- `docs/PROJECT_STATUS.md`: what is built and what is open
+- `docs/CLAUDE_BACKEND_PLAN.md`: memory and metrics design
