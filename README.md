@@ -240,23 +240,11 @@ Never put real keys in `.env.example`, code, or commits.
 
 ## 6. Check the install
 
-Run the test suite. It is offline: all network and LLM calls are mocked,
-so it does not use your keys or quota. It takes about 3–5 minutes. Pass
-`tests`, so pytest does not also collect test files inside cloned repositories
-under `replication/`.
+Check that the packages and the pipeline's modules load. This makes no
+network or LLM calls:
 
 ```powershell
-.venv\Scripts\python.exe -m pytest -q tests  # Windows
-```
-
-```bash
-.venv/bin/python -m pytest -q tests          # macOS / Linux
-```
-
-Run one test:
-
-```powershell
-.venv\Scripts\python.exe -m pytest tests/test_file.py::test_function_name
+python -c "import src.main, src.dashboard.server, camoufox; print('install OK')"
 ```
 
 Check that FreeLLMAPI answers (if you use it):
@@ -338,7 +326,7 @@ You have a working copy when all of these are true:
 - [ ] `python -m camoufox fetch` finished
 - [ ] http://localhost:3001 opens, and the Keys page has at least one provider key (FreeLLMAPI users)
 - [ ] `.env` has `LLM_PROVIDER`, its key, and `BRAVE_API_KEY` and/or `SERPENT_API_KEY`
-- [ ] `python -m pytest -q tests` passes
+- [ ] the install check in step 6 prints `install OK`
 - [ ] `python -m src.dashboard` opens at http://127.0.0.1:8050
 - [ ] a test run, for example
       `python run.py --reset --agents-off experiment,report,presentation "machine learning for detecting credit card fraud"`,

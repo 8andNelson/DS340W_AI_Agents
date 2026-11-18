@@ -43,6 +43,9 @@ build/
 dist/
 *.egg-info/
 
+# Tests are kept locally only, not tracked in the repo
+tests/
+
 # Test / coverage files
 .pytest_cache/
 .coverage
