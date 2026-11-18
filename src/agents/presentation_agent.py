@@ -218,7 +218,10 @@ def _bar_chart(slide, x, y, w, h, categories, series, point_colors=None, number_
     chart.category_axis.tick_labels.font.size = Pt(12)
     chart.value_axis.tick_labels.font.size = Pt(11)
     chart.value_axis.major_gridlines.format.line.color.rgb = GRID
-    chart.value_axis.minimum_scale = 0  # bars start at zero, so lengths are true to the values
+    # Bars start at zero, so lengths are true to the values; below zero only
+    # for a negative value (a score below the paper's).
+    low = min((v for _, values, _ in series for v in values), default=0)
+    chart.value_axis.minimum_scale = 0 if low >= 0 else low * 1.15
     top = max((v for _, values, _ in series for v in values), default=0)
     if 0 < top <= 1:
         chart.value_axis.maximum_scale = 1
@@ -240,6 +243,24 @@ def _bar_chart(slide, x, y, w, h, categories, series, point_colors=None, number_
 
 
 # --- The deck ---
+
+def signed(value) -> str:
+    """A difference from the paper, + above it; "n/a" when not measured."""
+    return "n/a" if not isinstance(value, (int, float)) else f"{value:+g}"
+
+
+def method_label(rerun: dict) -> str:
+    if rerun.get("method_source") == "beyond_paper":
+        return "Beyond paper: " + (", ".join(rerun.get("new_methods") or []) or "not named")
+    return "Paper's method" if rerun.get("method_source") == "paper" else "Not stated"
+
+
+def comparison_rows(facts: dict) -> list:
+    """The comparison table's rows (Master Agent checks the slide holds them)."""
+    return [[m["metric"], _fmt(m["published_value"]), _fmt(m["reproduced_value"]),
+             signed(m.get("signed_difference_points")), _fmt(m["classification"])]
+            for m in facts["evaluation"]["metrics"][:8]]
+
 
 def comparable_metrics(facts: dict) -> list:
     return [m for m in facts["evaluation"]["metrics"] if isinstance(m.get("published_value"), (int, float))
@@ -356,12 +377,16 @@ def build(facts: dict, bullets: dict, path: Path) -> None:
 
     # 10 Proposed Changes
     slide = _slide(prs, "Proposed Changes", f"{exp['rerun_count']} rerun(s), {exp['kept_count']} kept",
-                   notes="Source: experiments.reruns. A rerun that moved the score away was reverted.")
+                   notes="Source: experiments.reruns. A rerun that lowered the score was reverted. Difference: "
+                         "reproduced minus published, points, + above the paper. Method: the paper's own, or "
+                         "beyond the paper as declared by the Experiment Agent.")
     if exp["reruns"]:
-        _table(slide, 0.6, 1.7, 12.1, ["#", "Agent rerun", "Instruction", "Gap before", "Gap after", "Kept"],
-               [[_fmt(r["rerun"]), _fmt(r["target_agent"]), _clip("; ".join(r["instructions"]) or r["goal"], 70),
-                 _fmt(r["gap_before"]), _fmt(r["gap_after"]), _fmt(r["kept"])] for r in exp["reruns"][:8]],
-               widths=[0.6, 2.4, 5.6, 1.3, 1.3, 0.9])
+        _table(slide, 0.6, 1.7, 12.1, ["#", "Agent rerun", "Method", "Instruction", "Diff before", "Diff after",
+                                       "Kept"],
+               [[_fmt(r["rerun"]), _fmt(r["target_agent"]), _clip(method_label(r), 40),
+                 _clip("; ".join(r["instructions"]) or r["goal"], 55), signed(r.get("margin_before")),
+                 signed(r.get("margin_after")), _fmt(r["kept"])] for r in exp["reruns"][:8]],
+               widths=[0.5, 2.0, 2.4, 4.1, 1.1, 1.1, 0.9])
     else:
         _text(slide, 0.6, 1.8, 12.0, 0.6, "No rerun was run.", size=20)
     if exp["end_reason"]:
@@ -370,7 +395,16 @@ def build(facts: dict, bullets: dict, path: Path) -> None:
     # 11 Experimental Results (chart)
     metrics = comparable_metrics(facts)
     slide = _slide(prs, "Experimental Results", f"Overall: {_fmt(ev['status'])}",
-                   notes="Source: evaluation.metrics (metrics stated on both sides).")
+                   notes="Source: evaluation.metrics (metrics stated on both sides). SURPASSED: above the paper. "
+                         "NOT_IN_PAPER metrics are not part of the overall status.")
+    if ev.get("comparison_basis") == "paper_and_other_scenarios":
+        _text(slide, 0.6, 6.55, 12.1, 0.4, "Some values are from another scenario in the paper: fewer than 3 of the "
+              "paper's metrics could be compared.", size=12, color=INK_2)
+    if exp.get("beyond_paper_in_final"):
+        _text(slide, 0.6, 6.95, 12.1, 0.45,
+              "Includes changes beyond the paper's method: " + _clip("; ".join(
+                  ", ".join(b["new_methods"]) or f"rerun {b['rerun']}" for b in exp["beyond_paper_in_final"]), 110),
+              size=13, bold=True, color=INK_2)
     if metrics:
         _bar_chart(slide, 0.6, 1.6, 12.1, 5.4, [m["metric"] for m in metrics],
                    [("Published (Parent Paper)", [m["published_value"] for m in metrics], BLUE),
@@ -381,20 +415,20 @@ def build(facts: dict, bullets: dict, path: Path) -> None:
 
     # 12 Comparison (table, and the gap over the reruns)
     slide = _slide(prs, "Comparison",
-                   (f"Mean gap to the paper: {_fmt(ev['mean_gap_points'])} percentage points"
-                    if ev["mean_gap_points"] is not None else "The gap to the paper is not measurable"),
-                   notes="Source: evaluation.metrics, experiments.")
-    rows = [[m["metric"], _fmt(m["published_value"]), _fmt(m["reproduced_value"]), _fmt(m["difference_points"]),
-             _fmt(m["classification"])] for m in ev["metrics"][:8]]
+                   (f"Mean difference from the paper: {signed(ev.get('mean_margin_points'))} points (+ above it)"
+                    if ev.get("mean_margin_points") is not None else "The difference from the paper is not measurable"),
+                   notes="Source: evaluation.metrics, experiments. Diff: reproduced minus published, + above the paper.")
+    rows = comparison_rows(facts)
     if rows:
-        _table(slide, 0.6, 1.6, 6.9 if exp["reruns"] else 12.1, ["Metric", "Published", "Reproduced", "Diff (pts)",
+        _table(slide, 0.6, 1.6, 6.9 if exp["reruns"] else 12.1, ["Metric", "Published", "Reproduced", "Diff (+ above)",
                                                                 "Class"], rows, size=12).name = COMPARISON_TABLE
-    steps = ([("Baseline", exp["baseline_gap_points"], True)] if exp["baseline_gap_points"] is not None else []) + \
-        [(f"Rerun {r['rerun']}", r["gap_after"], r["kept"]) for r in exp["reruns"]
-         if isinstance(r.get("gap_after"), (int, float))]
+    steps = ([("Baseline", exp["baseline_margin_points"], True)]
+             if exp.get("baseline_margin_points") is not None else []) + \
+        [(f"Rerun {r['rerun']}", r["margin_after"], r["kept"]) for r in exp["reruns"]
+         if isinstance(r.get("margin_after"), (int, float))]
     if len(steps) >= 2:
         _bar_chart(slide, 7.8, 1.6, 5.0, 5.0, [s[0] for s in steps],
-                   [("Gap to the paper (points)", [s[1] for s in steps], BLUE)],
+                   [("Difference from the paper (points)", [s[1] for s in steps], BLUE)],
                    point_colors=[BLUE if s[2] else NOT_KEPT for s in steps])
         _text(slide, 7.8, 6.6, 5.0, 0.4, "Grey: rerun not kept", size=11, color=INK_2)
 

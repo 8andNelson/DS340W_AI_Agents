@@ -5,15 +5,37 @@ Compares the Replication Agent's actual captured output against the
 Parent Paper's own published results, classifying each matched metric as:
 
   - EXACT        -- reproduced value within a tight tolerance of published.
-  - APPROXIMATE  -- within a looser tolerance -- a real reproduction, with
-                    expected variance (seeds/hardware/library versions).
-  - FAILED       -- outside that tolerance -- a genuine discrepancy.
-  - INCONCLUSIVE -- no comparable number exists on one or both sides, so
-                    no verdict can be produced for that metric. Per
-                    CLAUDE.md's "state uncertainty, don't guess" policy --
-                    a paper that never states a concrete number doesn't
-                    get a manufactured one, and neither does a run that
-                    didn't print one.
+  - SURPASSED    -- better than the published value by more than that
+                    tolerance (higher, or lower for an error-type rate).
+                    The goal is the paper's score and, where possible, a
+                    better one, so this is never a failure.
+  - APPROXIMATE  -- below the published value, within a looser tolerance --
+                    a real reproduction, with expected variance
+                    (seeds/hardware/library versions).
+  - FAILED       -- below the published value, outside that tolerance -- a
+                    genuine shortfall.
+  - INCONCLUSIVE -- the paper states a score, but no comparable number
+                    exists (the run did not print it, or the paper's value
+                    is UNVERIFIED). Per
+                    CLAUDE.md's "state uncertainty, don't guess" policy.
+  - NOT_A_SCORE  -- the paper states a time, loss, error or cost: it has no
+                    0-1/0-100 scale, so it is never compared and never
+                    part of the overall status (a paper reporting training
+                    time made every run INCONCLUSIVE).
+  - NOT_IN_PAPER -- the run printed a metric the paper's text does not
+                    state. Shown for information only: it is never part of
+                    the overall status. (When the paper's values could not be
+                    read, such a metric is INCONCLUSIVE instead.)
+
+The overall status is the worst classification among the COMPARED metrics
+(EXACT < SURPASSED < APPROXIMATE < FAILED), or INCONCLUSIVE when nothing
+could be compared. The paper's metrics for the matched scenario come
+first: with MIN_PAPER_METRICS (3) or more of them compared, only they are
+used. With fewer, the run's other metrics are compared with the values the
+paper reports for its closest other scenario (published_scope
+"other_scenario"). A paper metric the run did not print stays listed
+(INCONCLUSIVE) and its revision is requested, but it does not set the
+status.
 
 Extracting "what number did the paper actually report" and "what number
 did our run actually print" are each a single, narrowly-scoped LLM call
@@ -75,22 +97,36 @@ _METRIC_LINE = re.compile(r"^\s*METRIC\s+([A-Za-z0-9_\- ]+?)\s*[=:]\s*([-+]?\d*\
                           re.MULTILINE)
 # Metrics with no fixed 0-1 / 0-100 scale: never converted to percentage
 # points (an RMSE of 0.5 is not 50 points), so never in the gap.
-UNBOUNDED_METRIC = re.compile(r"rmse|mse|mae|mape|loss|error(?!rate)|seconds|time|latency|runtime|perplexity")
+UNBOUNDED_METRIC = re.compile(r"rmse|mse|mae|mape|loss|error(?!rate)|seconds|time|latency|runtime|perplexity|cost")
 # A result as a paper writes it: a decimal or a percentage. Plain integers
 # (page numbers, counts, years) never confirm a value.
 _NUMBER = re.compile(r"\d*\.\d+|\d+(?=\s?%)")
 PUBLISHED_TEXT_CHARS = 24000  # results passages + results tables + dataset description (paper_fulltext.results_text)
 MAX_CONTEXT_ASSUMPTIONS = 12
 
-_STATUS_RANK = {"EXACT": 0, "APPROXIMATE": 1, "FAILED": 2, "INCONCLUSIVE": 3}
+# Worst last. NOT_IN_PAPER and NOT_A_SCORE are not ranked: they never set the overall status.
+_STATUS_RANK = {"EXACT": 0, "SURPASSED": 1, "APPROXIMATE": 2, "FAILED": 3, "INCONCLUSIVE": 4}
+NOT_IN_PAPER = "NOT_IN_PAPER"
+NOT_A_SCORE = "NOT_A_SCORE"   # time, loss, error, cost: never compared, so never part of the status
+COMPARED = ("EXACT", "SURPASSED", "APPROXIMATE", "FAILED")  # the statuses that set the overall status
+# With this many of the paper's metrics (for the matched scenario) compared,
+# only they are used; with fewer, the paper's other scenarios fill in.
+MIN_PAPER_METRICS = 3
+# Bounded scores where lower is better (an error or false-alarm rate): for
+# these, a reproduced value below the paper's is the better one.
+LOWER_IS_BETTER = re.compile(r"brier|loss|error|mse|mae|fpr|fnr|falsepositive|falsenegative|falsealarm|misclassif")
 
 _METRIC_DEFAULTS = {
     "metric": "",
     "published_value": None,
     "reproduced_value": None,
-    "difference_points": None,
+    "difference_points": None,             # absolute difference, percentage points
+    "signed_difference_points": None,      # + = better than the paper, - = worse (see signed_difference)
     "provisional_difference_points": None,  # a difference shown, but not counted in the gap (see run())
     "classification": "INCONCLUSIVE",
+    # Where the published value comes from: the scenario matched to the
+    # reproduction, or (fewer than MIN_PAPER_METRICS compared) another one.
+    "published_scope": "paper_scenario",
     "notes": "",
 }
 
@@ -109,7 +145,41 @@ METRIC_ALIASES = {
     "areaundertheroccurve": "auc", "rocaucscore": "auc", "aucscore": "auc",
     "sensitivity": "recall", "rc": "recall", "tpr": "recall", "truepositiverate": "recall",
     "pr": "precision", "ppv": "precision",
+    "brierscore": "brier",
 }
+
+
+# Metric names a paper's text can name, and the METRIC-line name a script
+# should print for each (paper_metric_names). Deterministic, no LLM.
+PAPER_METRIC_PATTERNS = (
+    ("accuracy", r"\baccuracy\b|\bacc\b"),
+    ("balanced_accuracy", r"balanced accuracy"),
+    ("precision", r"\bprecision\b|\bppv\b"),
+    ("recall", r"\brecall\b|\bsensitivity\b|true positive rate|\btpr\b|detection rate"),
+    ("specificity", r"\bspecificity\b|true negative rate|\btnr\b"),
+    ("f1", r"\bf1\b|f-?score|f-?measure"),
+    # "auc", but not the "auc" of AUC-PR / PR-AUC
+    ("roc_auc", r"(?<!pr-)(?<!pr_)(?<!pr )\bauc\b(?![-_ ]?pr\b)|\broc\b|auroc|area under the (roc )?curve"),
+    ("auc_pr", r"auc[-_ ]?pr\b|pr[-_ ]?auc|auprc|precision[- ]recall curve|average precision"),
+    ("mcc", r"\bmcc\b|matthews"),
+    ("g_mean", r"g[-_ ]?mean|geometric mean"),
+    ("kappa", r"\bkappa\b"),
+    ("brier", r"\bbrier\b"),
+    ("fpr", r"false positive rate|\bfpr\b|false alarm rate"),
+    ("fnr", r"false negative rate|\bfnr\b"),
+)
+
+
+def paper_metric_names(text: str) -> list:
+    """The metrics (as METRIC-line names) that the paper's text names, in a
+    fixed order. A hint for the Replication Agent: which metrics to print."""
+    low = (text or "").lower()
+    return [name for name, pattern in PAPER_METRIC_PATTERNS if re.search(pattern, low)]
+
+
+def print_name(metric: str) -> str:
+    """The METRIC-line name for a paper's metric name ("AUC-PR" -> "auc_pr")."""
+    return re.sub(r"[^a-z0-9]+", "_", (metric or "").lower()).strip("_") or "metric"
 
 
 def _normalize_metric_name(name: str) -> str:
@@ -126,6 +196,10 @@ def parse_metric_lines(text: str) -> dict:
     without this the unit was dropped and 0.5% was read as 50 points."""
     return {name.strip(): float(value) / 100 if percent else float(value)
             for name, value, percent in _METRIC_LINE.findall(text or "")}
+
+
+def higher_is_better(name: str) -> bool:
+    return not LOWER_IS_BETTER.search(_normalize_metric_name(name))
 
 
 def is_bounded_score(name: str) -> bool:
@@ -280,19 +354,87 @@ def to_percentage_points(value: float) -> float:
     return value * 100 if abs(value) <= 1.0 else value
 
 
-def _classify(published: float, reproduced: float) -> tuple:
+def signed_difference(published: float, reproduced: float, name: str = "") -> float:
+    """Reproduced minus published, in percentage points, signed so that +
+    is better than the paper: for a lower-is-better rate the sign flips."""
+    diff = to_percentage_points(reproduced) - to_percentage_points(published)
+    return diff if higher_is_better(name) else -diff
+
+
+def _classify(published: float, reproduced: float, name: str = "") -> tuple:
     """Deterministic classification -- a fixed percentage-point tolerance
     band, not an LLM judgment call, once both numbers are in hand. Both
     values are normalized onto a 0-100 percentage-point scale first so a
     0-1 fraction and a 0-100 percentage compare correctly against the
-    same thresholds."""
-    pub, rep = to_percentage_points(published), to_percentage_points(reproduced)
-    diff = abs(pub - rep)
+    same thresholds. Direction matters: a score better than the paper's
+    (beyond the EXACT band) is SURPASSED, never FAILED -- in a live run an
+    AUC 5 points above the paper was labelled FAILED."""
+    signed = signed_difference(published, reproduced, name)
+    diff = abs(signed)
     if diff <= EXACT_THRESHOLD_POINTS:
         return "EXACT", diff
+    if signed > 0:
+        return "SURPASSED", diff
     if diff <= APPROXIMATE_THRESHOLD_POINTS:
         return "APPROXIMATE", diff
     return "FAILED", diff
+
+
+def overall_status(metrics: list) -> str:
+    """The worst classification among the compared metrics (COMPARED); a
+    metric that could not be compared (INCONCLUSIVE, NOT_IN_PAPER,
+    NOT_A_SCORE) never sets it. INCONCLUSIVE only when nothing was compared.
+    A missing paper metric is still listed, and its revision requested."""
+    ranked = [m["classification"] for m in metrics if m.get("classification") in COMPARED]
+    return max(ranked, key=lambda c: _STATUS_RANK[c]) if ranked else "INCONCLUSIVE"
+
+
+def _compared_count(metrics: list, scope: str = "paper_scenario") -> int:
+    return sum(1 for m in metrics if m.get("classification") in COMPARED and m.get("published_scope") == scope)
+
+
+def _comparison_basis(metrics: list) -> str:
+    """What the overall status was judged on: "paper_metrics" (the paper's
+    metrics for the matched scenario, MIN_PAPER_METRICS or more, or all
+    there are), "paper_and_other_scenarios" (fewer, filled in from the
+    paper's other scenarios), or "none"."""
+    if _compared_count(metrics, "other_scenario"):
+        return "paper_and_other_scenarios"
+    return "paper_metrics" if _compared_count(metrics) else "none"
+
+
+def _compare_other_scenarios(metrics: list, published_text: str, published_label: str, published_limit: int,
+                             published_source: str, extraction: dict, replication_result: dict,
+                             cleaning_result: dict, dataset_result: dict) -> None:
+    """Fewer than MIN_PAPER_METRICS paper metrics were compared: look up the
+    run's other metrics (NOT_IN_PAPER) in the paper's other scenarios or
+    tables (one extraction call, the same checks), and compare those found.
+    Updates metrics in place; each one found is marked other_scenario."""
+    wanted = {_normalize_metric_name(m["metric"]): m for m in metrics
+              if m["classification"] == NOT_IN_PAPER and is_bounded_score(m["metric"])}
+    if not wanted:
+        return
+    main = ", ".join(filter(None, [extraction.get("scenario"), extraction.get("dataset")])) or "the main result"
+    context = (_reproduction_context(replication_result, cleaning_result, dataset_result)
+               + f"\nThe matching scenario ({main}) does not state these metrics: "
+               + ", ".join(m["metric"] for m in wanted.values())
+               + ". Return values for ONLY these metrics, from the scenario closest to it that states them (prefer "
+                 "the same model, then the same dataset). Name that scenario.")
+    other = {}
+    found = _extract_metrics(published_text, published_label, max_chars=published_limit, context=context,
+                             verify=published_source == "full_text", details=other)
+    scenario = ", ".join(filter(None, [other.get("scenario"), other.get("dataset")])) or "another scenario"
+    for name, value in found.items():
+        m = wanted.get(_normalize_metric_name(name))
+        if m is None or not isinstance(value, (int, float)):
+            continue
+        classification, diff = _classify(value, m["reproduced_value"], m["metric"])
+        m.update(published_value=value, difference_points=diff, classification=classification,
+                 signed_difference_points=round(signed_difference(value, m["reproduced_value"], m["metric"]), 4),
+                 published_scope="other_scenario",
+                 notes=f"From another scenario in the paper ({scenario}): the matched scenario does not state it, and "
+                       f"fewer than {MIN_PAPER_METRICS} of the paper's metrics could be compared.")
+        print(f"[Evaluation Agent] {m['metric']}: compared with the paper's value for {scenario} ({value}).")
 
 
 def _likely_causes(parent_paper: dict, replication_result: dict, metrics: list) -> list:
@@ -324,6 +466,11 @@ def _likely_causes(parent_paper: dict, replication_result: dict, metrics: list) 
         causes.append("Possible causes for a large gap: random seed differences, hardware/library version "
                        "differences, missing preprocessing details, or hyperparameter differences not stated "
                        "in the paper.")
+    surpassed = [m["metric"] for m in metrics if m["classification"] == "SURPASSED"]
+    if surpassed:
+        causes.append(f"The reproduction scored above the paper on {', '.join(surpassed)}. Possible causes: a "
+                      "different data version, sample or split, different library defaults, or a change beyond "
+                      "the paper's method (see the reruns). A higher score is checked for leakage like any other.")
     return causes
 
 
@@ -554,12 +701,70 @@ def review_unavailable(evaluation_result: dict | None) -> bool:
     return ((evaluation_result or {}).get("review") or {}).get("review_status") == "UNAVAILABLE"
 
 
-def _decide(raw: dict, findings: list, static: list, facts: dict, source: str) -> tuple[dict, list]:
+# A missing paper metric is requested at most this many times; after that it
+# is recorded as not realistically possible for this baseline.
+MAX_METRIC_REQUESTS = 2
+METRIC_REQUEST_TAG = "[paper metrics to print:"
+# How to compute a metric the paper reports, with the allowed libraries. By
+# normalized name (_normalize_metric_name); others: as the paper defines it.
+METRIC_HOWTO = {
+    "accuracy": "sklearn.metrics.accuracy_score(y_test, y_pred)",
+    "balancedaccuracy": "sklearn.metrics.balanced_accuracy_score(y_test, y_pred)",
+    "precision": "sklearn.metrics.precision_score(y_test, y_pred) (positive class)",
+    "recall": "sklearn.metrics.recall_score(y_test, y_pred) (positive class)",
+    "f1": "sklearn.metrics.f1_score(y_test, y_pred) (positive class)",
+    "auc": "sklearn.metrics.roc_auc_score(y_test, scores) with scores = predict_proba(X_test)[:, 1]",
+    "aucpr": "sklearn.metrics.average_precision_score(y_test, scores) with scores = predict_proba(X_test)[:, 1]",
+    "prauc": "sklearn.metrics.average_precision_score(y_test, scores) with scores = predict_proba(X_test)[:, 1]",
+    "specificity": "tn / (tn + fp), with tn, fp, fn, tp = sklearn.metrics.confusion_matrix(y_test, y_pred).ravel()",
+    "mcc": "sklearn.metrics.matthews_corrcoef(y_test, y_pred)",
+    "gmean": "sqrt(recall * specificity), both from the confusion matrix",
+    "kappa": "sklearn.metrics.cohen_kappa_score(y_test, y_pred)",
+    "brier": "sklearn.metrics.brier_score_loss(y_test, scores) with scores = predict_proba(X_test)[:, 1]",
+    "fpr": "fp / (fp + tn) from sklearn.metrics.confusion_matrix(y_test, y_pred).ravel()",
+    "fnr": "fn / (fn + tp) from sklearn.metrics.confusion_matrix(y_test, y_pred).ravel()",
+    "npv": "tn / (tn + fn) from sklearn.metrics.confusion_matrix(y_test, y_pred).ravel()",
+}
+
+
+def _howto(metric: str) -> str:
+    return METRIC_HOWTO.get(_normalize_metric_name(metric)) or "as the paper defines it"
+
+
+def missing_metric_instruction(missing: list, again: bool = False) -> str:
+    """The revision instruction for the paper metrics the run did not print:
+    how to compute each, and a tag that lists them (_metric_requests)."""
+    names = [print_name(m["metric"]) for m in missing]
+    how = "; ".join(f"{name} = {_howto(m['metric'])}" for name, m in zip(names, missing))
+    return (("The previous revision still did not print these metrics; add them now. " if again else "")
+            + f"Compute on the test set and print every metric the Parent Paper reports that the run does not print "
+            f"yet, each on its own line as {METRIC_LINE_FORMAT} with the value as a fraction between 0 and 1. "
+            f"How: {how}. Keep everything else unchanged. {METRIC_REQUEST_TAG} {', '.join(names)}]")
+
+
+def _metric_requests(history: list, name: str) -> int:
+    """How many earlier reruns asked for this metric (by the request tag)."""
+    count = 0
+    for h in history or []:
+        for instruction in h.get("instructions") or []:
+            tagged = str(instruction).partition(METRIC_REQUEST_TAG)[2].rstrip("]")
+            if name in [n.strip() for n in tagged.split(",") if n.strip()]:
+                count += 1
+                break
+    return count
+
+
+def _decide(raw: dict, findings: list, static: list, facts: dict, source: str, missing: list = None,
+            history: list = None) -> tuple[dict, list]:
     """Turn the LLM's proposed decision into one the evidence supports.
     Returns (decision, notes on any change). Deterministic rules:
 
       - verified leakage in a reconstructed baseline is always fixed first
         (a leaky score is not a real score);
+      - a reconstructed baseline must print every score the paper reports
+        (missing): its revision adds them (with how to compute each),
+        together with any leakage fix; each is asked for up to
+        MAX_METRIC_REQUESTS times;
       - "revise_replication" needs a verified critical/major finding and a
         reconstructed baseline;
       - "rerun_data_agent" needs a verified insufficient_data finding and a
@@ -582,17 +787,41 @@ def _decide(raw: dict, findings: list, static: list, facts: dict, source: str) -
         notes.append(f"Proposed '{action}' changed to 'revise_replication': verified data leakage must be fixed "
                      "before any other change, since the current score is not valid.")
         action = "revise_replication"
+    metric_fix = ""
+    if missing:
+        names = ", ".join(print_name(m["metric"]) for m in missing)
+        if source != "reconstructed":
+            notes.append(f"The run does not print {names}, which the paper reports, and the authors' cloned code is "
+                         "not changed; those metrics stay INCONCLUSIVE.")
+        else:
+            # Push for every paper metric: each missing one is asked for up to
+            # MAX_METRIC_REQUESTS times, then recorded as not realistically possible.
+            tries = {print_name(m["metric"]): _metric_requests(history, print_name(m["metric"])) for m in missing}
+            ask = [m for m in missing if tries[print_name(m["metric"])] < MAX_METRIC_REQUESTS]
+            given_up = [name for name, n in tries.items() if n >= MAX_METRIC_REQUESTS]
+            if given_up:
+                notes.append(f"Asked {MAX_METRIC_REQUESTS} times for {', '.join(given_up)}, and the run still does not "
+                             "print them: not realistically possible for this baseline, not requested again.")
+            if ask:
+                metric_fix = missing_metric_instruction(ask, again=any(tries[print_name(m["metric"])] for m in ask))
+                if action != "revise_replication":
+                    notes.append(f"Proposed '{action}' changed to 'revise_replication': the run must print every "
+                                 f"metric the paper reports, and it does not print "
+                                 f"{', '.join(print_name(m['metric']) for m in ask)}.")
+                    action = "revise_replication"
     if action == "revise_replication":
         if source != "reconstructed":
             notes.append("'revise_replication' not possible: the baseline is the authors' cloned code, which is "
                          "preserved. The defects are reported for the Experiment Agent and the report.")
             action = "accept"
-        elif not serious:
+        elif not serious and not metric_fix:
             notes.append("'revise_replication' not supported by a verified critical/major finding.")
             action = "accept"
         else:
             fixes = [f"{f['issue']} Fix: {f['fix']}" for f in leakage + serious if f.get("fix")]
-            instructions = list(dict.fromkeys(fixes + instructions))
+            # Only the missing metrics: the LLM's other instructions need a verified finding.
+            instructions = list(dict.fromkeys(fixes + (instructions if serious else []) + ([metric_fix] if metric_fix
+                                                                                        else [])))
     if action == "rerun_data_agent":
         current = facts.get("master_rows") or 0
         goal = raw.get("target_entries")
@@ -627,8 +856,11 @@ def _decide(raw: dict, findings: list, static: list, facts: dict, source: str) -
 
 
 def review(parent_paper: dict, paper: dict, replication_result: dict, metrics: list, stdout: str,
-           cleaning_result: dict = None, dataset_result: dict = None, history: list = None) -> dict:
-    """The senior data analyst review (see the section comment above)."""
+           cleaning_result: dict = None, dataset_result: dict = None, history: list = None,
+           missing_metrics: list = None) -> dict:
+    """The senior data analyst review (see the section comment above).
+    missing_metrics: the scores the paper reports that the run did not
+    print; a reconstructed baseline is revised to print them (_decide)."""
     script_path, script = _read_baseline_script(replication_result)
     stderr = _read_stdout(replication_result.get("stderr_path", ""))
     static = [dict(f, verified=True, source="static_check") for f in find_leakage(script)]
@@ -663,7 +895,13 @@ def review(parent_paper: dict, paper: dict, replication_result: dict, metrics: l
 
     corpus = "\n".join([script, stdout or "", stderr, paper.get("text", ""), json.dumps(facts, default=str)])
     findings = _verify(raw.get("findings") or [], corpus)
-    decision, decision_notes = _decide(raw.get("decision"), findings, static, facts, source)
+    missing_metrics = list(missing_metrics or [])
+    decision, decision_notes = _decide(raw.get("decision"), findings, static, facts, source, missing_metrics,
+                                       history)
+    metric_findings = [{"category": "missing_metric", "severity": "major", "verified": True,
+                        "issue": f"The run does not print {m['metric']}, which the Parent Paper reports.",
+                        "evidence": f"{m['metric']} = {m['published_value']} (the paper's value)",
+                        "fix": f"Print METRIC {print_name(m['metric'])}=<value>."} for m in missing_metrics]
     if review_error:
         decision_notes.insert(0, f"{review_error} The analyst review is UNAVAILABLE: the baseline's validity was "
                                  "checked only by the deterministic leakage checks.")
@@ -673,6 +911,7 @@ def review(parent_paper: dict, paper: dict, replication_result: dict, metrics: l
         "assessment": str(raw.get("assessment") or ""),
         "static_findings": static,
         "findings": findings,
+        "metric_findings": metric_findings,  # paper metrics the run did not print (never leakage)
         "data_facts": facts,
         "decision": decision,
         "decision_notes": decision_notes,
@@ -688,6 +927,7 @@ def _request_for(decision: dict, review_result: dict) -> list:
     if decision["action"] == "accept":
         return []
     evidence = [f for f in review_result["static_findings"] + review_result["findings"]
+                + review_result.get("metric_findings", [])
                 if f.get("verified", True) and f["severity"] in ("critical", "major")]
     goal = {"target_entries": decision["target_entries"]} if decision["target_entries"] else {}
     if decision["experiment_category"]:
@@ -764,8 +1004,9 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
     """
     Compare the Replication Agent's captured output against the Parent
     Paper's own stated results (a per-metric breakdown plus an overall
-    classification -- the worst case among matched metrics, or INCONCLUSIVE
-    if none could be matched), then review the replication as a senior data
+    classification -- the worst case among the paper's metrics, see
+    overall_status; a metric only the run printed is NOT_IN_PAPER and does
+    not count), then review the replication as a senior data
     analyst and return the next-action request for Master Agent.
 
     cleaning_result/dataset_result describe the data actually used;
@@ -830,12 +1071,12 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
             _, rep_value = reproduced_by_key[key]
             if not is_bounded_score(pub_name):
                 metrics.append(_default_metric(
-                    metric=pub_name, published_value=pub_value, reproduced_value=rep_value,
+                    metric=pub_name, published_value=pub_value, reproduced_value=rep_value, classification=NOT_A_SCORE,
                     notes=f"Not a 0-1/0-100 score (error, loss or time): raw difference "
                           f"{round(abs(rep_value - pub_value), 6)}, not percentage points, and not counted in "
-                          "the gap."))
+                          "the gap or the overall status."))
                 continue
-            classification, diff = _classify(pub_value, rep_value)
+            classification, diff = _classify(pub_value, rep_value, pub_name)
             if not trusted_source:
                 metrics.append(_default_metric(
                     metric=pub_name, published_value=pub_value, reproduced_value=rep_value,
@@ -846,21 +1087,41 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
             metrics.append(_default_metric(
                 metric=pub_name, published_value=pub_value, reproduced_value=rep_value,
                 difference_points=diff, classification=classification,
+                signed_difference_points=round(signed_difference(pub_value, rep_value, pub_name), 4),
                 notes=f"Paper's value for: {scenario_note}." if scenario_note else "",
             ))
         else:
+            bounded = is_bounded_score(pub_name)
             metrics.append(_default_metric(
                 metric=pub_name, published_value=pub_value,
-                notes="Not printed by the reproduction run.",
+                classification="INCONCLUSIVE" if bounded else NOT_A_SCORE,
+                notes="Not printed by the reproduction run." + (
+                    "" if bounded else " Not a 0-1/0-100 score (error, loss, time or cost), so it is never compared "
+                                       "and not part of the overall status."),
             ))
     for key, (rep_name, rep_value) in reproduced_by_key.items():
         if key not in published_by_key:
+            # The paper's text was read and does not state it: shown, never part
+            # of the overall status. When the paper's values could not be read,
+            # the paper may state it, so it stays INCONCLUSIVE.
+            unread = extraction.get("status") in ("FAILED", "AMBIGUOUS") or \
+                any(n.startswith(f"{rep_name}:") for n in extraction.get("notes") or [])
+            note = _unpublished_note(rep_name, extraction, published_source)
             metrics.append(_default_metric(
                 metric=rep_name, reproduced_value=rep_value,
-                notes=_unpublished_note(rep_name, extraction, published_source),
+                classification="INCONCLUSIVE" if unread else NOT_IN_PAPER,
+                notes=note if unread else note + " Not part of the overall status.",
             ))
 
-    overall = max((m["classification"] for m in metrics), key=lambda c: _STATUS_RANK[c]) if metrics else "INCONCLUSIVE"
+    # The paper's metrics for the matched scenario come first. With fewer than
+    # MIN_PAPER_METRICS of them compared, the run's other metrics are compared
+    # with the values the paper reports for its closest other scenario.
+    if trusted_source and _compared_count(metrics) < MIN_PAPER_METRICS:
+        _compare_other_scenarios(metrics, published_text, published_label, published_limit, published_source,
+                                 extraction, replication_result, cleaning_result, dataset_result)
+    basis = _comparison_basis(metrics)
+
+    overall = overall_status(metrics)
     causes = _likely_causes(parent_paper, replication_result, metrics)
     leakage_check = _published_leakage_check(published_by_key, reproduced_by_key, trusted_source, paper,
                                              replication_result, cleaning_result)
@@ -875,9 +1136,15 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
                       "abstract -- a snippet can quote another paper's results, so they are UNVERIFIED and not "
                       "counted in the gap.")
 
+    # The run must print every score the paper reports for its model.
+    missing = [m for m in metrics if m["classification"] == "INCONCLUSIVE" and m["published_value"] is not None
+               and m["reproduced_value"] is None and trusted_source]
+    if missing:
+        causes.append("The run does not print " + ", ".join(m["metric"] for m in missing) + ", which the paper "
+                      "reports, so those metrics cannot be compared.")
     print(f"[Evaluation Agent] Compared {len(metrics)} metric(s): overall={overall}. Reviewing the replication...")
     review_result = review(parent_paper, paper, replication_result, metrics, reproduced_text,
-                           cleaning_result, dataset_result, history)
+                           cleaning_result, dataset_result, history, missing_metrics=missing)
     decision = review_result["decision"]
     for f in review_result["static_findings"]:
         print(f"[Evaluation Agent] Leakage check: {f['issue']} (line {f['line']}: {f['evidence']})")
@@ -894,6 +1161,9 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
         "source": replication_result.get("source", ""),
         "metrics": metrics,
         "published_metrics_found": bool(published_metrics),
+        # What the overall status was judged on (_comparison_basis) and how many metrics.
+        "comparison_basis": basis,
+        "compared_metrics": sum(1 for m in metrics if m["classification"] in COMPARED),
         "published_source": published_source,
         # How the paper's values were read: status, the chosen scenario and
         # dataset, and why any value was left out (raw reply on a failure).

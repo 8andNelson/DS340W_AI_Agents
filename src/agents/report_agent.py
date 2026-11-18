@@ -107,7 +107,7 @@ def _paper_record(p: dict, key: str, parent_title: str) -> dict:
 
 def gather_facts(project: dict, run_id: str = None) -> dict:
     """Every fact the report may state, from the run's approved results."""
-    from src.agents.experiment_agent import score_gap
+    from src.agents.experiment_agent import score_gap, score_margin, signed_points
 
     intake = project.get("structured") or {}
     validation = project.get("validation_result") or {}
@@ -140,6 +140,13 @@ def gather_facts(project: dict, run_id: str = None) -> dict:
     environment = Path(replication_dir) / "ENVIRONMENT.md" if replication_dir else None
 
     baseline_gap = reruns[0].get("gap_before") if reruns else score_gap(evaluation)
+    baseline_margin = reruns[0].get("margin_before") if reruns else score_margin(evaluation)
+    # Changes the Experiment Agent declared to be beyond the Parent Paper's
+    # method; the kept ones are part of the final result.
+    beyond = [{"rerun": r.get("rerun"), "target_agent": r.get("target_agent"),
+               "new_methods": list(r.get("new_methods") or []), "kept": bool(r.get("applied")),
+               "instructions": [_short(i, 300) for i in r.get("instructions") or []]}
+              for r in reruns if r.get("method_source") == "beyond_paper"]
     return {
         "topic": project.get("topic") or intake.get("project_topic") or "",
         "research_question": intake.get("research_question") or intake.get("domain") or "",
@@ -201,26 +208,37 @@ def gather_facts(project: dict, run_id: str = None) -> dict:
                         "repository_fallback": replication.get("repository_fallback"),
                         "baseline_failed": bool(replication.get("baseline_failed"))},
         "evaluation": {"status": evaluation.get("status"),
-                       "metrics": [{k: m.get(k) for k in ("metric", "published_value", "reproduced_value",
-                                                          "difference_points", "classification", "notes")}
+                       "comparison_basis": evaluation.get("comparison_basis") or "",
+                       "compared_metrics": evaluation.get("compared_metrics"),
+                       "metrics": [{**{k: m.get(k) for k in ("metric", "published_value", "reproduced_value",
+                                                             "difference_points", "classification", "notes")},
+                                    "signed_difference_points": signed_points(m),
+                                    "published_scope": m.get("published_scope") or "paper_scenario"}
                                    for m in evaluation.get("metrics") or []],
-                       "mean_gap_points": score_gap(evaluation), "likely_causes": list(evaluation.get("likely_causes") or []),
+                       "mean_gap_points": score_gap(evaluation), "mean_margin_points": score_margin(evaluation), "likely_causes": list(evaluation.get("likely_causes") or []),
                        "assessment": _short(review.get("assessment"), 1200), "verified_findings": findings,
                        "decision": (evaluation.get("decision") or {}).get("action")},
         "experiments": {"rerun_count": len(reruns), "kept_count": sum(bool(r.get("applied")) for r in reruns),
                         "baseline_gap_points": baseline_gap, "final_gap_points": score_gap(evaluation),
+                        "baseline_margin_points": baseline_margin, "final_margin_points": score_margin(evaluation),
+                        "beyond_paper": beyond,
+                        "beyond_paper_in_final": [b for b in beyond if b["kept"]],
                         "end_reason": project.get("rerun_end_reason") or "",
                         "reruns": [{"rerun": r.get("rerun"), "requested_by": r.get("requested_by"),
                                     "target_agent": r.get("target_agent"),
                                     "instructions": [_short(i, 300) for i in r.get("instructions") or []],
                                     "goal": r.get("goal") or {}, "gap_before": r.get("gap_before"),
-                                    "gap_after": r.get("gap_after"), "kept": bool(r.get("applied")),
+                                    "gap_after": r.get("gap_after"), "margin_before": r.get("margin_before"),
+                                    "margin_after": r.get("margin_after"),
+                                    "method_source": r.get("method_source") or "",
+                                    "new_methods": list(r.get("new_methods") or []), "kept": bool(r.get("applied")),
                                     "improved": bool(r.get("improved")), "outcome": _short(r.get("outcome"), 300)}
                                    for r in reruns],
                         "analyses": [{"analysis": _short(a.get("analysis"), 600),
                                       "decision": (a.get("decision") or {}).get("action"),
                                       "target_agent": (a.get("decision") or {}).get("target_agent"),
-                                      "gap_points": a.get("gap_points")} for a in analyses]},
+                                      "gap_points": a.get("gap_points"), "margin_points": a.get("margin_points")}
+                                     for a in analyses]},
         "run": {"run_id": run_id, "date": datetime.now(timezone.utc).date().isoformat(),
                 "llm_provider": getattr(llm, "LLM_PROVIDER", ""), "models_used": _models_used(run_id)},
     }
@@ -266,6 +284,14 @@ def _overclaim(sentence: str, facts: dict) -> str:
         return f"claims an exact reproduction, but the evaluation status is {status or 'not set'}"
     if status in ("FAILED", "INCONCLUSIVE", "") and re.search(r"\bsuccessful(ly)?\s+(reproduc|replicat)", low):
         return f"claims a successful reproduction, but the evaluation status is {status or 'not set'}"
+    surpassed = any(m.get("classification") == "SURPASSED" for m in facts["evaluation"].get("metrics") or [])
+    if not surpassed and re.search(r"\b(surpass|outperform|exceed|beat|better than)\w*\b.{0,40}\b(paper|published|"
+                                   r"original|authors)", low) and not re.search(r"\b(not|no|n't|did not)\b", low):
+        return "claims a score above the paper, but no metric is SURPASSED"
+    if facts["experiments"].get("beyond_paper_in_final") and \
+            re.search(r"\b(only|solely|strictly|entirely)\b.{0,30}\b(paper's|paper|original)\s+(method|methodology)",
+                      low) and not re.search(r"\b(not|no|n't)\b", low):
+        return "says only the paper's method was used, but a kept rerun used a method beyond the paper"
     if facts["replication"].get("source") == "reconstructed" and \
             re.search(r"\b(authors'|official|original)\s+(code|implementation|repository)", low) and \
             not re.search(r"\b(not|no|n't|without|unavailable|could not)\b", low):
@@ -303,8 +329,12 @@ SYSTEM = (
     "2. Copy any number exactly as it is in the facts. Prefer to refer to the Results table over restating "
     "values.\n"
     "3. Cite papers only with their keys in square brackets, e.g. [P2]. The Parent Paper is facts.parent_paper.key.\n"
-    "4. State the reproduction outcome exactly as facts.evaluation.status says (EXACT, APPROXIMATE, FAILED or "
-    "INCONCLUSIVE). A reconstructed baseline (facts.replication.source == 'reconstructed') is not the authors' code.\n"
+    "4. State the reproduction outcome exactly as facts.evaluation.status says (EXACT, SURPASSED, APPROXIMATE, "
+    "FAILED or INCONCLUSIVE). SURPASSED means the reproduction scored above the paper. A metric marked "
+    "NOT_IN_PAPER is one the paper does not state, and NOT_A_SCORE is a time, loss or cost: neither is part of the outcome. A reconstructed baseline "
+    "(facts.replication.source == 'reconstructed') is not the authors' code.\n"
+    "4a. When facts.experiments.beyond_paper_in_final is not empty, say plainly that the final result uses methods "
+    "the Parent Paper does not describe, and name them. Never present them as the paper's method.\n"
     "5. Where a paper's status is UNVERIFIED, say it could not be verified. State uncertainty; never guess.\n"
     "6. A failed or imperfect reproduction is useful research information: report it plainly.\n"
     "Answer with one JSON object and nothing else, with these string keys: "
@@ -418,31 +448,75 @@ def metrics_figure(metrics: list) -> str | None:
 
 
 def gap_figure(facts: dict) -> str | None:
-    """The mean gap to the paper after the baseline and each rerun, or None."""
+    """The mean difference from the paper (+ above it) after the baseline
+    and each rerun, as bars around zero, or None."""
     exp = facts["experiments"]
     steps = []
-    if exp["baseline_gap_points"] is not None:
-        steps.append(("Baseline", exp["baseline_gap_points"], True))
-    steps += [(f"Rerun {r['rerun']} ({r['target_agent']})", r["gap_after"], r["kept"])
-              for r in exp["reruns"] if isinstance(r.get("gap_after"), (int, float))]
+    if exp.get("baseline_margin_points") is not None:
+        steps.append(("Baseline", exp["baseline_margin_points"], True))
+    steps += [(f"Rerun {r['rerun']} ({r['target_agent']})", r["margin_after"], r["kept"])
+              for r in exp["reruns"] if isinstance(r.get("margin_after"), (int, float))]
     if len(steps) < 2:
         return None
     top = max(abs(v) for _, v, _ in steps) * 1.1 or 1.0
     left, plot_w, bar_h, row_h = 210, 330, 16, 26
+    zero = left + plot_w / 2
     height = 70 + row_h * len(steps) + 30
-    body = [f'<text x="16" y="48" font-size="12" fill="{INK_2}">Mean gap to the paper, percentage points '
-            f'(shorter is closer). Grey: not kept.</text>']
+    body = [f'<text x="16" y="48" font-size="12" fill="{INK_2}">Mean difference from the paper, percentage points '
+            f'(right of the line: above the paper). Grey: not kept.</text>']
     for n, (label, value, kept) in enumerate(steps):
         y = 64 + n * row_h
-        w = plot_w * abs(value) / top
+        w = (plot_w / 2) * abs(value) / top
         color = PUBLISHED_COLOR if kept else NOT_KEPT_COLOR
+        tip = f"{label}: {value:+g} points" + ("" if kept else " (not kept)")
         body.append(f'<text x="{left - 8}" y="{y + bar_h - 3}" font-size="12" fill="{INK}" '
                     f'text-anchor="end">{_xml(label)}</text>')
-        body.append(_bar(left, y, w, bar_h, color, f"{label}: {value} points" + ("" if kept else " (not kept)")))
-        body.append(f'<text x="{left + w + 6:.1f}" y="{y + bar_h - 3}" font-size="11" fill="{INK_2}">'
-                    f'{_xml(value)}{"" if kept else " (not kept)"}</text>')
-    body.append(f'<line x1="{left}" y1="58" x2="{left}" y2="{height - 26}" stroke="{GRID}" stroke-width="1"/>')
-    return _svg(620, height, "Gap to the Parent Paper over the reruns", body)
+        if value >= 0:
+            body.append(_bar(zero, y, w, bar_h, color, tip))
+            text_x, anchor = zero + w + 6, "start"
+        else:
+            body.append(f'<rect x="{zero - w:.1f}" y="{y}" width="{w:.1f}" height="{bar_h}" rx="3" fill="{color}">'
+                        f'<title>{_xml(tip)}</title></rect>')
+            text_x, anchor = zero - w - 6, "end"
+        body.append(f'<text x="{text_x:.1f}" y="{y + bar_h - 3}" font-size="11" fill="{INK_2}" '
+                    f'text-anchor="{anchor}">{value:+g}{"" if kept else " (not kept)"}</text>')
+    body.append(f'<line x1="{zero:.1f}" y1="58" x2="{zero:.1f}" y2="{height - 26}" stroke="{INK_2}" stroke-width="1"/>')
+    return _svg(620, height, "Difference from the Parent Paper over the reruns", body)
+
+
+def _basis_line(ev: dict) -> str:
+    """What the overall status was judged on (the Evaluation Agent's comparison_basis)."""
+    other = sum(1 for m in ev["metrics"] if m.get("published_scope") == "other_scenario"
+                and m.get("difference_points") is not None)
+    count = ev.get("compared_metrics")
+    if ev.get("comparison_basis") == "paper_and_other_scenarios":
+        return (f"The status is judged on {count} metric(s): fewer than 3 of the paper's metrics for the matched "
+                f"scenario could be compared, so {other} were compared with values the paper reports for another "
+                "scenario (see the Notes column).")
+    if ev.get("comparison_basis") == "paper_metrics":
+        return f"The status is judged on the {count} metric(s) the paper reports for the matched scenario."
+    return ""
+
+
+def _signed(value) -> str:
+    return "n/a" if not isinstance(value, (int, float)) else f"{value:+g}"
+
+
+def _method_label(rerun: dict) -> str:
+    if rerun.get("method_source") == "beyond_paper":
+        return "beyond the paper: " + (", ".join(rerun.get("new_methods") or []) or "methods not named")
+    return "paper's method" if rerun.get("method_source") == "paper" else "not stated"
+
+
+def _beyond_paper_lines(exp: dict) -> list:
+    """Section 9's note on changes beyond the Parent Paper's method."""
+    if not exp["beyond_paper"]:
+        return ["Every rerun stayed within the Parent Paper's method.", ""]
+    lines = ["Changes beyond the Parent Paper's method (methods the paper does not describe):"]
+    lines += [f"- Rerun {b['rerun']} ({b['target_agent']}): {', '.join(b['new_methods']) or 'methods not named'}; "
+              + ("kept, so it is part of the final result." if b["kept"] else "not kept.")
+              for b in exp["beyond_paper"]]
+    return lines + [""]
 
 
 def _environment_line(rep: dict) -> str:
@@ -564,19 +638,23 @@ def render(facts: dict, sections: dict, removed: list, figures: dict, prose_erro
     L += ["## 9. Proposed Changes / Experiments", ""]
     if exp["reruns"]:
         L += [f"Master Agent ran {exp['rerun_count']} rerun(s) requested by the Evaluation and Experiment Agents; "
-              f"{exp['kept_count']} were kept. A rerun that moved the score away from the paper was reverted.", ""]
-        L += _table(["Rerun", "Requested by", "Agent rerun", "Instructions", "Gap before", "Gap after", "Kept",
-                     "Outcome"],
-                    [[r["rerun"], r["requested_by"], r["target_agent"], "; ".join(r["instructions"]) or r["goal"],
-                      r["gap_before"], r["gap_after"], "yes" if r["kept"] else "no", r["outcome"]]
+              f"{exp['kept_count']} were kept. The goal is the paper's score and, where possible, a higher one; a "
+              "rerun that lowered the score was reverted. Difference = reproduced minus published, in percentage "
+              "points (+ is above the paper).", ""]
+        L += _table(["Rerun", "Requested by", "Agent rerun", "Method", "Instructions", "Difference before",
+                     "Difference after", "Kept", "Outcome"],
+                    [[r["rerun"], r["requested_by"], r["target_agent"], _method_label(r),
+                      "; ".join(r["instructions"]) or r["goal"], _signed(r["margin_before"]),
+                      _signed(r["margin_after"]), "yes" if r["kept"] else "no", r["outcome"]]
                      for r in exp["reruns"]]) + [""]
+        L += _beyond_paper_lines(exp)
     else:
         L += ["No rerun was run.", ""]
     if exp["end_reason"]:
         L += [f"The rerun loop ended because {exp['end_reason']}.", ""]
     for n, a in enumerate(exp["analyses"], 1):
         if a["analysis"]:
-            L.append(f"- Experiment Agent analysis {n} (gap {a['gap_points'] if a['gap_points'] is not None else 'n/a'}"
+            L.append(f"- Experiment Agent analysis {n} (difference {_signed(a.get('margin_points'))}"
                      f" points; decision {a['decision']}{' -> ' + a['target_agent'] if a['target_agent'] else ''}): "
                      f"{a['analysis']}")
     L.append("")
@@ -591,18 +669,33 @@ def render(facts: dict, sections: dict, removed: list, figures: dict, prose_erro
 
     L += ["## 11. Results", "",
           f"Overall reproduction status: **{ev['status'] or 'not set'}**. "
-          + (f"Mean gap to the paper: {ev['mean_gap_points']} percentage points"
-             + (f" (baseline before reruns: {exp['baseline_gap_points']})." if exp["reruns"] else ".")
-             if ev["mean_gap_points"] is not None
-             else "The gap to the paper is not measurable: no metric is stated on both sides."), ""]
+          + (f"Mean difference from the paper: {_signed(ev['mean_margin_points'])} percentage points "
+             "(+ is above the paper)"
+             + (f" (baseline before reruns: {_signed(exp['baseline_margin_points'])})." if exp["reruns"] else ".")
+             if ev["mean_margin_points"] is not None
+             else "The difference from the paper is not measurable: no metric is stated on both sides."), ""]
+    if _basis_line(ev):
+        L += [_basis_line(ev), ""]
+    if exp["beyond_paper_in_final"]:
+        L += ["The final result includes changes beyond the Parent Paper's method: "
+              + "; ".join(f"rerun {b['rerun']} ({', '.join(b['new_methods']) or 'methods not named'})"
+                          for b in exp["beyond_paper_in_final"]) + ". It is not a pure reproduction of the paper.", ""]
     if ev["metrics"]:
-        L += _table(["Metric", "Published", "Reproduced", "Difference (points)", "Classification", "Notes"],
-                    [[m["metric"], m["published_value"], m["reproduced_value"], m["difference_points"],
-                      m["classification"], m["notes"]] for m in ev["metrics"]]) + [""]
+        L += _table(["Metric", "Published", "Reproduced", "Difference (points, + above the paper)", "Classification",
+                     "Notes"],
+                    [[m["metric"], m["published_value"], m["reproduced_value"],
+                      _signed(m.get("signed_difference_points")), m["classification"], m["notes"]]
+                     for m in ev["metrics"]]) + [""]
+        if any(m["classification"] == "NOT_IN_PAPER" for m in ev["metrics"]):
+            L += ["NOT_IN_PAPER: the run printed this metric, but the Parent Paper does not state it. It is shown for "
+                  "information and is not part of the overall status.", ""]
+        if any(m["classification"] == "NOT_A_SCORE" for m in ev["metrics"]):
+            L += ["NOT_A_SCORE: a time, loss, error or cost the paper states. It has no 0-1/0-100 scale, so it is not "
+                  "compared and is not part of the overall status.", ""]
     else:
         L += ["No metric was stated on both sides, so no value can be compared.", ""]
     for key, caption in (("metrics_figure_path", "Published vs reproduced metrics"),
-                         ("gap_figure_path", "Gap to the Parent Paper over the reruns")):
+                         ("gap_figure_path", "Difference from the Parent Paper over the reruns")):
         if figures.get(key):
             L += [f"![{caption}](figures/{Path(figures[key]).name})", ""]
     if ev["verified_findings"]:

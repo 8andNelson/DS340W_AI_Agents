@@ -66,7 +66,7 @@ from pathlib import Path
 import pandas as pd
 
 from src import llm
-from src.agents.evaluation_agent import METRIC_LINE_FORMAT, parse_metric_lines
+from src.agents.evaluation_agent import METRIC_LINE_FORMAT, paper_metric_names, parse_metric_lines
 from src.search import paper_fulltext
 from src.orchestration import repo_dependencies, repo_review, sandbox, venv_paths
 from src.orchestration.handoff import request as handoff_request
@@ -858,7 +858,15 @@ def _paper_section(paper: dict) -> str:
         label = "The paper's stored abstract and metadata (the full text was not available)"
     body = paper_fulltext.excerpt(paper.get("text", ""), paper_fulltext.METHOD_KEYWORDS,
                                   max_chars=PAPER_EXCERPT_CHARS)
-    return f"{label}:\n\"\"\"\n{body or '(none)'}\n\"\"\""
+    section = f"{label}:\n\"\"\"\n{body or '(none)'}\n\"\"\""
+    # The run must print every metric the paper reports for its model, so the
+    # Evaluation Agent can compare all of them (a missing one is INCONCLUSIVE).
+    names = paper_metric_names(paper.get("text", ""))
+    if names:
+        section += ("\nMetrics named in the paper's text: " + ", ".join(names) + ". Print EVERY one of these that the "
+                    "paper reports for its own model, as a METRIC line with exactly that name, in addition to the "
+                    "required ones.")
+    return section
 
 
 def _parse_generation(content: str) -> dict:

@@ -714,8 +714,15 @@ def _effect(r: dict) -> tuple[str | None, dict, str]:
         key = _normalize_metric_name(name)
         if key in after_by_key and is_bounded_score(name) and not LOWER_IS_BETTER.search(key):
             deltas[name] = round(_points(after_by_key[key][1]) - _points(value), 2)
+    margin_before, margin_after = r.get("margin_before"), r.get("margin_after")
     gap_before, gap_after = r.get("gap_before"), r.get("gap_after")
-    if isinstance(gap_before, (int, float)) and isinstance(gap_after, (int, float)):
+    if isinstance(margin_before, (int, float)) and isinstance(margin_after, (int, float)):
+        # Newer records: the signed difference from the paper (+ above it).
+        # A rise is better, also past the paper's score.
+        moved = margin_after - margin_before
+        direction = "better" if moved >= MIN_EFFECT_POINTS else "worse" if moved <= -MIN_EFFECT_POINTS else None
+        words = f"difference from the paper {margin_before:+g} -> {margin_after:+g} points"
+    elif isinstance(gap_before, (int, float)) and isinstance(gap_after, (int, float)):
         moved = gap_after - gap_before
         direction = "better" if moved <= -MIN_EFFECT_POINTS else "worse" if moved >= MIN_EFFECT_POINTS else None
         words = f"gap to the paper {gap_before} -> {gap_after} points"

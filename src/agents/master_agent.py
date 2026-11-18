@@ -716,9 +716,7 @@ def _check_presentation(result: dict) -> list:
     if titles != list(pa.SLIDES):
         return blocker(f"The slides are {titles}, not the required structure {list(pa.SLIDES)}.")
 
-    expected = [[m["metric"], pa._fmt(m["published_value"]), pa._fmt(m["reproduced_value"]),
-                 pa._fmt(m["difference_points"]), pa._fmt(m["classification"])]
-                for m in facts["evaluation"]["metrics"][:8]]
+    expected = pa.comparison_rows(facts)
     tables = [s for s in shapes if s.name == pa.COMPARISON_TABLE]
     found = [[cell.text for cell in row.cells] for row in tables[0].table.rows][1:] if tables else []
     if found != expected:
@@ -1132,8 +1130,9 @@ def _relay_and_apply(result: dict, ranked_pool: list, floor_ts: str) -> None:
 # evaluated the new baseline, which closes the rerun. A declined request
 # goes back to the Experiment Agent with the reason, so it can look for a
 # different solution. A rerun that fails is undone from the snapshot, and
-# an Experiment Agent rerun that moves the score further from the paper is
-# undone too, so the current baseline is always the closest one so far.
+# an Experiment Agent rerun that lowers the score (score_margin) is undone
+# too, so the current baseline is always the best valid one so far. A score
+# above the paper's is not a gap: the goal is the paper's score, then more.
 
 MAX_PIPELINE_RERUNS = 10    # reruns acted on per pipeline run
 REDUNDANT_STREAK = 3        # same agent rerun this many times in a row with no gain -> the next is redundant
@@ -1254,6 +1253,7 @@ def _review_rerun_request(request: dict, history: list, ctx: dict) -> str:
     approved, else the reason it is declined. Master Agent does not redo
     the sender's analysis; it checks that the request is actionable,
     supported by evidence, and not redundant."""
+    from src.agents.evaluation_agent import METRIC_REQUEST_TAG
     from src.agents.experiment_agent import RERUNNABLE_AGENTS, canonical_agent
 
     target = canonical_agent(request.get("target_agent"))
@@ -1278,11 +1278,14 @@ def _review_rerun_request(request: dict, history: list, ctx: dict) -> str:
         if previous["target_agent"] != target:
             break
         streak.append(previous)
-    if len(streak) >= REDUNDANT_STREAK and not any(h.get("improved") for h in streak):
-        gaps = ", ".join(str(h.get("gap_after")) for h in reversed(streak))
-        return (f"redundant: the {target} was rerun {len(streak)} times in a row without bringing the score closer "
-                f"to the paper (gap after each run: {gaps} points). Another run of it is not necessary. Look for a "
-                "different solution: another agent, or a different kind of change.")
+    # A request to print the paper's missing metrics is about completeness, not
+    # the score, and has its own limit (evaluation_agent.MAX_METRIC_REQUESTS).
+    asks_for_metrics = any(METRIC_REQUEST_TAG in str(i) for i in instructions)
+    if len(streak) >= REDUNDANT_STREAK and not any(h.get("improved") for h in streak) and not asks_for_metrics:
+        margins = ", ".join(_signed(h.get("margin_after")) for h in reversed(streak))
+        return (f"redundant: the {target} was rerun {len(streak)} times in a row without raising the score "
+                f"(difference from the paper after each run: {margins} points). Another run of it is not necessary. "
+                "Look for a different solution: another agent, or a different kind of change.")
 
     if target == "Data Agent" and goal.get("target_entries") is not None:
         goal_rows = goal["target_entries"]
@@ -1325,7 +1328,7 @@ def _loop_end_reason(drive: dict) -> str:
         return f"the limit of {MAX_PIPELINE_RERUNS} reruns per pipeline run was reached"
     recent = history[-NO_PROGRESS_LIMIT:]
     if len(recent) == NO_PROGRESS_LIMIT and not any(h.get("improved") for h in recent):
-        return (f"the last {NO_PROGRESS_LIMIT} reruns did not bring the score closer to the paper, so more reruns "
+        return (f"the last {NO_PROGRESS_LIMIT} reruns did not raise the score, so more reruns "
                 "are not expected to help")
     return ""
 
@@ -1555,7 +1558,7 @@ def _run_stage(target: str, request: dict, ctx: dict, drive: dict):
     checker, report = (globals()[name] for name in STAGE_CHECKS[target])
     extra = {}
     if target == "Replication Agent":
-        extra["final_next"] = ("Undo the rerun and keep the closest baseline so far." if rerun else
+        extra["final_next"] = ("Undo the rerun and keep the best baseline so far." if rerun else
                                "Continue without a working baseline: the failure is evaluated and reported.")
     return _supervise(target, _stage_call(target, request, ctx, drive), checker, report,
                       attempt_offset=offset, notes=notes, **extra)
@@ -1566,7 +1569,7 @@ def _run_stage(target: str, request: dict, ctx: dict, drive: dict):
 def _open_rerun(request: dict, target: str, sender: str, ctx: dict, drive: dict) -> None:
     """Snapshot the baseline and start a rerun record; the requested agent
     runs next, then each agent's handoff leads to the Evaluation Agent."""
-    from src.agents.experiment_agent import score_gap
+    from src.agents.experiment_agent import score_gap, score_margin
 
     rerun_no = len(drive["history"]) + 1
     goal = request.get("goal") or {}
@@ -1575,9 +1578,20 @@ def _open_rerun(request: dict, target: str, sender: str, ctx: dict, drive: dict)
               "goal": goal, "instructions": instructions, "reason": request.get("summary", ""),
               "status_before": ctx["evaluation_result"].get("status"),
               "metrics_before": _metrics_summary(ctx["evaluation_result"]),
-              "gap_before": score_gap(ctx["evaluation_result"]), "applied": False, "improved": False}
+              "gap_before": score_gap(ctx["evaluation_result"]),
+              "margin_before": score_margin(ctx["evaluation_result"]),
+              # The Evaluation Agent's requests fix validity against the paper's
+              # own method; the Experiment Agent says where its change comes from.
+              "method_source": request.get("method_source") or ("paper" if sender == "Evaluation Agent"
+                                                                else "unstated"),
+              "new_methods": list(request.get("new_methods") or []),
+              "applied": False, "improved": False}
     relay = [f"Master Agent relays a request from the {sender} (rerun {rerun_no}): "
              + (" ".join(f"({i}) {text}" for i, text in enumerate(instructions, 1)) or "no instructions.")
+             + (f" This change is beyond the Parent Paper's method ({', '.join(record['new_methods'])})."
+                if record["method_source"] == "beyond_paper" and record["new_methods"] else
+                " This change is beyond the Parent Paper's method." if record["method_source"] == "beyond_paper"
+                else "")
              + (f" Goal: {goal}." if goal else "") + f" Reason: {request.get('summary', '')}"]
     drive["rerun"] = {
         "request": request, "target": target, "sender": sender, "record": record, "relay": relay,
@@ -1655,18 +1669,22 @@ def _rerun_invalid(rerun: dict, ctx: dict) -> str:
 def _close_rerun(ctx: dict, drive: dict) -> bool:
     """The Evaluation Agent has evaluated the rerun's baseline. Keep it, or
     undo an Experiment Agent rerun that is not a valid, comparable baseline
-    (_rerun_invalid) or that moved the score further from the paper.
+    (_rerun_invalid) or that lowered the score (score_margin: the mean
+    difference from the paper, + above it). A score above the paper's is
+    not a gap, so a rerun that raises the score past the paper is kept.
     Returns True when it is kept."""
-    from src.agents.experiment_agent import score_gap
+    from src.agents.experiment_agent import score_gap, score_margin
     from src.orchestration.state_manager import update_state
 
     rerun = drive["rerun"]
     record = rerun["record"]
     gap_before, gap_after = record["gap_before"], score_gap(ctx["evaluation_result"])
-    record.update(gap_after=gap_after, status_after=ctx["evaluation_result"].get("status"),
+    margin_before, margin_after = record.get("margin_before"), score_margin(ctx["evaluation_result"])
+    record.update(gap_after=gap_after, margin_after=margin_after, status_after=ctx["evaluation_result"].get("status"),
                   metrics_after=_metrics_summary(ctx["evaluation_result"]))
-    change = (f"gap {gap_before} -> {gap_after} points; overall {record['status_before']} -> "
-              f"{record['status_after']}; metrics {record['metrics_before']} -> {record['metrics_after']}")
+    change = (f"difference from the paper {_signed(margin_before)} -> {_signed(margin_after)} points; overall "
+              f"{record['status_before']} -> {record['status_after']}; metrics {record['metrics_before']} -> "
+              f"{record['metrics_after']}")
     if rerun["sender"] == "Experiment Agent":
         # Validity fixes (Evaluation Agent requests) are kept even when the
         # score moves away: a leaky score is not a real score.
@@ -1674,14 +1692,15 @@ def _close_rerun(ctx: dict, drive: dict) -> bool:
         if invalid:
             _undo_rerun(f"{invalid} ({change})", ctx, drive, decision="Reverted")
             return False
-        widened = gap_before is not None and (gap_after is None or gap_after > gap_before + GAP_TOLERANCE_POINTS)
-        if widened:
-            _undo_rerun(f"the score moved further from the paper ({change})", ctx, drive, decision="Reverted")
+        lowered = margin_before is not None and (margin_after is None
+                                                 or margin_after < margin_before - GAP_TOLERANCE_POINTS)
+        if lowered:
+            _undo_rerun(f"the score went down ({change})", ctx, drive, decision="Reverted")
             return False
 
     record.update(applied=True, outcome=change,
-                  improved=gap_after is not None and (gap_before is None
-                                                      or gap_after < gap_before - GAP_TOLERANCE_POINTS))
+                  improved=margin_after is not None and (margin_before is None
+                                                         or margin_after > margin_before + GAP_TOLERANCE_POINTS))
     events.rerun_closed(_current_run_id, record["rerun"], rerun["target"], "kept", change, record["improved"])
     state = {}
     for agent_name, key in (("Data Agent", "dataset_result"), ("Cleaning Agent", "cleaning_result"),
@@ -1699,6 +1718,10 @@ def _close_rerun(ctx: dict, drive: dict) -> bool:
     return True
 
 
+def _signed(value) -> str:
+    return "n/a" if value is None else f"{value:+g}"
+
+
 def _decline(request: dict, target: str, sender: str, reason: str, ctx: dict, drive: dict) -> list | None:
     """Act on a declined request. Returns the next requests, or None when
     the drive ends. In the first pass a declined handoff is a wiring fault
@@ -1709,7 +1732,7 @@ def _decline(request: dict, target: str, sender: str, reason: str, ctx: dict, dr
              else f"handoff to the {target or request.get('target_agent')}")
     if drive["rerun"]:
         _undo_rerun(f"the {sender}'s {asked} was declined: {reason}", ctx, drive)
-        return _ask_experiment_agent("A rerun was undone; the closest baseline so far needs the next analysis.")
+        return _ask_experiment_agent("A rerun was undone; the best baseline so far needs the next analysis.")
     if not drive["evaluated"]:
         entry = _log_entry("Correction", sender, f"The {sender}'s {asked} was declined: {reason}",
                            "Rejected", "Halting pipeline; manual review required.")
@@ -1922,7 +1945,7 @@ def _drive(ctx: dict, queue: list, drive: dict, sender: str = "Master Agent") ->
         if blockers:
             if drive["rerun"]:
                 _undo_rerun(RERUN_FAILURE[target], ctx, drive)
-                queue, sender = _ask_experiment_agent("A rerun failed; the closest baseline so far needs the next "
+                queue, sender = _ask_experiment_agent("A rerun failed; the best baseline so far needs the next "
                                                       "analysis."), "Master Agent"
                 continue
             if target == "Experiment Agent":
@@ -1941,12 +1964,12 @@ def _drive(ctx: dict, queue: list, drive: dict, sender: str = "Master Agent") ->
                 and output["total_entries"] <= rerun["before"]["dataset_result"]["total_entries"]:
             rerun["record"]["found_no_data"] = True
             _undo_rerun("the Data Agent found no usable new data", ctx, drive)
-            queue, sender = _ask_experiment_agent("A rerun found no new data; the closest baseline so far needs "
+            queue, sender = _ask_experiment_agent("A rerun found no new data; the best baseline so far needs "
                                                   "the next analysis."), "Master Agent"
             continue
         if target == "Evaluation Agent":
             if rerun and not _close_rerun(ctx, drive):
-                queue, sender = _ask_experiment_agent("A rerun was undone; the closest baseline so far needs the "
+                queue, sender = _ask_experiment_agent("A rerun was undone; the best baseline so far needs the "
                                                       "next analysis."), "Master Agent"
                 continue
             drive["evaluated"] = True
@@ -1966,7 +1989,7 @@ def _drive(ctx: dict, queue: list, drive: dict, sender: str = "Master Agent") ->
     if drive["evaluated"] and not drive["blockers"] and not drive.get("report_stage"):
         end = _log_entry("Approval", "Experiment Agent",
                          f"Master Agent ends the rerun loop after {len(drive['history'])} rerun(s): "
-                         f"{drive['end_reason']}.", "Approved", "Keep the closest baseline so far and continue.")
+                         f"{drive['end_reason']}.", "Approved", "Keep the best baseline so far and continue.")
         _print_entry(end)
         _append_log([end])
 
@@ -2090,7 +2113,7 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
           "cleaning_result": dict | None,
           "code_discovery_result": dict | None,
           "replication_result": dict | None,
-          "evaluation_result": dict | None,     # the latest review: of the closest baseline so far
+          "evaluation_result": dict | None,     # the latest review: of the best baseline so far
           "reruns": list,                       # rerun requests Master Agent acted on, with their effect
           "rerun_end_reason": str,              # why Master Agent ended the rerun loop
           "experiment_results": list,           # every Experiment Agent analysis, in order

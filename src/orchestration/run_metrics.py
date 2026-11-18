@@ -72,7 +72,7 @@ METRICS = {
     "halted_at_agent": ("agent", "neutral", "the agent whose stage halted the run"),
     "reached_measurable_gap": ("0/1", "higher_better",
                                "an evaluation compared at least one metric stated by both the paper and the run"),
-    "evaluation_status": ("status", "neutral", "EXACT / APPROXIMATE / FAILED / INCONCLUSIVE of the kept evaluation"),
+    "evaluation_status": ("status", "neutral", "EXACT / SURPASSED / APPROXIMATE / FAILED / INCONCLUSIVE of the kept evaluation"),
     "final_gap_points": ("percentage points", "lower_better", "mean gap to the paper, kept evaluation"),
     "baseline_gap_points": ("percentage points", "lower_better", "mean gap to the paper, first evaluation"),
     "gap_closed_points": ("percentage points", "higher_better", "baseline_gap_points - final_gap_points"),

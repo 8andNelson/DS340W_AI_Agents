@@ -34,8 +34,8 @@ What counts (review findings 1, 13 and 14):
   * Approval is not enough for the agents whose work is the reproduction
     (VALIDITY_AGENTS). A memory used there helped only when the run's final
     baseline is valid -- no verified leakage, and the analyst review ran --
-    and, for the Replication Agent, close to the paper (a measured gap of
-    at most CREDIT_GAP_POINTS). Leakage is "hurt"; an unknown validity or
+    and, for the Replication Agent, close to or above the paper (at most
+    CREDIT_GAP_POINTS below it; a score above the paper is not a gap). Leakage is "hurt"; an unknown validity or
     fidelity is not judged.
   * The report counts only outcomes that were stored; a failed write is
     listed in "failed", never counted as learned.
@@ -85,7 +85,7 @@ def _validity(final: dict | None, agent: str) -> tuple[bool | None, str]:
     """(True, why) when the run's final baseline earns credit for this
     agent's memories; (False, why) when it is invalid; (None, why) unknown."""
     from src.agents.evaluation_agent import review_unavailable, verified_leakage
-    from src.agents.experiment_agent import score_gap
+    from src.agents.experiment_agent import score_shortfall
     if not final:
         return None, "no final evaluation: the baseline's validity is unknown"
     if verified_leakage(final):
@@ -93,11 +93,11 @@ def _validity(final: dict | None, agent: str) -> tuple[bool | None, str]:
     if review_unavailable(final):
         return None, "the analyst review was unavailable: validity unknown"
     if agent == "Replication Agent":
-        gap = score_gap(final)
-        if gap is None:
+        shortfall = score_shortfall(final)
+        if shortfall is None:
             return None, "no measurable gap to the paper: fidelity unknown"
-        if gap > CREDIT_GAP_POINTS:
-            return None, f"kept, but {gap} points from the paper (> {CREDIT_GAP_POINTS}): no credit"
+        if shortfall > CREDIT_GAP_POINTS:
+            return None, f"kept, but {shortfall} points below the paper (> {CREDIT_GAP_POINTS}): no credit"
     return True, "valid final baseline"
 
 
