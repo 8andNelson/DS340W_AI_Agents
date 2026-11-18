@@ -302,10 +302,40 @@ def main():
     if result.get("run_id"):
         print(f"[Run Store] Run {result['run_id']} recorded -- view it with: "
               f"python -m src.orchestration.run_store show {result['run_id']}")
-    print("\nParent Paper approved, dataset built, master CSV cleaned, code discovery attempted, "
-          "a baseline reproduction established and evaluated against the paper, and earlier agents "
-          "rerun on the Evaluation and Experiment Agents' requests to bring the score closer to the "
-          "paper. Next pipeline stage: Report Agent (Milestone 13).")
+    print("\n" + _final_summary(result))
+
+
+def _final_summary(result: dict) -> str:
+    """What this run actually did, from its result -- never a fixed claim."""
+    replication = result.get("replication_result") or {}
+    evaluation = result.get("evaluation_result") or {}
+    if result.get("baseline_failed"):
+        baseline = ("No working baseline: the Replication Agent failed every attempt, so there is no "
+                    "reproduction. The failure was evaluated and recorded.")
+    else:
+        baseline = (f"Baseline ran ({replication.get('source') or 'unknown source'}) and was evaluated "
+                    f"against the paper: {evaluation.get('status') or 'no status'}.")
+    reruns = result.get("reruns") or []
+    kept = sum(1 for r in reruns if r.get("applied"))
+    rerun_text = f"{len(reruns)} rerun(s), {kept} kept"
+    if result.get("rerun_end_reason"):
+        rerun_text += f"; the loop ended because {result['rerun_end_reason']}"
+    off = result.get("agents_off") or []
+
+    def output(agent: str, key: str, path_key: str) -> str:
+        if (result.get(key) or {}).get(path_key):
+            return result[key][path_key]
+        return "turned off" if agent in off else "not written"
+
+    return "\n".join([
+        "Run summary:",
+        "  Parent Paper approved; dataset built; master CSV cleaned; code discovery done.",
+        f"  {baseline}",
+        f"  Reruns: {rerun_text}.",
+        f"  Report: {output('Report Agent', 'report_result', 'report_path')}",
+        f"  Slides: {output('Presentation Agent', 'presentation_result', 'presentation_path')}",
+        f"  Final phase: {result.get('phase', '')}",
+    ])
 
 
 if __name__ == "__main__":

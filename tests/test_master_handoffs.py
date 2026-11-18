@@ -215,3 +215,25 @@ def test_conflicting_parallel_requests_are_rejected(tmp_path):
                                   request("validation_agent", "Data Agent", {"query": "b"})], drive)
     assert stage.call_count == 1
     assert "conflicting handoff inputs" in drive["blockers"][0]["issue"]
+
+
+def _loop_end_issues():
+    if not master_agent.LOG_FILE.exists():
+        return []
+    return [e["issue"] for e in log_entries() if "ends the rerun loop" in e.get("issue", "")]
+
+
+def test_a_rerun_loop_that_runs_out_of_requests_logs_why(tmp_path):
+    # Live run: "Master Agent ends the rerun loop after 0 rerun(s): ." had no reason.
+    drive = master_agent._new_drive(evaluated=True)
+    master_agent._drive(make_ctx(tmp_path), [], drive, sender="Evaluation Agent")
+    assert drive["end_reason"] == "the Evaluation Agent requested no next agent"
+    assert _loop_end_issues() == [
+        "Master Agent ends the rerun loop after 0 rerun(s): the Evaluation Agent requested no next agent."]
+
+
+def test_the_report_drive_does_not_log_a_second_rerun_loop_end(tmp_path):
+    drive = master_agent._new_drive(evaluated=True)
+    drive["report_stage"] = True
+    master_agent._drive(make_ctx(tmp_path), [], drive)
+    assert _loop_end_issues() == []

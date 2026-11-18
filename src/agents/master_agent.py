@@ -1883,6 +1883,8 @@ def _drive(ctx: dict, queue: list, drive: dict, sender: str = "Master Agent") ->
             if not drive["evaluated"]:
                 _decline({"target_agent": "", "action": "run_agent"}, "", sender,
                          f"the {sender} requested no next agent before the baseline was evaluated", ctx, drive)
+            elif not drive["end_reason"]:
+                drive["end_reason"] = f"the {sender} requested no next agent"
             break
 
         request = queue.pop(0)
@@ -1960,7 +1962,8 @@ def _drive(ctx: dict, queue: list, drive: dict, sender: str = "Master Agent") ->
             break
         queue = list(requests) + queue
 
-    if drive["evaluated"] and not drive["blockers"]:
+    # The report drive also starts evaluated; it is not the rerun loop.
+    if drive["evaluated"] and not drive["blockers"] and not drive.get("report_stage"):
         end = _log_entry("Approval", "Experiment Agent",
                          f"Master Agent ends the rerun loop after {len(drive['history'])} rerun(s): "
                          f"{drive['end_reason']}.", "Approved", "Keep the closest baseline so far and continue.")
@@ -2156,6 +2159,7 @@ def _run_stages(topic: str, parent_paper_input: str | Path | None = None) -> dic
     report_inputs = {"project": {key: result.get(key) for key in (
         "reruns", "rerun_end_reason", "experiment_results", "input_mode")}}
     report_drive = _new_drive(evaluated=True)
+    report_drive["report_stage"] = True
     _drive(ctx, [request("master_agent", "Report Agent", report_inputs,
                          "The rerun loop ended; write the final report from the recorded results.")],
            report_drive)

@@ -33,7 +33,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from src.orchestration import repo_review
+from src.orchestration import repo_review, venv_paths
 
 PROBE_SCRIPT = Path(__file__).with_name("leakage_probe_script.py")
 LEAK_MATCH_POINTS = 5.0   # published within this of the leaky score
@@ -50,7 +50,8 @@ def _venv_python(replication_result: dict) -> Path | None:
     folder = replication_result.get("replication_dir")
     if not folder:
         return None
-    python = Path(folder) / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    venv = replication_result.get("venv_dir") or venv_paths.venv_dir_for(Path(folder))
+    python = Path(venv) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     return python if python.is_file() else None
 
 

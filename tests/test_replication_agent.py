@@ -262,6 +262,26 @@ class TestReplicateByReconstruction(ReplicationAgentTestCase):
 
         self.assertEqual(result["inferred_assumptions"], generated["inferred_assumptions"])
 
+    def test_windows_path_too_long_is_reported_and_not_repaired(self):
+        # Live run, fresh clone in a deep folder: `import sklearn` failed on
+        # every attempt with WinError 206, and each repair rewrote the script.
+        generated = {"code": "import sklearn", "inferred_assumptions": [], "libraries_required": []}
+        error = "FileNotFoundError: [WinError 206] The filename or extension is too long"
+        with patch.object(replication_agent, "_generate_baseline_script", return_value=generated),              patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)),              patch.object(replication_agent, "_pip_freeze", return_value=""),              patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=1, stderr=error)),              patch.object(replication_agent, "_repair_generated_script") as repair_mock:
+            result = replication_agent._replicate_by_reconstruction(make_paper(), make_cleaning_result())
+
+        self.assertEqual(result["status"], "BLOCKED")
+        repair_mock.assert_not_called()
+        self.assertTrue(any("Windows path too long" in w for w in result["warnings"]))
+
+    def test_result_records_the_venv_folder(self):
+        generated = {"code": "print('ok')", "inferred_assumptions": [], "libraries_required": []}
+        with patch.object(replication_agent, "_generate_baseline_script", return_value=generated),              patch.object(replication_agent, "_create_venv", return_value=run_result(exit_code=0)) as venv_mock,              patch.object(replication_agent, "_pip_freeze", return_value=""),              patch.object(replication_agent, "_run_bounded", return_value=run_result(exit_code=0, stdout="METRIC f1=0.7")):
+            result = replication_agent._replicate_by_reconstruction(make_paper(), make_cleaning_result())
+
+        self.assertEqual(result["venv_dir"], str(venv_mock.call_args.args[0]))
+        self.assertIn(str(venv_mock.call_args.args[0]), result["command"][0])
+
 
 class TestRunDispatch(unittest.TestCase):
     def test_dispatches_to_repository_path_when_found(self):

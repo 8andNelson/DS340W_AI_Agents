@@ -40,6 +40,9 @@ def isolate_persisted_files(tmp_path, monkeypatch):
     monkeypatch.setattr(cleaning_agent, "PROCESSED_DATA_DIR", tmp_path / "data" / "processed")
     monkeypatch.setattr(data_agent, "RAW_DATA_DIR", tmp_path / "data" / "raw")
     monkeypatch.setattr(replication_agent, "REPLICATION_DIR", tmp_path / "replication")
+    # A deep temp path moves venvs to the short root: keep that in tmp_path too.
+    from src.orchestration import venv_paths
+    monkeypatch.setattr(venv_paths, "short_venv_root", lambda: tmp_path / "short_venvs")
     # Master Agent's repository review clones with git: never over the
     # network in tests. Review tests mock _git or give a local tree.
     monkeypatch.setattr(repo_review, "REVIEW_DIR", tmp_path / "replication" / "_reviewed")

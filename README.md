@@ -68,6 +68,12 @@ cd DS340W_AI_Agents
 python -m venv .venv
 ```
 
+Windows: a short folder is best, for example `C:\dev\DS340W_AI_Agents` or
+your Desktop. Windows cannot load files from paths longer than 259
+characters. When the project's folder is deep, the Replication Agent puts
+its venvs in a short folder under `%LOCALAPPDATA%\ds340w_venvs` by itself, so you
+do not have to do anything.
+
 Activate the virtual environment (`.venv` is gitignored, so each person makes their own):
 
 ```powershell

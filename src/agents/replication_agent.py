@@ -68,7 +68,7 @@ import pandas as pd
 from src import llm
 from src.agents.evaluation_agent import METRIC_LINE_FORMAT, parse_metric_lines
 from src.search import paper_fulltext
-from src.orchestration import repo_dependencies, repo_review, sandbox
+from src.orchestration import repo_dependencies, repo_review, sandbox, venv_paths
 from src.orchestration.handoff import request as handoff_request
 
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -129,6 +129,7 @@ _RESULT_DEFAULTS = {
     "repo_url": "",
     "commit_sha": "",
     "replication_dir": "",
+    "venv_dir": "",               # reconstructed baseline's venv (src/orchestration/venv_paths.py)
     "entry_point": "",
     "entry_point_source": "",      # "convention" | "readme_llm" | "generated"
     "command": None,
@@ -153,6 +154,12 @@ _RESULT_DEFAULTS = {
 }
 
 
+_PATH_TOO_LONG_WARNING = (
+    "Windows path too long (WinError 206): a file inside the venv or the replication folder is past "
+    "Windows' 259-character limit. This is not a defect in the script, so it was not repaired. "
+    "Clone the project into a shorter folder (for example C:\\dev\\DS340W_AI_Agents).")
+
+
 def _default_result(**overrides) -> dict:
     result = dict(_RESULT_DEFAULTS)
     result.update(overrides)
@@ -160,7 +167,9 @@ def _default_result(**overrides) -> dict:
 
 
 def _slugify(text: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:60]
+    # 40 characters: with a deep clone folder, longer names pushed files past
+    # Windows' path limit (see src/orchestration/venv_paths.py).
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:40].strip("-")
     return slug or "replication"
 
 
@@ -1045,7 +1054,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
     slug_dir = REPLICATION_DIR / _slugify(paper_title or "reconstructed")
     recon_dir = slug_dir / "reconstructed"
     attempts_dir = recon_dir / "attempts"
-    venv_dir = slug_dir / "venv"
+    venv_dir = venv_paths.venv_dir_for(slug_dir)
     attempts_dir.mkdir(parents=True, exist_ok=True)
     warnings = []
     revision = revision or {}
@@ -1095,12 +1104,18 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
         warnings.append(f"Dropped non-allowlisted libraries requested by the generated script: {', '.join(rejected_libs)}.")
     libraries = sorted((requested_libs & DEPENDENCY_ALLOWLIST) | set(BASE_LIBRARIES))
 
+    if venv_dir.parent != slug_dir:
+        print(f"[Replication Agent] The replication folder's path is too long for Windows; "
+              f"the venv is at {venv_dir} instead.")
     venv_result = _create_venv(venv_dir)
     if venv_result["exit_code"] != 0:
+        error = venv_result["stderr"] or venv_result["stdout"]
+        if venv_paths.path_too_long(error):
+            warnings.append(_PATH_TOO_LONG_WARNING)
         return _default_result(
-            status="BLOCKED", source="reconstructed", replication_dir=str(slug_dir),
+            status="BLOCKED", source="reconstructed", replication_dir=str(slug_dir), venv_dir=str(venv_dir),
             inferred_assumptions=generated.get("inferred_assumptions", []),
-            warnings=warnings + [f"Virtualenv creation failed: {venv_result['stderr'] or venv_result['stdout']}"],
+            warnings=warnings + [f"Virtualenv creation failed: {error}"],
             notes="Could not create an isolated environment for the reconstructed script.",
         )
 
@@ -1146,6 +1161,10 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
         else:
             stderr_feedback = run_result.get("stderr") or ""
         print(f"[Replication Agent] Attempt {attempt} failed: {stderr_feedback.strip().splitlines()[-1:] or ['(no output)']}")
+        if venv_paths.path_too_long(stderr_feedback):
+            # Not a defect in the script: a repair cannot fix it.
+            warnings.append(_PATH_TOO_LONG_WARNING)
+            break
         if attempt < MAX_REPAIR_ATTEMPTS:
             repaired = _repair_generated_script(
                 code, stderr_feedback, parent_paper, stdout=run_result.get("stdout", ""),
@@ -1162,6 +1181,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
     stdout_path, stderr_path = _save_run_output(slug_dir, run_result)
     _write_environment_doc(slug_dir, {
         "Source": "reconstructed", "Entry point": "train.py", "Command": " ".join(command),
+        "Venv": str(venv_dir),
         "Data environment": ", ".join(f"{k}={v}" for k, v in env.items()) or "none",
         "Libraries installed": ", ".join(installed_libs) or "none",
         "Script generated/repaired by (in order)": ", ".join(generated_by) or "unknown",
@@ -1183,7 +1203,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
           f"metrics={metrics or 'none'}.")
 
     return _default_result(
-        status=status, source="reconstructed", replication_dir=str(slug_dir),
+        status=status, source="reconstructed", replication_dir=str(slug_dir), venv_dir=str(venv_dir),
         entry_point="train.py", entry_point_source="generated", command=command,
         exit_code=run_result["exit_code"], stdout_path=stdout_path, stderr_path=stderr_path,
         duration_seconds=run_result["duration_seconds"], pip_freeze_path=str(pip_freeze_path),
@@ -1260,6 +1280,8 @@ def run(parent_paper: dict, code_discovery_result: dict, cleaning_result: dict, 
 def handoff(result: dict, context: dict) -> list:
     """The Replication Agent's request to Master Agent when it finishes: run
     the Evaluation Agent on the new baseline."""
+    status = (result or {}).get("status", "")
+    ran = "Baseline ran" if status == "OK" else "Baseline did not run successfully"
     return [handoff_request("replication_agent", "Evaluation Agent", {},
-                            f"Baseline ran (status {(result or {}).get('status', '')}, source "
+                            f"{ran} (status {status}, source "
                             f"{(result or {}).get('source', '')}); it must be compared with the paper.")]
