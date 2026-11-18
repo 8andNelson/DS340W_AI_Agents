@@ -1,7 +1,15 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.slack import slack_client
+
+
+@pytest.fixture(autouse=True)
+def _slack_enabled(monkeypatch):
+    # Slack is off by default; these tests exercise the client with it on.
+    monkeypatch.setattr(slack_client, "SLACK_ENABLED", True)
 
 
 class TestIsConfigured(unittest.TestCase):
@@ -128,3 +136,15 @@ class TestFetchNewMessages(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDisabled(unittest.TestCase):
+    def test_nothing_is_posted_or_read_when_disabled(self):
+        mock_client = MagicMock()
+        with patch.object(slack_client, "SLACK_ENABLED", False),              patch.object(slack_client, "SLACK_BOT_TOKEN", "xoxb-fake"),              patch.object(slack_client, "SLACK_CHANNEL_ID", "C_MAIN"),              patch.object(slack_client, "SLACK_ERRORS_CHANNEL_ID", "C_ERR"),              patch.object(slack_client, "_get_client", return_value=mock_client):
+            self.assertFalse(slack_client.is_configured())
+            self.assertIsNone(slack_client.post_message("status"))
+            self.assertIsNone(slack_client.post_error_message("correction"))
+            self.assertEqual(slack_client.fetch_new_messages(), [])
+        mock_client.chat_postMessage.assert_not_called()
+        mock_client.conversations_history.assert_not_called()

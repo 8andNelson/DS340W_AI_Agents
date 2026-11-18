@@ -14,8 +14,12 @@ the project's two configured Slack channels (src/config.py):
                                never silently dropped just because a
                                second channel hasn't been configured yet.
 
-Slack is the pipeline's observability and inter-agent-communication layer,
-not a hard dependency -- every function here fails soft. A missing token, a
+Slack is off unless SLACK_ENABLED=true (src/config.py): the dashboard
+shows the same progress, so the project does not need Slack. When it is
+off, nothing is posted or read, and slack_sdk does not need to be
+installed (it is imported only when a client is first needed).
+
+When it is on, Slack is an observability layer, not a hard dependency -- every function here fails soft. A missing token, a
 network error, or a bad channel ID prints a warning and returns None/[]
 rather than raising, so an agent's actual work (research, downloading
 data, etc.) never fails because Slack is unreachable or unconfigured, and
@@ -23,32 +27,37 @@ the project still runs exactly as it did before Slack was wired in when
 SLACK_BOT_TOKEN/SLACK_CHANNEL_ID aren't set (same optionality pattern as
 KAGGLE_USERNAME/KAGGLE_KEY -- see CLAUDE.md's Secrets section).
 """
-from slack_sdk import WebClient
+from src.config import SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, SLACK_ENABLED, SLACK_ERRORS_CHANNEL_ID
 
-from src.config import SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, SLACK_ERRORS_CHANNEL_ID
-
-_client: WebClient | None = None
+_client = None
 
 
-def _get_client() -> "WebClient | None":
+def _get_client():
     global _client
     if _client is None and SLACK_BOT_TOKEN:
+        try:
+            from slack_sdk import WebClient
+        except ImportError:
+            print("[Slack] SLACK_ENABLED is true, but slack_sdk is not installed (pip install slack_sdk).")
+            return None
         _client = WebClient(token=SLACK_BOT_TOKEN)
     return _client
 
 
 def is_configured() -> bool:
-    return bool(SLACK_BOT_TOKEN and SLACK_CHANNEL_ID)
+    return bool(SLACK_ENABLED and SLACK_BOT_TOKEN and SLACK_CHANNEL_ID)
 
 
 def is_errors_configured() -> bool:
-    return bool(SLACK_BOT_TOKEN and SLACK_ERRORS_CHANNEL_ID)
+    return bool(SLACK_ENABLED and SLACK_BOT_TOKEN and SLACK_ERRORS_CHANNEL_ID)
 
 
 def _post(channel: str, text: str) -> str | None:
-    if not SLACK_BOT_TOKEN or not channel:
+    if not SLACK_ENABLED or not SLACK_BOT_TOKEN or not channel:
         return None
     client = _get_client()
+    if client is None:
+        return None
     try:
         resp = client.chat_postMessage(channel=channel, text=text)
         return resp.get("ts")
@@ -94,6 +103,8 @@ def fetch_new_messages(oldest_ts: str = None, limit: int = 50) -> list:
     if not is_configured():
         return []
     client = _get_client()
+    if client is None:
+        return []
     try:
         kwargs = {"channel": SLACK_CHANNEL_ID, "limit": limit}
         if oldest_ts:

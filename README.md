@@ -10,8 +10,8 @@ topic. A **Master Agent** then supervises specialized agents that:
 5. request reruns to close the gap,
 6. write a report (`reports/`) and slides (`presentations/`).
 
-Agent progress and Master Agent corrections go to Slack. A local dashboard
-shows every run.
+A local dashboard shows every agent's progress, the Master Agent's
+decisions, and every past run. Slack is not used and needs no setup.
 
 This guide takes you from an empty machine to a working copy. Do the steps in order.
 
@@ -169,9 +169,6 @@ Only the LLM provider and one search key are required. The rest are optional.
 | `ANTHROPIC_API_KEY` | only for `LLM_PROVIDER=anthropic` | Claude API key | https://console.anthropic.com/settings/keys |
 | `BRAVE_API_KEY` | **Yes** (or SerpApi) | Brave Search API, first search provider | https://brave.com/search/api/ → keys at https://api-dashboard.search.brave.com/app/keys |
 | `SERPENT_API_KEY` | Recommended | SerpApi (Google results), used when Brave fails or hits its limit | https://serpapi.com/manage-api-key |
-| `SLACK_BOT_TOKEN` | Optional | Slack bot token (`xoxb-...`) | https://api.slack.com/apps (see below) |
-| `SLACK_CHANNEL_ID` | Optional | channel for agent status | Slack: channel name → **View channel details** → ID at the bottom |
-| `SLACK_ERRORS_CHANNEL_ID` | Optional | channel for Master Agent corrections and errors | same as above |
 | `KAGGLE_USERNAME`, `KAGGLE_KEY` | Optional | lets the Data Agent search and download Kaggle datasets | https://www.kaggle.com/settings → **API** → **Create New Token** (the downloaded `kaggle.json` has both values) |
 
 Free-tier limits to know:
@@ -181,13 +178,8 @@ Free-tier limits to know:
   This is why FreeLLMAPI is recommended.
 - **Brave Search:** 1,000 requests per month, reset on the 1st.
 
-**Slack bot setup** (optional; the pipeline runs without Slack):
-
-1. https://api.slack.com/apps → **Create New App** → **From scratch**, pick your workspace.
-2. **OAuth & Permissions** → **Bot Token Scopes**: add `chat:write` and
-   `channels:history` (add `groups:history` for a private channel).
-3. **Install to Workspace**, then copy the **Bot User OAuth Token** (`xoxb-...`).
-4. In each Slack channel, type `/invite @<your app name>`.
+Slack needs no keys and no setup: it is off, and the dashboard shows all
+agent progress.
 
 ---
 
@@ -243,14 +235,16 @@ Never put real keys in `.env.example`, code, or commits.
 ## 6. Check the install
 
 Run the test suite. It is offline: all network and LLM calls are mocked,
-so it does not use your keys or quota. It takes about 4–5 minutes.
+so it does not use your keys or quota. It takes about 3–5 minutes. Pass
+`tests`, so pytest does not also collect test files inside cloned repositories
+under `replication/`.
 
 ```powershell
-.venv\Scripts\python.exe -m pytest -q        # Windows
+.venv\Scripts\python.exe -m pytest -q tests  # Windows
 ```
 
 ```bash
-.venv/bin/python -m pytest -q                # macOS / Linux
+.venv/bin/python -m pytest -q tests          # macOS / Linux
 ```
 
 Run one test:
@@ -338,7 +332,7 @@ You have a working copy when all of these are true:
 - [ ] `python -m camoufox fetch` finished
 - [ ] http://localhost:3001 opens, and the Keys page has at least one provider key (FreeLLMAPI users)
 - [ ] `.env` has `LLM_PROVIDER`, its key, and `BRAVE_API_KEY` and/or `SERPENT_API_KEY`
-- [ ] `python -m pytest -q` passes
+- [ ] `python -m pytest -q tests` passes
 - [ ] `python -m src.dashboard` opens at http://127.0.0.1:8050
 - [ ] a test run, for example
       `python run.py --reset --agents-off experiment,report,presentation "machine learning for detecting credit card fraud"`,
@@ -364,7 +358,6 @@ To update later: `git pull`, then `pip install -r requirements.txt` again.
 | LLM calls fail with 401 | wrong `FREELLMAPI_API_KEY` / `OPENROUTER_API_KEY`; copy it again |
 | `DailyQuotaExceeded` | OpenRouter free limit reached; wait for the reset or switch to FreeLLMAPI |
 | every search fails | check `BRAVE_API_KEY` and `SERPENT_API_KEY`; Brave resets monthly |
-| no Slack messages | invite the bot to the channel; check the channel IDs and scopes |
 | Kaggle datasets skipped | set `KAGGLE_USERNAME` and `KAGGLE_KEY` |
 | a found repository is not run | Docker is not running; the baseline is rebuilt from the paper instead |
 

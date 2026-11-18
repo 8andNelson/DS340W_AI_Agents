@@ -11,6 +11,9 @@ SERPENT_API_KEY = os.getenv("SERPENT_API_KEY", "")  # SerpApi (serpapi.com)
 # Free local browser fallback for blocked public pages; no API key or proxy.
 CAMOUFOX_ENABLED = os.getenv("CAMOUFOX_ENABLED", "true").lower() in ("true", "1", "yes")
 CAMOUFOX_TIMEOUT_SECONDS = max(30, min(300, int(os.getenv("CAMOUFOX_TIMEOUT_SECONDS", "180"))))
+# Slack is off by default: the dashboard shows the same progress. Set
+# SLACK_ENABLED=true (and pip install slack_sdk) to post to Slack as well.
+SLACK_ENABLED = os.getenv("SLACK_ENABLED", "false").strip().lower() in ("true", "1", "yes")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "")  # main status/activity channel
 SLACK_ERRORS_CHANNEL_ID = os.getenv("SLACK_ERRORS_CHANNEL_ID", "")  # Master Agent corrections/failures

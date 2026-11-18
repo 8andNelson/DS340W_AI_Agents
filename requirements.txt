@@ -1,5 +1,4 @@
 anthropic
-slack_sdk
 python-dotenv
 requests
 camoufox==0.5.9
