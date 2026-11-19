@@ -41,18 +41,37 @@ def _fingerprint(manifest: dict) -> str:
     return sha256(json.dumps(fields, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def save_input(folder: Path, content: bytes, topic: str, title: str, targets: str) -> tuple[Path, dict]:
+TITLE_SEARCH_CHARS = 10000  # a title must be printed in this much of the paper's start
+
+
+def _normalize(value: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
+
+
+def title_in_text(title: str, text: str) -> bool:
+    """Is this title printed at the start of the paper's text? Case, spacing
+    and punctuation are ignored (pypdf often joins or splits words)."""
+    return bool(_normalize(title or "")) and _normalize(title) in _normalize((text or "")[:TITLE_SEARCH_CHARS])
+
+
+def parse_target_terms(targets: str) -> list:
+    return list(dict.fromkeys(t.strip().lower() for t in (targets or "").split(",") if t.strip()))
+
+
+def save_input(folder: Path, content: bytes, topic: str, title: str = "", targets: str = "") -> tuple[Path, dict]:
+    """Store a supplied Parent Paper PDF. The title and the prediction target
+    are optional: when one is empty, the pipeline's Intake Agent reads it from
+    the PDF (master_agent._supplied_parent_context), with the same checks."""
     title = " ".join((title or "").split())
-    target_terms = list(dict.fromkeys(t.strip().lower() for t in (targets or "").split(",") if t.strip()))
-    if not title or len(title) > 500:
-        raise PaperInputError("Enter the title printed on the PDF (up to 500 characters).")
-    if not target_terms or len(target_terms) > 5 or any(len(t) > 80 for t in target_terms):
-        raise PaperInputError("Enter 1–5 prediction-target keywords, separated by commas (for example fraud).")
+    target_terms = parse_target_terms(targets)
+    if len(title) > 500:
+        raise PaperInputError("The title can have up to 500 characters.")
+    if len(target_terms) > 5 or any(len(t) > 80 for t in target_terms):
+        raise PaperInputError("Enter up to 5 prediction-target keywords, separated by commas (for example fraud).")
     text, pages = read_pdf(content)
-    def normalize(value):
-        return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
-    if normalize(title) not in normalize(text[:10000]):
-        raise PaperInputError("The title was not found at the start of the PDF. Enter the title printed on the paper.")
+    if title and not title_in_text(title, text):
+        raise PaperInputError("The title was not found at the start of the PDF. Enter the title printed on the paper, "
+                              "or leave it empty to have it read from the paper.")
     manifest = {"schema_version": 1, "topic": topic, "title": title, "target_terms": target_terms,
                 "pdf_sha256": sha256(content).hexdigest(), "pages": pages}
     manifest["input_fingerprint"] = _fingerprint(manifest)

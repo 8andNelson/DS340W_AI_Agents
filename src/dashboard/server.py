@@ -286,6 +286,20 @@ def _output(attempts: list[dict], agent: str):
     return chosen[0]["output"] if chosen[0] else None
 
 
+def _reads_supplied_paper(run: dict) -> bool:
+    """The run's Intake Agent read a supplied PDF (its output has the paper's
+    "title"; a topic intake has none) -- before Parent Paper Intake is recorded."""
+    for stage in (run or {}).get("stages", []):
+        if stage.get("agent") == "Intake Agent":
+            try:
+                output = json.loads(stage.get("output_json") or "null")
+            except ValueError:
+                continue
+            if isinstance(output, dict) and "title" in output:
+                return True
+    return False
+
+
 def _papers(attempts: list[dict]) -> tuple[list[dict], dict]:
     supplied = _output(attempts, "Parent Paper Intake") or {}
     if supplied:
@@ -578,10 +592,14 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
                        if stage["name"] in turned_off else None),
                    "has_output": stage["name"] in attempted}
                   for stage in PIPELINE]
-        if "Parent Paper Intake" in attempted:
-            agents = [{"name": "Parent Paper Intake", "phase": "MASTER_APPROVAL",
-                       "role": "Uses your fixed PDF and prediction target; paper discovery is skipped.",
-                       "live": progress.get("Parent Paper Intake"), "has_output": True},
+        if "Parent Paper Intake" in attempted or _reads_supplied_paper(run):
+            # The Intake Agent stays when it read the title or target from the PDF.
+            reader = [a for a in agents if a["name"] == "Intake Agent" and a["has_output"]]
+            for a in reader:
+                a["role"] = "Reads the title and prediction target from your PDF."
+            agents = [*reader, {"name": "Parent Paper Intake", "phase": "MASTER_APPROVAL",
+                                "role": "Uses your fixed PDF and prediction target; paper discovery is skipped.",
+                                "live": progress.get("Parent Paper Intake"), "has_output": "Parent Paper Intake" in attempted},
                       *[a for a in agents if a["name"] not in ("Intake Agent", "Research Agent", "Validation Agent")]]
         phase = ""
         if run and run["is_current"] and run.get("run_id"):

@@ -76,11 +76,11 @@
             <span class="pdf-name" id="pdf-name"></span>
             <button type="button" class="btn sm ghost" id="pdf-clear">Remove</button>
           </div>
-          <p class="muted small">Intake, Research and Validation are skipped. Reuse the same PDF, title, topic and prediction target for matching inputs.</p>
-          <label for="parent-title" class="label">Title printed on the paper</label>
-          <input id="parent-title" type="text" maxlength="500" placeholder="Exact paper title">
-          <label for="parent-target" class="label">Prediction target</label>
-          <input id="parent-target" type="text" maxlength="400" placeholder="e.g. fraud (separate multiple keywords with commas)">
+          <p class="muted small">Research and Validation are skipped. Leave the title or prediction target empty and the Intake Agent reads it from the PDF. Reuse the same PDF, title, topic and prediction target for matching inputs.</p>
+          <label for="parent-title" class="label">Title printed on the paper (optional)</label>
+          <input id="parent-title" type="text" maxlength="500" placeholder="Leave empty to read it from the paper">
+          <label for="parent-target" class="label">Prediction target (optional)</label>
+          <input id="parent-target" type="text" maxlength="400" placeholder="e.g. fraud (comma-separated) — or leave empty to read it from the paper">
           <p class="muted small" id="parent-input-status" role="status"></p>
         </div>
         <div class="prompt-row">

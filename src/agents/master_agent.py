@@ -443,6 +443,57 @@ def _check_intake(structured: dict) -> list:
     return []
 
 
+def _check_paper_reading(result: dict, need_title: bool = True, need_targets: bool = True) -> list:
+    """The Intake Agent's reading of a supplied paper (intake_agent.read_paper)
+    must give each value the user left empty. read_paper already dropped a
+    title not printed in the PDF and target terms the paper does not use."""
+    notes = " ".join((result or {}).get("notes") or [])
+    blockers = []
+    if need_title and not (result or {}).get("title"):
+        blockers.append(_log_entry(
+            "Correction", "Intake Agent",
+            "No title printed at the start of the supplied PDF was found." + (f" {notes}" if notes else ""),
+            "Rejected", "Diagnose the failure and re-run the Intake Agent on the paper with the diagnosis."))
+    if need_targets and not (result or {}).get("target_terms"):
+        blockers.append(_log_entry(
+            "Correction", "Intake Agent",
+            "No prediction target that the supplied paper itself uses was found." + (f" {notes}" if notes else ""),
+            "Rejected", "Diagnose the failure and re-run the Intake Agent on the paper with the diagnosis."))
+    return blockers
+
+
+def _format_paper_reading_report(result: dict) -> str:
+    result = result or {}
+    lines = ["Intake Agent: read the supplied Parent Paper PDF.",
+             f"Title: {result.get('title') or '(not found)'}",
+             f"Prediction target: {', '.join(result.get('target_terms') or []) or '(not found)'}",
+             f"Domain: {result.get('domain') or '-'}; ML task: {result.get('ml_task') or '-'}",
+             f"Read by: {result.get('read_by') or 'unknown model'}",
+             "Checks: the title must be printed at the start of the PDF; each target term must be used in the "
+             "paper's text."]
+    lines += [f"  - {n}" for n in result.get("notes") or []]
+    return "\n".join(lines)
+
+
+def _read_supplied_paper(text: str, topic: str, need_title: bool, need_targets: bool) -> dict:
+    """Master Agent runs the Intake Agent on a supplied PDF for the values the
+    user left empty, under the usual diagnose-and-retry supervision. Raises
+    PaperInputError when it still cannot read them."""
+    from src.agents import intake_agent
+    from src.paper_input import PaperInputError
+
+    output, blockers = _supervise(
+        "Intake Agent", lambda: intake_agent.read_paper(text, topic),
+        lambda r: _check_paper_reading(r, need_title, need_targets), _format_paper_reading_report,
+        final_next="Halting pipeline: enter the paper's title and prediction target and start the run again.")
+    if blockers:
+        missing = " and ".join(name for name, needed in (("title", need_title), ("prediction target", need_targets))
+                               if needed)
+        raise PaperInputError(f"The Intake Agent could not read the paper's {missing} from the PDF after "
+                              f"{MAX_ATTEMPTS} attempts. Enter it with the PDF and start the run again.")
+    return output
+
+
 def _check_research(papers: list) -> list:
     if not papers:
         return [_log_entry(
@@ -2069,7 +2120,16 @@ def _supplied_parent_context(topic: str, path: str | Path) -> dict:
 
     manifest, pdf = load_input(Path(path), topic)
     text, _ = read_pdf(pdf.read_bytes())  # validate before acknowledging the selected input
-    parent = {"title": manifest["title"], "authors": [], "year": 0, "venue": "", "doi": "",
+    title, target_terms = manifest["title"], manifest["target_terms"]
+    source = {"title": "entered by the user", "target_terms": "entered by the user"}
+    if not title or not target_terms:
+        # The user left a value empty: the Intake Agent reads it from the PDF.
+        read = _read_supplied_paper(text, topic, need_title=not title, need_targets=not target_terms)
+        if not title:
+            title, source["title"] = read["title"], "read from the PDF by the Intake Agent"
+        if not target_terms:
+            target_terms, source["target_terms"] = read["target_terms"], "read from the PDF by the Intake Agent"
+    parent = {"title": title, "authors": [], "year": 0, "venue": "", "doi": "",
               "paper_url": "", "peer_reviewed": None, "validation_status": "USER_SUPPLIED",
               "selection_source": "user_pdf", "pdf_path": str(pdf), "pdf_sha256": manifest["pdf_sha256"],
               "scope_excerpt": excerpt(text, METHOD_KEYWORDS, max_chars=3000, head_chars=400),
@@ -2077,10 +2137,10 @@ def _supplied_parent_context(topic: str, path: str | Path) -> dict:
               "notes": "Selected by the user. Publication metadata and peer review have not been independently verified."}
     validation = {"source": "user_pdf", "all": [parent], "verified": [], "unverified": [parent], "rejected": [],
                   "recommended_parent_paper": parent, "ranked_pool": [parent]}
-    output = {"parent_paper": parent, "target_terms": manifest["target_terms"],
+    output = {"parent_paper": parent, "target_terms": target_terms, "value_sources": source,
               "input_fingerprint": manifest["input_fingerprint"], "input_mode": "parent_pdf"}
-    report = (f"User selected the Parent Paper: {parent['title']}\n"
-              f"Prediction target: {', '.join(manifest['target_terms'])}\n"
+    report = (f"User selected the Parent Paper: {parent['title']} (title {source['title']})\n"
+              f"Prediction target: {', '.join(target_terms)} ({source['target_terms']})\n"
               f"PDF SHA-256: {manifest['pdf_sha256']}\nInput fingerprint: {manifest['input_fingerprint']}\n"
               "Intake, Research and competitive paper selection are skipped. "
               "This accepts the user's input; it does not certify peer review or scientific validity.")
@@ -2089,8 +2149,8 @@ def _supplied_parent_context(topic: str, path: str | Path) -> dict:
     entry = _log_entry("Approval", "Parent Paper Intake", report, "Approved", "Start Data and Code Discovery.")
     _append_log([entry])
     _print_entry(entry)
-    return {"structured": {"domain": topic, "target_terms": manifest["target_terms"], "source": "user_pdf"},
-            "target_terms": manifest["target_terms"], "papers": [parent], "validation_result": validation,
+    return {"structured": {"domain": topic, "target_terms": target_terms, "source": "user_pdf"},
+            "target_terms": target_terms, "papers": [parent], "validation_result": validation,
             "parent_paper": parent, "ranked_pool": [parent], "input_fingerprint": manifest["input_fingerprint"],
             "input_mode": "parent_pdf"}
 

@@ -261,9 +261,16 @@ function chosenPdf() { return $("#parent-pdf").files[0] || null; }
 // With a PDF chosen and no run in progress, the pipeline shows the next run's stages.
 function previewingNextRun() { return Boolean(chosenPdf()) && !viewRun && !(status && status.active); }
 
+// The Intake Agent reads the title or target from the PDF when either field is empty.
+const PAPER_READER = { name: "Intake Agent", phase: "TOPIC_ANALYSIS",
+  role: "Reads the title and prediction target from your PDF." };
+
+function readsPaper() { return !$("#parent-title").value.trim() || !$("#parent-target").value.trim(); }
+
 function pipelineAgents() {
   if (!previewingNextRun()) return status.agents;
-  return [{ ...PARENT_INTAKE, live: null, preview: true },
+  return [...(readsPaper() ? [{ ...PAPER_READER, live: null, preview: true }] : []),
+    { ...PARENT_INTAKE, live: null, preview: true },
     ...status.agents.filter((a) => !PAPER_SEARCH_STAGES.includes(a.name) && a.name !== PARENT_INTAKE.name)
       .map((a) => ({ ...a, live: null, preview: true }))];
 }
@@ -388,14 +395,15 @@ function showChosenPdf() {
   $("#parent-pdf-fields").hidden = !file;
   $("#pick-pdf").textContent = file ? "Choose another PDF…" : "Use my Parent Paper PDF…";
   $("#pick-pdf-hint").hidden = Boolean(file);
-  for (const id of ["parent-title", "parent-target"]) $("#" + id).required = Boolean(file);
   $("#pdf-name").textContent = file ? `${file.name} (${(file.size / 1048576).toFixed(1)} MB)` : "";
   $("#parent-input-status").textContent = "";
-  if (file && !$("#parent-title").value) $("#parent-title").focus();
   if (status) renderPipeline();
 }
 
 $("#parent-pdf").addEventListener("change", showChosenPdf);
+for (const id of ["parent-title", "parent-target"]) {
+  $("#" + id).addEventListener("input", () => { if (status && previewingNextRun()) renderPipeline(); });
+}
 $("#pdf-clear").addEventListener("click", () => { $("#parent-pdf").value = ""; showChosenPdf(); });
 
 $("#topic").addEventListener("keydown", (e) => {

@@ -96,6 +96,15 @@ def _paper_line(paper: dict) -> str:
 # --- One function per agent ---
 
 def _intake(o: dict) -> dict:
+    if "title" in o:  # it read a supplied paper (intake_agent.read_paper), not a topic
+        points = [p for p in [
+            f"Title: {o['title']}." if o.get("title") else "The title printed on the paper was not found.",
+            f"What the models will try to predict: {', '.join(o['target_terms'])}." if o.get("target_terms")
+            else "No prediction target that the paper itself uses was found.",
+            *[str(n) for n in o.get("notes") or []],
+        ] if p]
+        return {"headline": "Read the title and prediction target from your paper", "points": points,
+                "next": "The run continues with your paper as the Parent Paper."}
     points = [p for p in [
         f"Research area: {o['domain']}." if o.get("domain") else "",
         f"Kind of problem: {o['ml_task'] if isinstance(o.get('ml_task'), str) else ', '.join(o.get('ml_task') or [])}."
