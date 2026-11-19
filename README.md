@@ -369,23 +369,23 @@ Go back to this repo when you are done: `cd ..\DS340W_AI_Agents` (Windows) or
 
 ## 4. Get the API keys
 
-Only the LLM provider and one search key are required. The rest are optional.
+The project uses FreeLLMAPI (step 3) for every LLM call. You need three keys
+in this repo's `.env`; SerpApi is optional.
 
 | Variable | Required? | What it is | Where to get it |
 |---|---|---|---|
-| `FREELLMAPI_API_KEY` | **Yes** (if `LLM_PROVIDER=freellmapi`) | unified key from FreeLLMAPI | Keys page at http://localhost:3001 (step 3) |
-| `OPENROUTER_API_KEY` | **Yes** (if `LLM_PROVIDER=openrouter`) | OpenRouter key | https://openrouter.ai/settings/keys |
-| `ANTHROPIC_API_KEY` | only for `LLM_PROVIDER=anthropic` | Claude API key | https://console.anthropic.com/settings/keys |
-| `BRAVE_API_KEY` | **Yes** (or SerpApi) | Brave Search API, first search provider | https://brave.com/search/api/ → keys at https://api-dashboard.search.brave.com/app/keys |
-| `SERPENT_API_KEY` | Recommended | SerpApi (Google results), used when Brave fails or hits its limit | https://serpapi.com/manage-api-key |
-| `KAGGLE_USERNAME`, `KAGGLE_KEY` | Optional | lets the Data Agent search and download Kaggle datasets | https://www.kaggle.com/settings → **API** → **Create New Token** (the downloaded `kaggle.json` has both values) |
+| `FREELLMAPI_API_KEY` | **Yes** | unified key from FreeLLMAPI | Keys page at http://localhost:3001 (step 3) |
+| `BRAVE_API_KEY` | **Yes** | Brave Search API: every web search (papers, datasets, code) | https://brave.com/search/api/ → keys at https://api-dashboard.search.brave.com/app/keys |
+| `KAGGLE_USERNAME`, `KAGGLE_KEY` | **Yes** | lets the Data Agent search and download Kaggle datasets. Many Parent Papers use a Kaggle dataset; without these, a Kaggle dataset cannot be downloaded and is rejected | https://www.kaggle.com/settings → **API** → **Create New Token** (the downloaded `kaggle.json` has both values) |
+| `SERPENT_API_KEY` | Optional | SerpApi (Google results), used only when Brave fails or reaches its monthly limit | https://serpapi.com/manage-api-key |
 
-Free-tier limits to know:
+Leave `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY` in `.env` **empty**: this
+setup does not use them.
 
-- **OpenRouter** without credits: 50 free-model requests per day. One full
-  run makes about 30–60 requests, so the free tier may not finish a run.
-  This is why FreeLLMAPI is recommended.
-- **Brave Search:** 1,000 requests per month, reset on the 1st.
+Free-tier limit to know:
+
+- **Brave Search:** 1,000 requests per month, reset on the 1st. Add a
+  SerpApi key if your team runs out before then.
 
 Slack needs no keys and no setup: it is off, and the dashboard shows all
 agent progress.
@@ -408,7 +408,7 @@ cp .env.example .env
 nano .env
 ```
 
-Minimum working `.env` with FreeLLMAPI (recommended):
+Minimum working `.env`:
 
 ```ini
 LLM_PROVIDER=freellmapi
@@ -416,19 +416,15 @@ FREELLMAPI_API_KEY=<unified key from the FreeLLMAPI Keys page>
 FREELLMAPI_BASE_URL=http://localhost:3001/v1
 FREELLMAPI_COMPOSE_DIR=C:\Users\you\Desktop\freellmapi
 BRAVE_API_KEY=<your Brave key>
-SERPENT_API_KEY=<your SerpApi key>
+KAGGLE_USERNAME=<username from kaggle.json>
+KAGGLE_KEY=<key from kaggle.json>
+SERPENT_API_KEY=                   # optional: your SerpApi key
 ```
 
-Or with OpenRouter instead:
-
-```ini
-LLM_PROVIDER=openrouter
-OPENROUTER_API_KEY=<your OpenRouter key>
-BRAVE_API_KEY=<your Brave key>
-SERPENT_API_KEY=<your SerpApi key>
-```
-
-Leave the other values at their defaults. `.env.example` explains each one.
+`.env.example` already sets `LLM_PROVIDER=freellmapi`; keep that line (if it
+is missing, the code falls back to `openrouter`, which this setup does not
+use). Leave `OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY` empty, and the other
+values at their defaults. `.env.example` explains each one.
 Useful optional settings:
 
 - `MEMORY_CONTRIBUTOR=<your short name>`: recorded with each run's metrics.
@@ -536,7 +532,7 @@ You have a working copy when all of these are true:
 - [ ] `.venv` is active and `pip install -r requirements.txt` finished without errors
 - [ ] `python -m camoufox fetch` finished
 - [ ] http://localhost:3001 opens, and the Keys page has at least one provider key (FreeLLMAPI users)
-- [ ] `.env` has `LLM_PROVIDER`, its key, and `BRAVE_API_KEY` and/or `SERPENT_API_KEY`
+- [ ] `.env` has `LLM_PROVIDER=freellmapi`, `FREELLMAPI_API_KEY`, `BRAVE_API_KEY`, `KAGGLE_USERNAME` and `KAGGLE_KEY` (`SERPENT_API_KEY` optional)
 - [ ] the install check in step 6 prints `install OK`
 - [ ] `python -m src.dashboard` opens at http://127.0.0.1:8050
 - [ ] a test run, for example
@@ -560,9 +556,9 @@ To update later: `git pull`, then `pip install -r requirements.txt` again.
 | `Activate.ps1 cannot be loaded` | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | `docker: command not found` / engine not running | start Docker Desktop and wait for "Engine running"; open a new terminal |
 | dashboard says the router is down | check `FREELLMAPI_COMPOSE_DIR`, then run `docker compose up -d` in that folder |
-| LLM calls fail with 401 | wrong `FREELLMAPI_API_KEY` / `OPENROUTER_API_KEY`; copy it again |
-| `DailyQuotaExceeded` | OpenRouter free limit reached; wait for the reset or switch to FreeLLMAPI |
-| every search fails | check `BRAVE_API_KEY` and `SERPENT_API_KEY`; Brave resets monthly |
+| LLM calls fail with 401 | wrong `FREELLMAPI_API_KEY`; copy it again from FreeLLMAPI's Keys page |
+| `OPENROUTER_API_KEY is not set` | `.env` has no `LLM_PROVIDER=freellmapi` line (an older `.env` may still say `openrouter`); set `LLM_PROVIDER=freellmapi` |
+| every search fails | check `BRAVE_API_KEY` (and `SERPENT_API_KEY` if you set one); Brave resets monthly |
 | Kaggle datasets skipped | set `KAGGLE_USERNAME` and `KAGGLE_KEY` |
 | a found repository is not run | Docker is not running; the baseline is rebuilt from the paper instead |
 
@@ -601,11 +597,33 @@ always kept. Each agent attempt records its own start and finish time.
 ### Search and paper access
 
 Searches go to Brave first, then SerpApi. Result pages are fetched directly;
-CAPTCHA, login, and rate-limit pages are detected even with HTTP 200. Blocked
-public pages can use the local Camoufox browser (no key, proxy, or
-subscription). Fetch attempts are logged in `logs/page_fetch_calls.jsonl`.
+CAPTCHA, login, and rate-limit pages are detected even with HTTP 200.
 A search snippet is never accepted as paper access, and a paper that cannot
 be verified stays `UNVERIFIED`.
+
+**Getting past bot blockers with Firefox (Camoufox).** Many publisher and
+dataset sites answer a script with a bot check, such as Cloudflare's "Just a
+moment" page or a "verify you are human" checkbox. When a public page is
+blocked like this, the agents open it again in
+[Camoufox](https://github.com/daijro/camoufox), a Firefox-based browser made
+to look like an ordinary person's browser (`src/search/camoufox_worker.py`):
+
+- It runs headless (no window), presents your real operating system, and
+  moves the mouse like a person (`humanize=True`).
+- It lets the page's JavaScript challenge finish, and clicks Cloudflare's
+  checkbox when one appears (at most twice). It waits up to 35 seconds.
+- For a paper, it then follows the article's own **View PDF** link in the
+  same browser session, so the cookies from the challenge still apply.
+- It runs in its own process with a hard time limit (`CAMOUFOX_TIMEOUT_SECONDS`,
+  default 180), at most two at a time, and is stopped completely at the limit.
+- What it returns is checked again: if it is still a challenge page, it is rejected.
+
+Limits: it never logs in or bypasses a sign-in page, never receives the
+project's keys or cookies, never downloads a full journal issue, and uses no
+paid proxy or CAPTCHA-solving service. Install its Firefox once with
+`python -m camoufox fetch` (step 2); turn it off with `CAMOUFOX_ENABLED=false`.
+Every attempt is logged in `logs/page_fetch_calls.jsonl` (`provider`:
+`direct` or `camoufox`).
 
 ### Project documentation
 
