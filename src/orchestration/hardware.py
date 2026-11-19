@@ -169,6 +169,30 @@ def _number(value) -> float | None:
         return None
 
 
+def gpu_libraries(value) -> list:
+    """The model's gpu_library answer as library names: a string such as
+    "torch, xgboost" or "PyTorch and XGBoost", or a list. A whole-string
+    comparison once read "torch, xgboost" as one unknown library and stopped
+    a run this computer could do (run 20261119T181706Z-40c6adae)."""
+    items = value if isinstance(value, (list, tuple)) else [value]
+    names = []
+    for item in items:
+        for part in re.split(r",|/|;|\band\b|\+", str(item or "").lower()):
+            part = part.strip()
+            if part and part not in names:
+                names.append(part)
+    return names
+
+
+def _uses_gpu_on_windows(library: str, hw: dict) -> bool:
+    """Can this library use this computer's NVIDIA GPU on native Windows?
+    PyTorch only when the Replication Agent can install a CUDA build that fits
+    the driver (torch_cuda_index); TensorFlow never; an empty name is unknown."""
+    if library in ("torch", "pytorch"):
+        return bool(torch_cuda_index(hw))
+    return library in GPU_LIBRARIES_ON_WINDOWS
+
+
 def feasibility(resources: dict | None, hw: dict, cleaning_result: dict | None = None) -> list:
     """Why this computer cannot run the script, or [] when it can (or when a
     limit is unknown). resources is the model's estimate: estimated_ram_gb,
@@ -185,13 +209,15 @@ def feasibility(resources: dict | None, hw: dict, cleaning_result: dict | None =
         reasons.append(f"the method needs about {ram} GB of memory, and this computer has {total_ram} GB")
     if resources.get("needs_gpu") is True:
         why = str(resources.get("gpu_reason") or "").strip()
-        library = str(resources.get("gpu_library") or "").strip().lower()
+        libraries = gpu_libraries(resources.get("gpu_library"))
         if not (hw.get("gpu") or {}).get("name"):
             reasons.append("the method needs a GPU" + (f" ({why})" if why else "") + ", and no GPU was found")
-        elif os.name == "nt" and library not in GPU_LIBRARIES_ON_WINDOWS:
-            reasons.append("the method needs a GPU" + (f" ({why})" if why else "")
-                           + f" for {library or 'its neural networks'}, and on Windows TensorFlow and the PyTorch "
-                             "installed here cannot use this computer's GPU")
+        elif os.name == "nt":
+            blocked = [lib for lib in libraries or [""] if not _uses_gpu_on_windows(lib, hw)]
+            if blocked:
+                named = ", ".join(lib for lib in blocked if lib) or "its neural networks"
+                reasons.append("the method needs a GPU" + (f" ({why})" if why else "")
+                               + f" for {named}, which cannot use this computer's GPU on Windows")
     disk = _number(resources.get("estimated_disk_gb"))
     if hw.get("disk_free_gb") is not None and disk is not None and disk > hw["disk_free_gb"]:
         reasons.append(f"the run needs about {disk} GB of disk, and {hw['disk_free_gb']} GB is free")

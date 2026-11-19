@@ -1169,6 +1169,15 @@ def _archive_previous_baseline(slug_dir: Path, recon_dir: Path, revision_round: 
     return archive / "train.py"
 
 
+def _last_error_line(stderr: str, limit: int = 300) -> str:
+    """The line of a run's stderr that names its error: the last
+    "SomethingError: ..." line of a traceback, else the last line."""
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    errors = [line for line in lines if re.match(r"^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt)\b", line)]
+    line = (errors or lines or ["(no output)"])[-1]
+    return line if len(line) <= limit else line[:limit - 3] + "..."
+
+
 def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revision: dict = None) -> dict:
     paper_title = (parent_paper or {}).get("title", "")
     slug_dir = REPLICATION_DIR / _slugify(paper_title or "reconstructed")
@@ -1288,6 +1297,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
     run_result = None
     metrics = {}
     generated_by = [m for m in [generated.get("generated_by", "")] if m]
+    attempt_errors = []  # each failed run's last error line, for Master Agent's diagnosis
 
     for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
         attempts = attempt
@@ -1318,6 +1328,7 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
         else:
             stderr_feedback = run_result.get("stderr") or ""
         print(f"[Replication Agent] Attempt {attempt} failed: {stderr_feedback.strip().splitlines()[-1:] or ['(no output)']}")
+        attempt_errors.append(f"attempt {attempt}: {_last_error_line(stderr_feedback)}")
         if venv_paths.path_too_long(stderr_feedback):
             # Not a defect in the script: a repair cannot fix it.
             warnings.append(_PATH_TOO_LONG_WARNING)
@@ -1359,7 +1370,10 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
             warnings.append(f"Reconstructed script ran but printed no '{METRIC_LINE_FORMAT}' lines "
                             f"after {attempts} attempt(s).")
         else:
-            warnings.append(f"Reconstructed script still failing after {attempts} attempt(s).")
+            # The errors themselves: without them Master Agent's diagnosis had
+            # only this sentence and guessed a cause (run 20261119T181706Z-40c6adae).
+            warnings.append(f"Reconstructed script still failing after {attempts} attempt(s)."
+                            + (" Errors: " + "; ".join(attempt_errors) if attempt_errors else ""))
 
     print(f"[Replication Agent] Done. status={status}, exit_code={run_result['exit_code']}, "
           f"metrics={metrics or 'none'}.")
