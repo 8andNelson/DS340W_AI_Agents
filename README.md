@@ -72,7 +72,12 @@ own environment, only when a script needs it:
    - macOS: https://docs.docker.com/desktop/setup/install/mac-install/
    - Linux: https://docs.docker.com/desktop/setup/install/linux/
 2. Start Docker Desktop and wait until it shows **"Engine running"**.
-3. Check it in a new terminal:
+3. **Restart your terminal:** close every terminal window (PowerShell,
+   Command Prompt, the VS Code terminal) and open a new one. A terminal that
+   was open during the install does not know the new `docker` command, and
+   says `docker: command not found` (or "is not recognized"). If a new
+   terminal still does not find it, restart the computer.
+4. Check it in the new terminal:
 
    ```powershell
    docker --version
