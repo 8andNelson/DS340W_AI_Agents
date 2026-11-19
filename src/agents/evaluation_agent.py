@@ -70,6 +70,8 @@ evaluation is itself useful research information, not an agent defect --
 CLAUDE.md's Results Integrity policy is explicit that "a failed or
 imperfect reproduction is still useful research information."
 """
+import copy
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -84,6 +86,15 @@ from src.search import paper_fulltext
 from src.orchestration.handoff import request as handoff_request
 
 STDOUT_CHAR_LIMIT = 4000
+
+# The paper's published values, read once per process (one pipeline run)
+# for the same inputs. Every evaluation round used to ask the model again:
+# in run 20261118T233806Z-8a8e932d the same scenario was chosen in all 5
+# rounds, but precision came back as 0.9999 in some rounds and 0.999 in
+# others, so gaps between reruns were measured against different targets.
+# The key leaves out the script's inferred assumptions (they change with
+# every revision); a FAILED extraction is never kept.
+_published_cache = {}
 EXACT_THRESHOLD_POINTS = 1.0        # percentage points
 APPROXIMATE_THRESHOLD_POINTS = 5.0  # percentage points
 
@@ -421,8 +432,10 @@ def _compare_other_scenarios(metrics: list, published_text: str, published_label
                + ". Return values for ONLY these metrics, from the scenario closest to it that states them (prefer "
                  "the same model, then the same dataset). Name that scenario.")
     other = {}
-    found = _extract_metrics(published_text, published_label, max_chars=published_limit, context=context,
-                             verify=published_source == "full_text", details=other)
+    stable = (_reproduction_context(replication_result, cleaning_result, dataset_result, assumptions=False)
+              + "\nOther scenarios for: " +", ".join(sorted(wanted)) + " | " + main)
+    found = _extract_published(published_text, published_label, published_limit, published_source == "full_text",
+                               other, context, stable)
     scenario = ", ".join(filter(None, [other.get("scenario"), other.get("dataset")])) or "another scenario"
     for name, value in found.items():
         m = wanted.get(_normalize_metric_name(name))
@@ -947,18 +960,41 @@ def _request_for(decision: dict, review_result: dict) -> list:
     }]
 
 
-def _reproduction_context(replication_result: dict, cleaning_result: dict | None, dataset_result: dict | None) -> str:
+def _extract_published(text: str, label: str, limit: int, verify: bool, details: dict, context: str,
+                       cache_context: str) -> dict:
+    """_extract_metrics on the paper's text, kept in _published_cache by
+    the text, the checks and cache_context (the context without the
+    inferred assumptions). details is filled as _extract_metrics fills it;
+    a cached answer adds a note that it was read in an earlier round."""
+    key = hashlib.sha256(json.dumps([text[:limit], label, limit, verify, cache_context]).encode("utf-8")).hexdigest()
+    cached = _published_cache.get(key)
+    if cached is not None:
+        metrics, info = copy.deepcopy(cached)
+        details.update(info)
+        details["notes"] = list(info.get("notes") or []) + [
+            "Read in an earlier evaluation round of this run, for the same paper text and data; not asked again."]
+        return metrics
+    metrics = _extract_metrics(text, label, max_chars=limit, context=context, verify=verify, details=details)
+    if details.get("status") != "FAILED":
+        _published_cache[key] = copy.deepcopy((metrics, details))
+    return metrics
+
+
+def _reproduction_context(replication_result: dict, cleaning_result: dict | None, dataset_result: dict | None,
+                          assumptions: bool = True) -> str:
     """What was reproduced, for choosing the matching row of a paper that
-    reports many scenarios: the method details and the data used."""
+    reports many scenarios: the method details and the data used.
+    assumptions=False leaves out the inferred method details (for the
+    _published_cache key)."""
     lines = []
     if replication_result.get("source") == "reconstructed":
         lines.append("A baseline reconstructed from the paper's method.")
     elif replication_result.get("repo_url"):
         lines.append(f"The repository {replication_result['repo_url']} "
                      f"(entry point {replication_result.get('entry_point') or 'unknown'}).")
-    assumptions = [str(a) for a in replication_result.get("inferred_assumptions") or []]
-    if assumptions:
-        lines.append("Method details: " + " ".join(assumptions[:MAX_CONTEXT_ASSUMPTIONS]))
+    details = [str(a) for a in replication_result.get("inferred_assumptions") or []] if assumptions else []
+    if details:
+        lines.append("Method details: " + " ".join(details[:MAX_CONTEXT_ASSUMPTIONS]))
     datasets = [d.get("display_name") or d.get("name") or ""
                 for d in (dataset_result or {}).get("selected_datasets") or []]
     rows = (cleaning_result or {}).get("rows_total")
@@ -1045,10 +1081,12 @@ def run(parent_paper: dict, replication_result: dict, cleaning_result: dict = No
     reproduced_text = _read_stdout(replication_result.get("stdout_path", ""))
 
     extraction = {}
-    published_metrics = _extract_metrics(published_text, published_label, max_chars=published_limit,
-                                         context=_reproduction_context(replication_result, cleaning_result,
-                                                                       dataset_result),
-                                         verify=published_source == "full_text", details=extraction)
+    published_metrics = _extract_published(published_text, published_label, published_limit,
+                                           published_source == "full_text", extraction,
+                                           _reproduction_context(replication_result, cleaning_result,
+                                                                 dataset_result),
+                                           _reproduction_context(replication_result, cleaning_result,
+                                                                 dataset_result, assumptions=False))
     extraction.setdefault("status", "FOUND" if published_metrics else "NONE_STATED")
     for note in extraction.get("notes") or []:
         print(f"[Evaluation Agent] Published values: {note}")

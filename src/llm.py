@@ -44,6 +44,17 @@ _last_call = threading.local()  # per thread: research/validation call concurren
 RATE_LIMIT_RETRIES = 5  # 5+10+20+40+80s: the free tier's per-minute window often outlasts 35s
 RATE_LIMIT_BACKOFF_SECONDS = 5
 
+# A FreeLLMAPI model that just failed (429, 5xx, timeout, no connection) is
+# tried last for this long: in three runs to 2026-11-19, failed calls cost
+# 59 min, mostly the same down model tried again on every call (one
+# dots3-note-preview 502 took about 2 min). It is moved to the end of the
+# chain, never removed, so a call still tries every model before it fails.
+# A 4xx other than 429 (e.g. 413: this prompt is too large for the model)
+# says nothing about the model's health and does not count.
+MODEL_COOLDOWN_SECONDS = 300
+_model_failed_at = {}  # model -> time.monotonic() of its last failure
+_cooldown_lock = threading.Lock()
+
 # Claude requests always stream: generated scripts can be long, and
 # streaming keeps a large max_tokens clear of HTTP timeouts.
 CLAUDE_MAX_TOKENS = 64000
@@ -301,7 +312,10 @@ def _chat_freellmapi_chain(chain: list, prompt: str, system: str, timeout: int, 
     next model here. Every model except the last skips the long 429
     backoff -- switching to the next model is faster than waiting out a
     per-minute window. Each failure is logged with the router's own reason
-    (_error_detail). The last model's error is raised if all fail."""
+    (_error_detail). Models that failed in the last MODEL_COOLDOWN_SECONDS
+    are tried last (_order_by_health). The last model's error is raised if
+    all fail."""
+    chain = _order_by_health(chain, agent)
     for i, model in enumerate(chain):
         is_last = i == len(chain) - 1
         started = time.monotonic()
@@ -313,15 +327,50 @@ def _chat_freellmapi_chain(chain: list, prompt: str, system: str, timeout: int, 
         except requests.RequestException as e:
             detail = _error_detail(e)
             _record_call("freellmapi", model, "", started, agent=agent, error=_short_error(e), detail=detail)
+            _note_health(model, e)
             reason = _short_error(e) + (f": {_console_reason(detail['message'])}" if detail.get("message") else "")
             if is_last:
                 print(f"  [LLM] {model} failed for {agent or 'call'} ({reason}); no models left.")
                 raise
             print(f"  [LLM] {model} failed for {agent or 'call'} ({reason}); trying {chain[i + 1]}...")
             continue
+        _note_health(model, None)
         if (content and content.strip()) or is_last:
             return content
         print(f"  [LLM] {model} returned an empty answer for {agent or 'call'}; trying {chain[i + 1]}...")
+
+
+def _counts_against_model(e: Exception) -> bool:
+    """A failure that says the model is down or overloaded: no response
+    (timeout, connection), 429 or 5xx. Other 4xx are about the request."""
+    response = getattr(e, "response", None)
+    if response is None:
+        return True
+    return response.status_code == 429 or response.status_code >= 500
+
+
+def _note_health(model: str, error: Exception | None) -> None:
+    """Record a model's failure (error) or success (None) for the cooldown."""
+    with _cooldown_lock:
+        if error is None:
+            _model_failed_at.pop(model, None)
+        elif _counts_against_model(error):
+            _model_failed_at[model] = time.monotonic()
+
+
+def _order_by_health(chain: list, agent: str = None) -> list:
+    """The chain with every model that failed in the last
+    MODEL_COOLDOWN_SECONDS moved to the end, oldest failure first, each
+    group in its own order."""
+    now = time.monotonic()
+    with _cooldown_lock:
+        failed = {m: t for m, t in _model_failed_at.items() if now - t < MODEL_COOLDOWN_SECONDS}
+    cooling = sorted((m for m in chain if m in failed), key=lambda m: failed[m])
+    if not cooling or len(cooling) == len(chain):
+        return chain
+    print(f"  [LLM] {', '.join(cooling)} failed in the last {MODEL_COOLDOWN_SECONDS // 60} min; "
+          f"trying {'it' if len(cooling) == 1 else 'them'} last for {agent or 'call'}.")
+    return [m for m in chain if m not in failed] + cooling
 
 
 def _short_error(e: Exception) -> str:
