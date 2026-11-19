@@ -39,7 +39,7 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file
 from src import paper_input
 
-from src.dashboard import editor, insights, pdf_fetch, readers, slides
+from src.dashboard import editor, insights, pdf_fetch, plain, readers, slides
 from src.dashboard.freellmapi import FreeLLMAPIManager
 from src.dashboard.runner import CONSOLE_DIR, PipelineRunner, RunError, validate_topic
 
@@ -519,10 +519,12 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
                        "dashboard). Wait for it to finish; two runs would overwrite each other's files.")
         router = app.config["FREELLMAPI"].status()
         if router["enabled"] and not router["healthy"] and not runner.is_running():
-            # With LLM_PROVIDER=freellmapi every agent call would fail without the router.
-            abort(409, "The FreeLLMAPI router is not running, so the agents cannot reach a model. "
-                       + ("It is starting now; try again when it shows Running." if router["busy"]
-                          else "Select Start router first."))
+            # With LLM_PROVIDER=freellmapi every agent call would fail without the
+            # router. The Overview has no router controls, so it is started here.
+            if not router["busy"]:
+                app.config["FREELLMAPI"].start_async()
+            abort(409, "The FreeLLMAPI router is not running, so the agents cannot reach a model yet. It is "
+                       "starting now (this can take a minute); select Start run again shortly.")
         try:
             options = {"reset": bool(body.get("reset")), "agents_off": _agents_off()}
             if "parent_paper_id" in body:
@@ -594,6 +596,8 @@ def create_app(runner: PipelineRunner | None = None, router: FreeLLMAPIManager |
     def run_detail():
         run = _resolve_run(current_runner())
         attempts = _attempts(run)
+        # Each attempt also in plain words, for readers who are not technical.
+        attempts = [{**a, "plain": plain.summarize(a)} for a in attempts]
         return jsonify({"run": _public(run), "summary": _summary(attempts), "attempts": attempts})
 
     @app.get("/api/runs")

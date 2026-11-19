@@ -137,8 +137,13 @@ _STATUS_BY_DECISION = {"Approved": "approved", "Retrying": "retrying", "Rejected
 SUMMARY_MAX_CHARS = 400
 
 
+# The tag every report starts with ("[Intake Agent] ..."): the pipeline card
+# already names the agent, so the card's summary leaves it out.
+_AGENT_TAG = re.compile(r"^\[[^\]\n]{1,60}\]\s*")
+
+
 def _summary(text: str) -> str:
-    text = (text or "").strip()
+    text = _AGENT_TAG.sub("", (text or "").strip(), count=1)
     return text if len(text) <= SUMMARY_MAX_CHARS else text[:SUMMARY_MAX_CHARS].rstrip() + " ..."
 
 

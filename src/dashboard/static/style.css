@@ -122,6 +122,7 @@ h2 { font-size: 15px; margin: 0; }
 .main { flex: 1; min-width: 0; padding: 28px 32px 48px; }
 .view { max-width: 1240px; margin: 0 auto; }
 .view-head { margin-bottom: 20px; }
+.view-head-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .view-head p { margin: 0; max-width: 760px; }
 .section-head { display: flex; align-items: center; gap: 12px; justify-content: space-between; margin: 28px 0 12px; }
 
@@ -235,6 +236,19 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   background: var(--surface-2); border-radius: 8px; padding: 12px; max-height: 480px; overflow: auto;
 }
 .tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
+
+/* Plain-words summary of an attempt, and the folded technical cards */
+.plain { border-left: 3px solid var(--accent); }
+.plain-headline { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
+.plain-points { margin: 0 0 10px; padding-left: 20px; line-height: 1.6; }
+.plain-points li { margin-bottom: 2px; }
+.plain-decision { margin: 0 0 6px; color: var(--muted); }
+.plain-next { margin: 0; }
+details.technical > summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 10px; }
+details.technical > summary h3 { margin: 0; }
+details.technical > summary::before { content: "\25B8"; color: var(--muted); }
+details.technical[open] > summary::before { content: "\25BE"; }
+details.technical[open] > summary { margin-bottom: 10px; }
 .chip {
   padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border);
   background: var(--surface); color: var(--muted); font: inherit; font-size: 12.5px; cursor: pointer;
@@ -342,18 +356,6 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .run-row-links { display: flex; gap: 12px; font-size: 12.5px; }
 .note.small { font-size: 12px; }
 
-/* Model router */
-.router { margin-top: 12px; padding: 10px 14px; }
-.router-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.router-text { display: flex; flex-direction: column; min-width: 0; }
-.router-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-.router-dot.running { background: var(--ok); }
-.router-dot.starting, .router-dot.stopping { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
-.router-dot.error { background: var(--bad); }
-.router-log { margin-top: 6px; font-size: 12px; }
-.router-log summary { cursor: pointer; color: var(--muted); }
-.router-log pre { margin: 6px 0 0; font: 12px/1.5 var(--mono); white-space: pre-wrap; color: var(--muted); }
-.router-log:not(:has(pre:not(:empty))) { display: none; }
 
 /* Scripts */
 .mono { font-family: var(--mono); }
@@ -397,7 +399,13 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .tk-com { color: var(--tk-com); font-style: italic; }
 .tk-def { color: var(--tk-def); font-weight: 600; }
 
-.paper-toggle { margin: 14px 0; }
+.paper-pick { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+.pdf-chip { display: flex; align-items: center; gap: 10px; padding: 8px 12px; margin-bottom: 8px;
+  background: var(--surface-2); border-radius: 8px; }
+.pdf-name { font-weight: 600; overflow-wrap: anywhere; }
+.agent.preview { border-style: dashed; cursor: default; }
+.agent.preview:hover { border-color: var(--border); }
+.card-switch { align-self: flex-start; margin-top: 2px; }
 #parent-pdf-fields { margin: 12px 0 18px; }
 #parent-pdf-fields input { max-width: 100%; }
 #parent-pdf-fields input[type="text"] { display: block; width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: inherit; }
@@ -445,8 +453,6 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 @media (max-width: 900px) { .mem-layout { grid-template-columns: 1fr; } }
 
 /* Optional agents: on/off switches */
-.agent-switches-block { margin-top: 14px; }
-.agent-switches { display: flex; flex-wrap: wrap; gap: 8px; }
 .switch { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px 6px 8px; border-radius: 999px;
   border: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; font-size: 13px;
   cursor: pointer; }

@@ -242,8 +242,38 @@ function agentBadge(agent) {
   return `<span class="badge ${esc(live.status)}">${esc(statusLabel(live.status) + inferred)}</span>`;
 }
 
+// The first stages a supplied Parent Paper replaces (the server's PIPELINE names).
+const PAPER_SEARCH_STAGES = ["Intake Agent", "Research Agent", "Validation Agent"];
+const PARENT_INTAKE = { name: "Parent Paper Intake", phase: "MASTER_APPROVAL",
+  role: "Uses your PDF and prediction target; the paper search is skipped." };
+
+function chosenPdf() { return $("#parent-pdf").files[0] || null; }
+
+// With a PDF chosen and no run in progress, the pipeline shows the next run's stages.
+function previewingNextRun() { return Boolean(chosenPdf()) && !viewRun && !(status && status.active); }
+
+function pipelineAgents() {
+  if (!previewingNextRun()) return status.agents;
+  return [{ ...PARENT_INTAKE, live: null, preview: true },
+    ...status.agents.filter((a) => !PAPER_SEARCH_STAGES.includes(a.name) && a.name !== PARENT_INTAKE.name)
+      .map((a) => ({ ...a, live: null, preview: true }))];
+}
+
+function agentSwitch(name) {
+  const s = switches[name];
+  if (!s) return "";
+  return `
+    <button type="button" class="switch card-switch" role="switch" aria-checked="${s.on}" data-switch="${esc(name)}"
+      ${s.available ? "" : "disabled"} title="${esc(s.note || "Whether this agent runs in the next run you start")}">
+      <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
+      <span class="switch-state">${s.on ? "On" : "Off"} next run</span>
+    </button>`;
+}
+
 function renderPipeline() {
-  $("#pipeline").innerHTML = status.agents.map((a, i) => {
+  const preview = previewingNextRun();
+  $("#pipeline-note").textContent = preview ? "Preview of the next run with your PDF." : "";
+  $("#pipeline").innerHTML = pipelineAgents().map((a, i) => {
     const live = a.live || {};
     const attempt = live.attempt ? `Attempt ${live.attempt}${live.max_attempts ? ` of ${live.max_attempts}` : ""}` : "";
     let took = "";
@@ -254,18 +284,32 @@ function renderPipeline() {
     else if (live.status === "interrupted") took = "execution duration unknown";
     const meta = [attempt, took].filter(Boolean).join(", ");
     return `
-      <div class="card agent ${a.planned ? "planned" : ""} ${live.status === "running" ? "running" : ""}" data-agent="${esc(a.name)}">
-        <div class="agent-top"><span class="step">${i + 1}</span><span class="agent-name">${esc(a.name)}</span>${agentBadge(a)}</div>
+      <div class="card agent ${a.planned ? "planned" : ""} ${a.preview ? "preview" : ""} ${live.status === "running" ? "running" : ""}" data-agent="${esc(a.name)}">
+        <div class="agent-top"><span class="step">${i + 1}</span><span class="agent-name">${esc(a.name)}</span>${a.preview ? `<span class="badge">Next run</span>` : agentBadge(a)}</div>
         <div class="agent-role">${esc(a.role)}</div>
+        ${agentSwitch(a.name)}
         ${meta ? `<div class="agent-meta">${esc(meta)}</div>` : ""}
         ${live.summary ? `<div class="agent-summary">${esc(live.summary)}</div>` : ""}
       </div>`;
   }).join("");
 }
 
-$("#pipeline").addEventListener("click", (e) => {
+$("#pipeline").addEventListener("click", async (e) => {
+  const button = e.target.closest("button[data-switch]");
+  if (button) {  // an optional agent's switch, not a link to its outputs
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      const on = button.getAttribute("aria-checked") !== "true";
+      setSwitches((await postJson("/api/agent-switches", { name: button.dataset.switch, on })).agents);
+    } catch (err) {
+      $("#form-msg").textContent = err.message;
+    }
+    renderPipeline();
+    return;
+  }
   const card = e.target.closest(".agent");
-  if (!card || card.classList.contains("planned")) return;
+  if (!card || card.classList.contains("planned") || card.classList.contains("preview")) return;
   selectedAgent = card.dataset.agent;
   location.hash = hashFor("agents", viewRun);
 });
@@ -278,9 +322,8 @@ $("#prompt-form").addEventListener("submit", async (e) => {
   $("#start-btn").disabled = true;
   try {
     const body = { topic: $("#topic").value, reset: $("#reset").checked };
-    if ($("#use-parent-pdf").checked) {
-      const file = $("#parent-pdf").files[0];
-      if (!file) throw new Error("Choose a Parent Paper PDF.");
+    const file = chosenPdf();
+    if (file) {
       const data = new FormData();
       data.append("pdf", file);
       data.append("topic", body.topic);
@@ -305,11 +348,23 @@ $("#prompt-form").addEventListener("submit", async (e) => {
   }
 });
 
-$("#use-parent-pdf").addEventListener("change", () => {
-  const enabled = $("#use-parent-pdf").checked;
-  $("#parent-pdf-fields").hidden = !enabled;
-  for (const id of ["parent-pdf", "parent-title", "parent-target"]) $("#" + id).required = enabled;
-});
+// "Use my Parent Paper PDF" opens the file explorer; choosing a file sets up the run.
+$("#pick-pdf").addEventListener("click", () => $("#parent-pdf").click());
+
+function showChosenPdf() {
+  const file = chosenPdf();
+  $("#parent-pdf-fields").hidden = !file;
+  $("#pick-pdf").textContent = file ? "Choose another PDF…" : "Use my Parent Paper PDF…";
+  $("#pick-pdf-hint").hidden = Boolean(file);
+  for (const id of ["parent-title", "parent-target"]) $("#" + id).required = Boolean(file);
+  $("#pdf-name").textContent = file ? `${file.name} (${(file.size / 1048576).toFixed(1)} MB)` : "";
+  $("#parent-input-status").textContent = "";
+  if (file && !$("#parent-title").value) $("#parent-title").focus();
+  if (status) renderPipeline();
+}
+
+$("#parent-pdf").addEventListener("change", showChosenPdf);
+$("#pdf-clear").addEventListener("click", () => { $("#parent-pdf").value = ""; showChosenPdf(); });
 
 $("#topic").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#prompt-form").requestSubmit(); }
@@ -366,6 +421,44 @@ async function pollConsole() {
 
 let selectedAgent = null;
 let selectedAttempt = null;
+// Simple view: the plain summary first, the technical report and JSON folded.
+// Remembered in this browser only (a per-viewer preference).
+let simpleView = true;
+try { simpleView = localStorage.getItem("simpleView") !== "off"; } catch (err) { /* storage blocked */ }
+$("#simple-view").checked = simpleView;
+$("#simple-view").addEventListener("change", (e) => {
+  simpleView = e.target.checked;
+  try { localStorage.setItem("simpleView", simpleView ? "on" : "off"); } catch (err) { /* storage blocked */ }
+  renderAgents();
+});
+
+function plainCard(plain) {
+  if (!plain) return "";
+  return `
+    <div class="card plain">
+      <h3>In plain words</h3>
+      <p class="plain-headline">${esc(plain.headline || "")}</p>
+      ${(plain.points || []).length ? `<ul class="plain-points">${plain.points.map((p) => `<li>${esc(p)}</li>`).join("")}</ul>` : ""}
+      ${plain.decision ? `<p class="plain-decision">${esc(plain.decision)}</p>` : ""}
+      ${plain.next ? `<p class="plain-next"><strong>Next:</strong> ${esc(plain.next)}</p>` : ""}
+      ${plain.note ? `<p class="muted small">${esc(plain.note)}</p>` : ""}
+    </div>`;
+}
+
+// Technical cards opened in the simple view stay open when a live run re-renders the page.
+const openTechnical = new Set();
+
+function technicalCard(title, body) {
+  return simpleView
+    ? `<details class="card technical" data-title="${esc(title)}" ${openTechnical.has(title) ? "open" : ""}><summary><h3>${esc(title)}</h3><span class="muted small">Technical details. Select to show.</span></summary>${body}</details>`
+    : `<div class="card"><h3>${esc(title)}</h3>${body}</div>`;
+}
+
+$("#agent-detail").addEventListener("toggle", (e) => {
+  const card = e.target.closest && e.target.closest("details.technical");
+  if (!card) return;
+  if (card.open) openTechnical.add(card.dataset.title); else openTechnical.delete(card.dataset.title);
+}, true);
 
 function renderAgents() {
   if (!status) return;
@@ -412,17 +505,14 @@ function renderAgentDetail(agent) {
         Attempt ${a.attempt}: ${esc(a.decision)}
       </button>`).join("")}
     </div>
-    <div class="card">
-      <h3>Report</h3>
+    ${plainCard(chosen.plain)}
+    ${technicalCard("Report", `
       <div class="muted small">Recorded ${esc(fmtTime(chosen.recorded_at))}. Master Agent decision: ${esc(chosen.decision)}.</div>
       ${chosen.duration_seconds != null ? `<p class="muted small">Agent execution: ${esc(elapsedSeconds(chosen.duration_seconds))}. Started ${esc(fmtTime(chosen.started_at))}; finished ${esc(fmtTime(chosen.finished_at))}.</p>` : ""}
-      <pre class="report">${esc(chosen.report_text || "No report text was recorded for this attempt.")}</pre>
-    </div>
-    <div class="card">
-      <h3>Structured output</h3>
-      ${chosen.output == null ? `<div class="muted">No output was recorded for this attempt (the agent raised an error).</div>`
-        : `<div class="json">${jsonTree(chosen.output)}</div>`}
-    </div>`}`;
+      <pre class="report">${esc(chosen.report_text || "No report text was recorded for this attempt.")}</pre>`)}
+    ${technicalCard("Structured output", chosen.output == null
+      ? `<div class="muted">No output was recorded for this attempt (the agent raised an error).</div>`
+      : `<div class="json">${jsonTree(chosen.output)}</div>`)}`}`;
 }
 
 $("#agent-detail").addEventListener("click", (e) => {
@@ -1323,83 +1413,27 @@ $("#mem-table").addEventListener("click", (e) => {
 $("#mem-search").addEventListener("change", () => loadMemory());
 $("#mem-refresh").addEventListener("click", () => loadMemory(true));
 
-// --- Model router (FreeLLMAPI in Docker) ---
-
-const ROUTER_LABELS = {
-  running: "Running. The agents can reach their models.",
-  starting: "Starting",
-  stopping: "Stopping",
-  stopped: "Stopped. Start it before you start a run.",
-  idle: "Not running. Start it before you start a run.",
-  error: "Could not start",
-};
-
-async function pollRouter() {
-  let r;
-  try { r = await api("/api/freellmapi"); } catch { return; }
-  const box = $("#router");
-  box.hidden = !r.enabled;
-  if (!r.enabled) return;
-  const state = r.busy ? r.state : (r.healthy ? "running" : r.state === "error" ? "error" : (r.state === "idle" ? "idle" : "stopped"));
-  $("#router-dot").className = `router-dot ${state}`;
-  const label = ROUTER_LABELS[state] || state;
-  $("#router-msg").textContent = r.busy || state === "error" ? `${label}: ${r.message}` : label;
-  $("#router-open").href = r.url;
-  $("#router-open").hidden = !r.healthy;
-  $("#router-start").hidden = r.healthy || r.busy;
-  $("#router-stop").hidden = !r.healthy || r.busy;
-  $("#router-log").textContent = r.log.join("\n");
-}
-
-async function routerAction(action) {
-  try { await postJson(`/api/freellmapi/${action}`); }
-  catch (err) { $("#router-msg").textContent = err.message; return; }
-  pollRouter();
-}
-
-$("#router-start").addEventListener("click", () => routerAction("start"));
-$("#router-stop").addEventListener("click", () => routerAction("stop"));
-
 // --- Start ---
 
 // --- Optional agents: on/off switches for the next run ---
 
-function renderSwitches(agents) {
-  $("#agent-switches").innerHTML = agents.map((a) => `
-    <button type="button" class="switch" role="switch" aria-checked="${a.on}" data-agent="${esc(a.name)}"
-      ${a.available ? "" : "disabled"} title="${esc(a.note || (a.on ? "On: click to turn off" : "Off: click to turn on"))}">
-      <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
-      <span class="switch-name">${esc(a.name)}</span>
-      <span class="switch-state">${a.on ? "On" : "Off"}</span>
-    </button>`).join("");
-  const blocked = agents.filter((a) => a.note).map((a) => `${a.name}: ${a.note}`);
-  $("#agent-switches-note").textContent = ["Changes apply to the next run you start.", ...blocked].join(" ");
+// Optional agents' switches (shown on their pipeline cards), by agent name.
+let switches = {};
+
+function setSwitches(agents) {
+  switches = Object.fromEntries((agents || []).map((a) => [a.name, a]));
 }
 
 async function loadSwitches() {
-  try { renderSwitches((await api("/api/agent-switches")).agents); } catch (err) {
-    $("#agent-switches-note").textContent = `Agent switches unavailable: ${err.message}`;
-  }
+  try { setSwitches((await api("/api/agent-switches")).agents); } catch { switches = {}; }
+  if (status) renderPipeline();
 }
-
-$("#agent-switches").addEventListener("click", async (e) => {
-  const button = e.target.closest("button.switch");
-  if (!button || button.disabled) return;
-  button.disabled = true;
-  try {
-    const on = button.getAttribute("aria-checked") !== "true";
-    renderSwitches((await postJson("/api/agent-switches", { name: button.dataset.agent, on })).agents);
-  } catch (err) {
-    $("#agent-switches-note").textContent = err.message;
-    button.disabled = false;
-  }
-});
 
 loadSwitches();
 
 async function tick() {
   await pollStatus();
-  if (currentView === "overview") await Promise.all([pollConsole(), pollRouter()]);
+  if (currentView === "overview") await pollConsole();
 }
 
 route();

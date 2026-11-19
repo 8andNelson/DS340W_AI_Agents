@@ -62,24 +62,24 @@
       <form class="card prompt" id="prompt-form">
         <label for="topic" class="label">Research topic</label>
         <textarea id="topic" rows="2" maxlength="500" placeholder="e.g. machine learning for detecting credit card fraud"></textarea>
-        <label class="check paper-toggle"><input type="checkbox" id="use-parent-pdf"> Start from my Parent Paper PDF</label>
+        <div class="paper-pick">
+          <button type="button" class="btn" id="pick-pdf">Use my Parent Paper PDF…</button>
+          <input id="parent-pdf" type="file" accept=".pdf,application/pdf" hidden>
+          <span class="muted small" id="pick-pdf-hint">Optional. Skips the paper search and uses your paper (text-based PDF, up to 50 MB).</span>
+        </div>
         <div id="parent-pdf-fields" hidden>
-          <p class="muted small">Skips Intake, Research and paper selection. Reuse the same PDF, title, topic and prediction target for matching inputs. Dataset and modeling decisions still happen during the run.</p>
-          <label for="parent-pdf" class="label">Parent Paper PDF (text-based, up to 50 MB)</label>
-          <input id="parent-pdf" type="file" accept=".pdf,application/pdf">
+          <div class="pdf-chip">
+            <span class="pdf-name" id="pdf-name"></span>
+            <button type="button" class="btn sm ghost" id="pdf-clear">Remove</button>
+          </div>
+          <p class="muted small">Intake, Research and Validation are skipped. Reuse the same PDF, title, topic and prediction target for matching inputs.</p>
           <label for="parent-title" class="label">Title printed on the paper</label>
           <input id="parent-title" type="text" maxlength="500" placeholder="Exact paper title">
           <label for="parent-target" class="label">Prediction target</label>
           <input id="parent-target" type="text" maxlength="400" placeholder="e.g. fraud (separate multiple keywords with commas)">
           <p class="muted small" id="parent-input-status" role="status"></p>
         </div>
-        <div class="agent-switches-block">
-          <span class="label">Optional agents</span>
-          <div class="agent-switches" id="agent-switches" role="group" aria-label="Optional agents"></div>
-          <p class="muted small" id="agent-switches-note">Changes apply to the next run you start.</p>
-        </div>
         <div class="prompt-row">
-          <label class="check"><input type="checkbox" id="reset"> Reset project state first</label>
           <div class="spacer"></div>
           <span class="form-msg" id="form-msg" role="status"></span>
           <button type="button" class="btn ghost danger" id="stop-btn" hidden>Stop run</button>
@@ -87,26 +87,12 @@
         </div>
       </form>
 
-      <div class="card router" id="router" hidden>
-        <div class="router-row">
-          <span class="router-dot" id="router-dot" aria-hidden="true"></span>
-          <div class="router-text">
-            <strong>Model router (FreeLLMAPI)</strong>
-            <span class="muted small" id="router-msg"></span>
-          </div>
-          <div class="spacer"></div>
-          <a class="btn sm ghost" id="router-open" target="_blank" rel="noopener">Open router dashboard</a>
-          <button class="btn sm" id="router-start">Start router</button>
-          <button class="btn sm ghost danger" id="router-stop">Stop router</button>
-        </div>
-        <details class="router-log"><summary>Startup log</summary><pre id="router-log"></pre></details>
-      </div>
-
       <p class="muted small run-note" id="run-note"></p>
       <div class="summary-row" id="summary-row"></div>
 
       <div class="section-head">
         <h2>Pipeline</h2>
+        <span class="muted small" id="pipeline-note"></span>
       </div>
       <div class="pipeline" id="pipeline"></div>
 
@@ -121,7 +107,8 @@
     <section class="view" id="view-agents" hidden>
       <header class="view-head">
         <h1>Agent outputs</h1>
-        <p class="muted">Each agent's attempts in this run: the report it wrote and the structured output the Master Agent checked.</p>
+        <p class="muted">Each agent's attempts in this run: what it did in plain words, the report it wrote and the structured output the Master Agent checked.</p>
+        <label class="check small"><input type="checkbox" id="simple-view" checked> Simple view (technical details folded away)</label>
       </header>
       <div class="split">
         <div class="list" id="agent-list"></div>
@@ -132,7 +119,13 @@
     <!-- Papers -->
     <section class="view" id="view-papers" hidden>
       <header class="view-head">
-        <h1>Papers</h1>
+        <div class="view-head-row">
+          <h1>Papers</h1>
+          <!-- Read when Start run is pressed on the Overview page. -->
+          <label class="check small" title="Clears logs/project_state.json when the next run starts. The run database, memory, caches and files are kept.">
+            <input type="checkbox" id="reset"> Reset project state on the next run
+          </label>
+        </div>
         <p class="muted">The papers this run's Research Agent found, with the Validation Agent's verdicts. Open-access PDFs can be fetched and viewed here.</p>
       </header>
       <div id="papers"></div>
