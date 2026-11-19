@@ -321,6 +321,15 @@ emailed. Find it with
    | **Kilo** | https://app.kilo.ai | `dots3-note-preview`: the Validation and Evaluation Agents |
 
 2. On FreeLLMAPI's **Keys** page, add each key under its provider.
+
+   > **Let every key serve every model.** When you add a key, do not limit
+   > it to some models: leave its **Model scope** empty ("No scope set —
+   > this key serves every model of its provider"). If a key was limited,
+   > open **Edit models** and select everything. Then, on the **Models**
+   > page, select **Enable all** and **Save**, so every model is in the
+   > routing chain. The agents ask FreeLLMAPI for specific models (for
+   > example `gemini-3.6-flash`); a model that a key cannot serve, or that
+   > is turned off, makes those calls fail and fall back to weaker models.
 3. Copy the **unified API key** shown in the header of the Keys page. It
    goes in this repo's `.env` as `FREELLMAPI_API_KEY` (step 5).
 4. Note the full path of the `freellmapi` folder (for example
