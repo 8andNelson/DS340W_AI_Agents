@@ -92,7 +92,8 @@ FREELLMAPI_SMART_MODEL = os.getenv("FREELLMAPI_SMART_MODEL", "auto:smart")
 # A requested model id is strict on FreeLLMAPI -- verified live, a timed-out
 # gemini-3.8-flash returned 502 instead of moving to another model -- so
 # src/llm.py tries the backup itself, then FREELLMAPI_MODEL/SMART_MODEL
-# ("auto") as a last resort so one provider outage cannot halt the pipeline.
+# ("auto", both), then every other agent's models here, so one provider
+# outage cannot halt the pipeline (llm._freellmapi_chain).
 # An agent not listed here uses auto routing directly.
 FREELLMAPI_AGENT_MODELS = {
     "intake_agent":         ("gemini-3.5-flash-lite", "ministral-14b"),      # speed

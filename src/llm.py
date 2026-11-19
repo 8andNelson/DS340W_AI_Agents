@@ -108,11 +108,7 @@ def _chat_once(prompt: str, system: str, timeout: int, model: str, effort: str, 
     if LLM_PROVIDER == "freellmapi":
         if not FREELLMAPI_API_KEY:
             raise EnvironmentError("FREELLMAPI_API_KEY is not set in .env (copy it from FreeLLMAPI's Keys page)")
-        auto_model = FREELLMAPI_SMART_MODEL if effort in HIGH_EFFORT else FREELLMAPI_MODEL
-        if model:
-            chain = [model]
-        else:
-            chain = [m for m in FREELLMAPI_AGENT_MODELS.get(agent, ()) if m] + [auto_model]
+        chain = [model] if model else _freellmapi_chain(agent, effort)
         return _chat_freellmapi_chain(chain, prompt, system, timeout, agent)
     if LLM_PROVIDER == "anthropic":
         return _chat_claude(prompt, system, timeout, model or CLAUDE_MODEL, effort or CLAUDE_EFFORT)
@@ -158,9 +154,10 @@ def last_served_by() -> str:
 
 
 def _record_call(provider: str, requested: str, served_by: str, started: float, usage: dict = None,
-                 agent: str = None, error: str = None) -> None:
+                 agent: str = None, error: str = None, detail: dict = None) -> None:
     """Append one call to CALL_LOG. A failed attempt (error set) is logged
-    too, so a fallback from an agent's primary model stays visible."""
+    too, with the router's reason (detail: error_detail, fallback_trail),
+    so a fallback from an agent's primary model stays visible."""
     if not error:
         _last_call.served_by = served_by
     entry = {
@@ -174,6 +171,10 @@ def _record_call(provider: str, requested: str, served_by: str, started: float, 
     }
     if error:
         entry["error"] = error
+    if detail and detail.get("message"):
+        entry["error_detail"] = detail["message"]
+    if detail and detail.get("fallback_trail"):
+        entry["fallback_trail"] = detail["fallback_trail"]
     run_context.tag(entry)  # the pipeline run in progress, for run metrics
     try:
         with _log_lock:
@@ -272,14 +273,35 @@ def _served_by(response, requested: str) -> str:
         return requested
 
 
+def _freellmapi_chain(agent: str, effort: str) -> list:
+    """The models one FreeLLMAPI call tries, in order: the agent's primary
+    and backup, the auto model for its effort, the other auto model, then
+    every other agent's configured model. A provider outage (live,
+    2026-11-19: Google's 503 "high demand" on both Gemini models, and Groq's
+    token limit on qwen3.8-27b for 8k-token prompts) can take out an
+    agent's primary and backup together, so the call keeps going through
+    more models instead of failing the stage."""
+    if effort in HIGH_EFFORT:
+        autos = [FREELLMAPI_SMART_MODEL, FREELLMAPI_MODEL]
+    else:
+        autos = [FREELLMAPI_MODEL, FREELLMAPI_SMART_MODEL]
+    others = [m for models in FREELLMAPI_AGENT_MODELS.values() for m in models]
+    chain = []
+    for m in list(FREELLMAPI_AGENT_MODELS.get(agent, ())) + autos + others:
+        if m and m not in chain:
+            chain.append(m)
+    return chain
+
+
 def _chat_freellmapi_chain(chain: list, prompt: str, system: str, timeout: int, agent: str = None) -> str:
     """Try each FreeLLMAPI model in order and return the first answer.
 
     A pinned model id is not failed over by the router itself, so a
     timeout, connection error, HTTP error or empty answer moves on to the
     next model here. Every model except the last skips the long 429
-    backoff -- switching to the backup is faster than waiting out a
-    per-minute window. The last model's error is raised if all fail."""
+    backoff -- switching to the next model is faster than waiting out a
+    per-minute window. Each failure is logged with the router's own reason
+    (_error_detail). The last model's error is raised if all fail."""
     for i, model in enumerate(chain):
         is_last = i == len(chain) - 1
         started = time.monotonic()
@@ -289,10 +311,13 @@ def _chat_freellmapi_chain(chain: list, prompt: str, system: str, timeout: int, 
                 rate_limit_retries=RATE_LIMIT_RETRIES if is_last else 0, agent=agent,
             )
         except requests.RequestException as e:
+            detail = _error_detail(e)
+            _record_call("freellmapi", model, "", started, agent=agent, error=_short_error(e), detail=detail)
+            reason = _short_error(e) + (f": {_console_reason(detail['message'])}" if detail.get("message") else "")
             if is_last:
+                print(f"  [LLM] {model} failed for {agent or 'call'} ({reason}); no models left.")
                 raise
-            _record_call("freellmapi", model, "", started, agent=agent, error=_short_error(e))
-            print(f"  [LLM] {model} failed for {agent or 'call'} ({_short_error(e)}); trying {chain[i + 1]}...")
+            print(f"  [LLM] {model} failed for {agent or 'call'} ({reason}); trying {chain[i + 1]}...")
             continue
         if (content and content.strip()) or is_last:
             return content
@@ -304,6 +329,40 @@ def _short_error(e: Exception) -> str:
     if response is not None:
         return f"HTTP {response.status_code}"
     return type(e).__name__
+
+
+ERROR_DETAIL_CHARS = 500
+
+
+def _error_detail(e: Exception) -> dict:
+    """Why a request failed, as the router reported it: its error message
+    (e.g. "... Last error: Google API error 503: This model is currently
+    experiencing high demand ...") and its X-Fallback-Trail header (which
+    provider keys it tried, and how each failed). Empty when the request
+    got no response (timeout, connection error)."""
+    response = getattr(e, "response", None)
+    if response is None:
+        return {"message": str(e)[:ERROR_DETAIL_CHARS]} if str(e) else {}
+    message = ""
+    try:
+        error = response.json().get("error")
+        message = error.get("message", "") if isinstance(error, dict) else str(error or "")
+    except Exception:
+        message = getattr(response, "text", "") or ""
+    detail = {}
+    if isinstance(message, str) and message.strip():
+        detail["message"] = message.strip()[:ERROR_DETAIL_CHARS]
+    trail = (getattr(response, "headers", None) or {}).get("X-Fallback-Trail")
+    if isinstance(trail, str) and trail:
+        detail["fallback_trail"] = trail
+    return detail
+
+
+def _console_reason(message: str, limit: int = 120) -> str:
+    """The useful end of a router error for the console: the text after
+    "Last error:" when the router gives one."""
+    reason = message.rsplit("Last error:", 1)[-1].strip()
+    return reason if len(reason) <= limit else reason[:limit - 3] + "..."
 
 
 def _chat_openai_compatible(provider: str, base_url: str, api_key: str, model: str,
