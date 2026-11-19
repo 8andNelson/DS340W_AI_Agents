@@ -28,7 +28,10 @@
       <a class="btn sm" id="run-card-back" href="#overview" hidden>Back to the current run</a>
     </section>
 
+    <button type="button" class="btn nav-toggle" id="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+
     <nav class="nav" id="nav">
+      <div class="nav-group">This run</div>
       <a href="#overview" data-view="overview">Overview</a>
       <a href="#agents" data-view="agents">Agent outputs</a>
       <a href="#papers" data-view="papers">Papers</a>
@@ -37,6 +40,7 @@
       <a href="#documents" data-view="documents">Documents</a>
       <a href="#report" data-view="report">Report &amp; slides</a>
       <a href="#activity" data-view="activity">Master Agent log</a>
+      <div class="nav-group">All runs</div>
       <a href="#runs" data-view="runs" class="nav-runs">Run history</a>
       <a href="#compare" data-view="compare">Compare runs</a>
       <a href="#memory" data-view="memory">Memory</a>

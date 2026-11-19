@@ -113,7 +113,15 @@ const loaders = {
 // Views that cover every run, not the run being viewed.
 const GLOBAL_VIEWS = ["runs", "compare", "memory"];
 
+$("#nav-toggle").addEventListener("click", () => {
+  const open = !document.body.classList.contains("nav-open");
+  document.body.classList.toggle("nav-open", open);
+  $("#nav-toggle").setAttribute("aria-expanded", String(open));
+});
+
 function route() {
+  document.body.classList.remove("nav-open");
+  $("#nav-toggle").setAttribute("aria-expanded", "false");
   const [view, query] = (location.hash || "#overview").slice(1).split("?");
   const run = new URLSearchParams(query || "").get("run");
   const runChanged = (run || null) !== viewRun;
@@ -204,6 +212,7 @@ function renderRunCard() {
 async function loadDetail() {
   try { detail = await api(withRun("/api/run-detail")); } catch { detail = null; }
   renderSummary();
+  if (status) renderPipeline();
   if (currentView === "agents") renderAgents();
 }
 
@@ -227,7 +236,7 @@ function renderSummary() {
     ["Experiment", s.experiment || "—", s.experiment ? "Against the baseline" : "None yet"],
   ];
   $("#summary-row").innerHTML = tiles.map(([label, value, note]) => `
-    <div class="card tile">
+    <div class="tile">
       <div class="tile-label">${esc(label)}</div>
       <div class="tile-value">${esc(value)}</div>
       <div class="tile-note" title="${esc(note)}">${esc(note)}</div>
@@ -270,10 +279,22 @@ function agentSwitch(name) {
     </button>`;
 }
 
+// The agent's last attempt in plain words (src/dashboard/plain.py), when its outputs are loaded.
+function stageHeadline(name) {
+  const mine = ((detail && detail.attempts) || []).filter((t) => t.agent === name && t.plain);
+  return mine.length ? mine[mine.length - 1].plain.headline : "";
+}
+
+function stageState(a) {
+  if (a.preview) return "preview";
+  if (a.planned) return "planned";
+  return (a.live && a.live.status) || "waiting";
+}
+
 function renderPipeline() {
   const preview = previewingNextRun();
   $("#pipeline-note").textContent = preview ? "Preview of the next run with your PDF." : "";
-  $("#pipeline").innerHTML = pipelineAgents().map((a, i) => {
+  $("#pipeline").innerHTML = `<ol class="track">${pipelineAgents().map((a, i) => {
     const live = a.live || {};
     const attempt = live.attempt ? `Attempt ${live.attempt}${live.max_attempts ? ` of ${live.max_attempts}` : ""}` : "";
     let took = "";
@@ -283,15 +304,25 @@ function renderPipeline() {
       took = `estimated ${duration(live.started_at, live.finished_at)}`;
     else if (live.status === "interrupted") took = "execution duration unknown";
     const meta = [attempt, took].filter(Boolean).join(", ");
+    const busy = ["running", "checking"].includes(live.status);
+    const headline = preview || busy ? "" : stageHeadline(a.name);
+    const state = stageState(a);
+    const opens = !a.planned && !a.preview;
     return `
-      <div class="card agent ${a.planned ? "planned" : ""} ${a.preview ? "preview" : ""} ${live.status === "running" ? "running" : ""}" data-agent="${esc(a.name)}">
-        <div class="agent-top"><span class="step">${i + 1}</span><span class="agent-name">${esc(a.name)}</span>${a.preview ? `<span class="badge">Next run</span>` : agentBadge(a)}</div>
-        <div class="agent-role">${esc(a.role)}</div>
+      <li class="stage ${esc(state)}" data-agent="${esc(a.name)}">
+        <span class="node" aria-hidden="true"></span>
+        <div class="stage-body">
+          <div class="stage-top">
+            ${opens ? `<a class="stage-name" href="${hashFor("agents", viewRun)}" data-open="${esc(a.name)}"><span class="stage-num">${i + 1}</span>${esc(a.name)}</a>`
+              : `<span class="stage-name"><span class="stage-num">${i + 1}</span>${esc(a.name)}</span>`}
+            ${a.preview ? `<span class="badge">Next run</span>` : agentBadge(a)}
+          </div>
+          <p class="stage-text">${esc(headline || a.role)}</p>
+          ${meta ? `<p class="stage-meta">${esc(meta)}</p>` : ""}
+        </div>
         ${agentSwitch(a.name)}
-        ${meta ? `<div class="agent-meta">${esc(meta)}</div>` : ""}
-        ${live.summary ? `<div class="agent-summary">${esc(live.summary)}</div>` : ""}
-      </div>`;
-  }).join("");
+      </li>`;
+  }).join("")}</ol>`;
 }
 
 $("#pipeline").addEventListener("click", async (e) => {
@@ -308,8 +339,9 @@ $("#pipeline").addEventListener("click", async (e) => {
     renderPipeline();
     return;
   }
-  const card = e.target.closest(".agent");
+  const card = e.target.closest(".stage");
   if (!card || card.classList.contains("planned") || card.classList.contains("preview")) return;
+  e.preventDefault();
   selectedAgent = card.dataset.agent;
   location.hash = hashFor("agents", viewRun);
 });
