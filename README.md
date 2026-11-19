@@ -201,18 +201,114 @@ which takes a minute or two. The router listens on `127.0.0.1:3001` only, so
 other computers cannot reach it. Check that it answers:
 
 ```powershell
+# Windows (PowerShell)
 curl.exe http://localhost:3001/api/ping
+```
+
+```bash
+# macOS / Linux
+curl http://localhost:3001/api/ping
 ```
 
 You should see `{"status":"ok",...}`. If not, wait a few seconds, or look
 at the log: `docker compose logs -f freellmapi`.
 
-### 3.4 First visit: account, provider keys, unified key
+### 3.4 First visit: find the setup code and create your account
 
-1. Open http://localhost:3001 in a browser. On the first visit, create the
-   dashboard account (an email and a password). It is stored only in this
-   FreeLLMAPI install.
-2. On the **Keys** page, add free API keys for the providers it lists.
+The FreeLLMAPI dashboard is protected by an account (an email and a
+password). The first time you open it, you create that account. Because the
+router runs inside Docker, the dashboard also asks for a **one-time setup
+code**: a browser on your computer reaches the container through Docker's
+network, so FreeLLMAPI treats it as "another device" and wants proof that
+you are the person running the server.
+
+#### Step 1: Find the setup code in the server's log
+
+When FreeLLMAPI starts and has no account yet, it prints the code in its
+log, like this:
+
+```text
+freellmapi-1  |
+freellmapi-1  |   First-run setup code: K7MP2XQR9D
+freellmapi-1  |   A browser on this machine can finish setup without it. From any
+freellmapi-1  |   other device, enter this code to create the first account.
+freellmapi-1  |
+```
+
+(`K7MP2XQR9D` is an example. Your code is different.)
+
+`docker compose up -d` runs the router **in the background** (`-d` means
+detached), so this text does **not** appear in the terminal where you
+started it. Get it from the log in one of these ways. Run the commands in
+the `freellmapi` folder.
+
+**A. Search the log for the code (recommended):**
+
+```powershell
+# Windows (PowerShell)
+docker compose logs freellmapi | Select-String "setup code"
+```
+
+```bash
+# macOS / Linux
+docker compose logs freellmapi | grep -i "setup code"
+```
+
+You should see one line such as
+`freellmapi-1  |   First-run setup code: K7MP2XQR9D`. The code is the 10
+characters after `First-run setup code:`.
+
+**B. Watch the log live:** `docker compose logs -f freellmapi` shows the
+whole log and keeps it open. Scroll up to the `First-run setup code` line.
+Press `Ctrl+C` to stop watching. This does not stop the router.
+
+**C. Docker Desktop:** open **Containers**, then the `freellmapi` container,
+then its **Logs** tab, and look for `First-run setup code`.
+
+Things to know about the code:
+
+- It has 10 characters: capital letters and the numbers 2–9. It never
+  contains `0`, `O`, `1` or `I`, so you cannot mix them up.
+- **Every start makes a new code.** If FreeLLMAPI restarted (for example
+  after `docker compose down` and `up`, after a computer restart, or when
+  the dashboard started it), use the **last** `First-run setup code` line in
+  the log. An older code no longer works.
+- It works only once. After you create the account, no code is printed
+  again, and the search above finds nothing. That is normal.
+- If the search finds nothing on a new install, the router may not have
+  finished starting. Wait a few seconds and run it again, or check
+  `docker compose ps` (the status should be `Up` and later `healthy`).
+
+#### Step 2: Create your account
+
+1. Open http://localhost:3001 in a browser. The page shows
+   **Create your account**.
+2. **Email:** any valid email address, for example `you@example.com`. It is
+   your login name for this dashboard only. FreeLLMAPI never sends email to
+   it, so it does not have to be a real inbox, but use one you will remember.
+3. **Password:** at least 8 characters. Save it in a password manager.
+4. **Setup code:** paste the code from step 1. Copy it exactly; there are
+   no spaces in it.
+5. Select **Create account**. You are signed in, and the Keys page opens.
+
+The account is stored only in this FreeLLMAPI install, in its Docker volume
+on your computer. Later visits show **Sign in**: use the same email and
+password.
+
+If the page says **A setup code is required to create the first account
+from a remote device**, the code field was empty or the code was old. Find
+the newest code (step 1) and try again.
+
+**Forgot your password?** On the Sign in page, select **Forgot password?**,
+then **Send reset code**. The reset code is written to the server's log, not
+emailed. Find it with
+`docker compose logs freellmapi | Select-String "reset code"`
+(macOS / Linux: `| grep -i "reset code"`). The line reads
+`Password-reset code: ...`; enter that code on the form to set a new password.
+
+#### Step 3: Add provider keys and copy the unified key
+
+1. On the **Keys** page, add free API keys for the providers it lists.
    Each provider's page links to where you sign up. More providers means
    fewer rate-limit stops.
 3. Copy the **unified API key** shown in the header of the Keys page. It
@@ -247,7 +343,8 @@ Do **not** run `docker compose down -v` unless you want to delete all its saved 
 
 FreeLLMAPI's own install guide: https://github.com/tashfeenahmed/freellmapi/blob/main/docs/en/install/01-install.md
 
-Go back to this repo when you are done: `cd ..\DS340W_AI_Agents`
+Go back to this repo when you are done: `cd ..\DS340W_AI_Agents` (Windows) or
+`cd ../DS340W_AI_Agents` (macOS / Linux).
 
 ---
 
@@ -339,7 +436,13 @@ python -c "import src.main, src.dashboard.server, camoufox; print('install OK')"
 Check that FreeLLMAPI answers (if you use it):
 
 ```powershell
+# Windows (PowerShell)
 curl.exe http://localhost:3001/api/ping
+```
+
+```bash
+# macOS / Linux
+curl http://localhost:3001/api/ping
 ```
 
 ---
