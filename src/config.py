@@ -10,6 +10,9 @@ BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 SERPENT_API_KEY = os.getenv("SERPENT_API_KEY", "")  # SerpApi (serpapi.com)
 # Free local browser fallback for blocked public pages; no API key or proxy.
 CAMOUFOX_ENABLED = os.getenv("CAMOUFOX_ENABLED", "true").lower() in ("true", "1", "yes")
+# PyTorch for replication scripts: auto (CUDA build with an NVIDIA GPU, else CPU) | off (always CPU).
+# Read by src/orchestration/hardware.py; listed here with the other settings.
+TORCH_CUDA = os.getenv("TORCH_CUDA", "auto").strip().lower()
 CAMOUFOX_TIMEOUT_SECONDS = max(30, min(300, int(os.getenv("CAMOUFOX_TIMEOUT_SECONDS", "180"))))
 # Slack is off by default: the dashboard shows the same progress. Set
 # SLACK_ENABLED=true (and pip install slack_sdk) to post to Slack as well.

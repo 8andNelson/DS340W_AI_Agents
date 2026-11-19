@@ -25,9 +25,40 @@ This guide takes you from an empty machine to a working copy. Do the steps in or
 | **Python 3.11 or newer** (tested on 3.14) | runs the pipeline | https://www.python.org/downloads/ (Windows: select **"Add python.exe to PATH"**) |
 | **Docker Desktop** | runs FreeLLMAPI and the sandbox for cloned repositories | https://www.docker.com/products/docker-desktop/ |
 | VS Code (optional) | the dashboard's "Open in VS Code" button | https://code.visualstudio.com/ |
+| NVIDIA GPU driver (optional) | lets replication scripts train on an NVIDIA GPU | https://www.nvidia.com/Download/index.aspx |
 
 About 5 GB of free disk space is enough for Docker images, the Camoufox
-browser, and datasets.
+browser, and datasets. With an NVIDIA GPU, allow about 6 GB more for
+PyTorch's CUDA build (see "GPU (optional)" below).
+
+### GPU (optional)
+
+**No NVIDIA GPU? Do nothing.** Everything runs on the CPU, and you do not
+need CUDA. Do not install CUDA or a CUDA build of PyTorch yourself.
+
+PyTorch is not in `requirements.txt` on purpose. pip cannot choose a build by
+hardware, so the Replication Agent installs PyTorch itself, inside each run's
+own environment, only when a script needs it:
+
+| This computer | What the Replication Agent installs |
+|---|---|
+| No NVIDIA GPU | PyTorch's normal CPU build (from PyPI) |
+| NVIDIA GPU with a recent driver | PyTorch's CUDA build from download.pytorch.org (2–3 GB the first time; pip caches it), chosen to match the driver |
+| CUDA install fails | falls back to the CPU build, and says so |
+
+- With an NVIDIA GPU you only need the **driver**. The PyTorch CUDA build
+  includes the CUDA libraries, so do not install the CUDA Toolkit.
+- To skip the CUDA download even with a GPU, set `TORCH_CUDA=off` in `.env`.
+- Scripts choose the device when they run (`cuda` if available, else
+  `cpu`), so a script made on a GPU computer also runs on one without.
+- XGBoost and CatBoost use an NVIDIA GPU without extra installs. TensorFlow
+  cannot use a GPU on native Windows, so neural networks are written in
+  PyTorch where the paper allows it.
+- Replications have no time limit. Before running, the Replication Agent
+  checks this computer's RAM, GPU and disk, and stops early, with the
+  reason, if the paper's method needs more than this computer has. A run
+  that stops working (no CPU, disk, GPU or output for 15 minutes) is
+  stopped as hung.
 
 ---
 

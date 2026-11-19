@@ -72,7 +72,7 @@ def _find_docker_desktop() -> Path | None:
     return next((c for c in candidates if c.is_file()), None)
 
 
-def _docker(args: list, timeout: int, name: str = "") -> dict:
+def _docker(args: list, timeout: int | None, name: str = "") -> dict:
     """Run the docker CLI. Never raises; the same result shape as the
     Replication Agent's _run_bounded. On a timeout the named container is
     removed too -- killing the CLI alone would leave it running."""
@@ -81,6 +81,14 @@ def _docker(args: list, timeout: int, name: str = "") -> dict:
     if not docker:
         return {"exit_code": None, "stdout": "", "stderr": "The docker command was not found.",
                 "duration_seconds": 0.0, "timed_out": False}
+    if timeout is None:
+        # No time limit (a repository's run): stopped only if it hangs.
+        from src.orchestration import watchdog
+        return watchdog.run([docker, *args], env=repo_review.child_environment(), label="Sandbox",
+                            progress=watchdog.docker_progress(docker, name) if name else None,
+                            on_kill=(lambda: subprocess.run([docker, "rm", "-f", name], capture_output=True,
+                                                            timeout=60, **_no_window())) if name else None,
+                            popen_kwargs=_no_window())
     try:
         proc = subprocess.run([docker, *args], capture_output=True, text=True, timeout=timeout, encoding="utf-8",
                               errors="replace", stdin=subprocess.DEVNULL, env=repo_review.child_environment(),

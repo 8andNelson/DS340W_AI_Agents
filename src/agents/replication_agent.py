@@ -68,7 +68,7 @@ import pandas as pd
 from src import llm
 from src.agents.evaluation_agent import METRIC_LINE_FORMAT, paper_metric_names, parse_metric_lines
 from src.search import paper_fulltext
-from src.orchestration import repo_dependencies, repo_review, sandbox, venv_paths
+from src.orchestration import hardware, repo_dependencies, repo_review, sandbox, venv_paths, watchdog
 from src.orchestration.handoff import request as handoff_request
 
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -76,7 +76,11 @@ REPLICATION_DIR = REPO_ROOT / "replication"
 
 VENV_TIMEOUT_SECONDS = 120
 INSTALL_TIMEOUT_SECONDS = 600
-REPLICATION_TIMEOUT_SECONDS = 1800
+TORCH_INSTALL_TIMEOUT_SECONDS = 3600  # PyTorch's CUDA build is a 2-3 GB download (pip caches it afterwards)
+# No time limit on running a replication (user's rule, 2026-11-18): if the
+# Parent Paper's method needs hours, it gets them. What can stop a run is the
+# computer itself, checked before the run (src/orchestration/hardware.py).
+REPLICATION_TIMEOUT_SECONDS = None
 README_CHAR_LIMIT = 6000
 # Free-model scripts often need more than one fix (an import, then a
 # column name, then a dtype), so a reconstruction gets 3 repairs.
@@ -130,6 +134,10 @@ _RESULT_DEFAULTS = {
     "commit_sha": "",
     "replication_dir": "",
     "venv_dir": "",               # reconstructed baseline's venv (src/orchestration/venv_paths.py)
+    "stop_early": False,          # True: this computer cannot run it; Master Agent does not retry
+    "torch": {},                  # PyTorch build and whether it can use the GPU (_install_torch)
+    "hardware": {},               # this computer (src/orchestration/hardware.py)
+    "resources": {},              # what the script needs, by the model's estimate
     "entry_point": "",
     "entry_point_source": "",      # "convention" | "readme_llm" | "generated"
     "command": None,
@@ -160,6 +168,20 @@ _PATH_TOO_LONG_WARNING = (
     "Clone the project into a shorter folder (for example C:\\dev\\DS340W_AI_Agents).")
 
 
+def _hung_warning(run_result: dict) -> str:
+    minutes = round((run_result.get("stalled_seconds") or watchdog.STALL_SECONDS) / 60)
+    return (f"The run hung: it did no work for {minutes} minutes (no CPU, disk, GPU or output), so it was stopped "
+            f"after {round((run_result.get('duration_seconds') or 0) / 60)} minutes in total. A slow run is never "
+            "stopped; this one had stopped working (for example a deadlock, or a worker waiting forever).")
+
+
+def _number(value) -> float | None:
+    try:
+        return float(value) if value is not None and not isinstance(value, bool) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _default_result(**overrides) -> dict:
     result = dict(_RESULT_DEFAULTS)
     result.update(overrides)
@@ -187,9 +209,11 @@ def data_env(split: dict) -> dict:
     return {var: str((split or {}).get(key, "")) for var, key in DATA_ENV_VARS.items() if (split or {}).get(key)}
 
 
-def _run_bounded(cmd: list, cwd: Path = None, timeout: int = REPLICATION_TIMEOUT_SECONDS, env: dict = None) -> dict:
-    """Run cmd (always an argv list, never a shell string) with a bounded
-    timeout, capturing output. Never raises -- every outcome (success,
+def _run_bounded(cmd: list, cwd: Path = None, timeout: int | None = REPLICATION_TIMEOUT_SECONDS,
+                 env: dict = None) -> dict:
+    """Run cmd (always an argv list, never a shell string), capturing output.
+    timeout=None (a replication run) has no limit; installs and helper
+    commands pass their own. Never raises -- every outcome (success,
     non-zero exit, timeout, or a launch failure) comes back as the same
     dict shape so callers don't need a try/except of their own.
 
@@ -200,6 +224,9 @@ def _run_bounded(cmd: list, cwd: Path = None, timeout: int = REPLICATION_TIMEOUT
     running a setup.py, or an LLM-written script."""
     start = time.monotonic()
     child_env = repo_review.child_environment({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", **(env or {})})
+    if timeout is None:
+        # No time limit: the watchdog runs it to the end and stops it only if it hangs.
+        return watchdog.run(cmd, cwd=str(cwd) if cwd else None, env=child_env, label="Replication Agent")
     try:
         proc = subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, timeout=timeout,
@@ -776,6 +803,8 @@ def _run_in_sandbox(box, paper_title, repo_url, slug_dir, repo_dir, review, clea
                   exit_code=run_result["exit_code"], stdout_path=stdout_path, stderr_path=stderr_path,
                   duration_seconds=run_result["duration_seconds"], pip_freeze_path=str(pip_freeze_path),
                   modifications=modifications, sandbox=box_info)
+    if run_result.get("hung"):
+        return failed("The repository's run hung.", _hung_warning(run_result), status="HUNG", **result)
     if run_result["timed_out"]:
         return failed("The repository's run timed out.",
                       f"No result within {REPLICATION_TIMEOUT_SECONDS}s.", status="TIMEOUT", **result)
@@ -830,9 +859,17 @@ _SCRIPT_REQUIREMENTS = """Requirements for the script:
 - Remove from the features: the target, '_source_dataset', and identifier-like columns (row ids,
   unique per row, names, free text). Encode categorical columns and handle missing values.
 - Fit on train, evaluate on test. Use random_state=42 everywhere randomness exists.
-- It must finish in under 20 minutes on a CPU-only laptop. If the method cannot train on the full
-  training set in that time, train on a stratified subsample and say so with an "# INFERRED:"
-  comment and a printed line starting "NOTE:".
+- There is no time limit: keep the paper's method and its stated settings (models, epochs, folds,
+  data size). Do not shrink them to save time. Use every speed-up that keeps the method the same:
+  n_jobs=-1 for scikit-learn and imbalanced-learn estimators that support it, tree_method="hist"
+  and n_jobs=-1 for XGBoost, the GPU where a library can use it on this computer (see "GPU use"
+  below), float32 inputs for neural networks, and no repeated work.
+- Choose the device when the script runs; never hard-code it, so the script also runs on a computer
+  without a GPU. os.environ["REPLICATION_GPU"] is "1" when this computer has an NVIDIA GPU, else "0".
+  Use GPU options (XGBoost device="cuda", CatBoost task_type="GPU") only when it is "1"; in PyTorch
+  use device = "cuda" if torch.cuda.is_available() else "cpu".
+- This computer: {hardware}. If the method needs more than this computer has (memory, a GPU
+  it cannot do without, disk), do not change the method: say so in "resources".
 - Print each final test-set metric on its own line in exactly this form: {metric_format}
   with the value as a fraction between 0 and 1, e.g. "METRIC accuracy=0.9871".
   Print at least accuracy, precision, recall and f1 (for the positive class), plus roc_auc when the
@@ -845,7 +882,18 @@ _SCRIPT_REQUIREMENTS = """Requirements for the script:
 def _script_requirements() -> str:
     return _SCRIPT_REQUIREMENTS.format(
         metric_format=METRIC_LINE_FORMAT, libraries=", ".join(sorted(DEPENDENCY_ALLOWLIST)),
+        hardware=hardware.describe(_hardware()),
     )
+
+
+_HARDWARE: dict = {}
+
+
+def _hardware() -> dict:
+    """This computer's profile, read once per process."""
+    if not _HARDWARE:
+        _HARDWARE.update(hardware.profile(REPLICATION_DIR))
+    return _HARDWARE
 
 
 def _paper_section(paper: dict) -> str:
@@ -877,8 +925,10 @@ def _parse_generation(content: str) -> dict:
     meta = meta if isinstance(meta, dict) else {}
     assumptions = meta.get("inferred_assumptions") or []
     libraries = meta.get("libraries_required") or []
+    resources = meta.get("resources") if isinstance(meta.get("resources"), dict) else {}
     return {
         "code": code,
+        "resources": resources,
         "inferred_assumptions": [str(a) for a in assumptions] if isinstance(assumptions, list) else [],
         "libraries_required": [str(l) for l in libraries] if isinstance(libraries, list) else [],
         # A router (FreeLLMAPI) may serve each call from a different model;
@@ -936,7 +986,11 @@ or stop training early.
 
 Respond with exactly two fenced blocks and nothing else. First, a JSON block:
 ```json
-{{"inferred_assumptions": ["<one sentence per detail you inferred while fixing>"], "libraries_required": ["<pip package name>"]}}
+{{"inferred_assumptions": ["<one sentence per detail you inferred while fixing>"], "libraries_required": ["<pip package name>"],
+ "resources": {{"estimated_ram_gb": <number>, "needs_gpu": <true only if the method cannot run without one>,
+               "gpu_reason": "<why, or empty>", "gpu_library": "<the library that needs it, or empty>",
+               "estimated_disk_gb": <number>,
+               "estimated_hours": <number, on this computer>}}}}
 ```
 Then the full revised script:
 ```python
@@ -973,7 +1027,11 @@ Write a single, self-contained Python training script that implements the method
 
 Respond with exactly two fenced blocks and nothing else. First, a JSON block:
 ```json
-{{"inferred_assumptions": ["<one sentence per inferred detail>"], "libraries_required": ["<pip package name>"]}}
+{{"inferred_assumptions": ["<one sentence per inferred detail>"], "libraries_required": ["<pip package name>"],
+ "resources": {{"estimated_ram_gb": <number>, "needs_gpu": <true only if the method cannot run without one>,
+               "gpu_reason": "<why, or empty>", "gpu_library": "<the library that needs it, or empty>",
+               "estimated_disk_gb": <number>,
+               "estimated_hours": <number, on this computer>}}}}
 ```
 Then the full script:
 ```python
@@ -1046,6 +1104,33 @@ Respond with the full fixed script in one fenced block and nothing else:
         print(f"[Replication Agent] Repair call failed: {e}")
         return ""
     return llm.parse_code(content)
+
+
+def _install_torch(venv_dir: Path, cwd: Path, hw: dict) -> dict:
+    """Install PyTorch: its CUDA build when this computer has an NVIDIA GPU
+    whose driver fits one (hardware.torch_cuda_index), else PyPI's. The CUDA
+    build comes only from PyTorch's own index (--index-url, for torch alone:
+    no other package can come from there). Then torch itself says whether it
+    can use the GPU. Returns {"installed", "build", "cuda_available", "note"}."""
+    index = hardware.torch_cuda_index(hw)
+    note = ""
+    if index:
+        print(f"[Replication Agent] Installing PyTorch's CUDA build from {index} (a large download the first time)...")
+        result = _run_bounded([str(_venv_pip(venv_dir)), "install", "torch", "--index-url", index], cwd=cwd,
+                              timeout=TORCH_INSTALL_TIMEOUT_SECONDS)
+        if result["exit_code"] != 0:
+            note = (f"PyTorch's CUDA build could not be installed from {index}; the CPU build from PyPI is used. "
+                    f"{(result.get('stderr') or '').strip().splitlines()[-1:] or ''}")
+            index = ""
+    if not index and _pip_install(venv_dir, cwd, ["install", "torch"])["exit_code"] != 0:
+        return {"installed": False, "build": "", "cuda_available": False, "note": note or "torch could not be installed."}
+    probe = _run_bounded([str(_venv_python(venv_dir)), "-c",
+                          "import torch; print(torch.__version__, torch.cuda.is_available())"], timeout=300)
+    version, _, available = (probe.get("stdout") or "").strip().partition(" ")
+    cuda = available.strip() == "True"
+    if index and not cuda:
+        note = (note + " " if note else "") + "PyTorch's CUDA build is installed, but it cannot use the GPU here."
+    return {"installed": True, "build": version or "unknown", "cuda_available": cuda, "note": note.strip()}
 
 
 def _install_libraries(venv_dir: Path, cwd: Path, libraries: list) -> tuple:
@@ -1133,6 +1218,27 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
         )
     generated["inferred_assumptions"] = previous_assumptions + generated.get("inferred_assumptions", [])
 
+    hw = _hardware()
+    resources = generated.get("resources") or {}
+    cannot = hardware.feasibility(resources, hw, cleaning_result)
+    if cannot:
+        recon_dir.mkdir(parents=True, exist_ok=True)
+        (recon_dir / "train.py").write_text(generated["code"], encoding="utf-8")  # kept for the record
+        reason = "; ".join(cannot)
+        print(f"[Replication Agent] Stopping early: this computer cannot run the Parent Paper's method: {reason}. "
+              f"This computer: {hardware.describe(hw)}.")
+        return _default_result(
+            status="INFEASIBLE", source="reconstructed", replication_dir=str(slug_dir),
+            paper_text_status=paper.get("status", ""), revision_round=revision_round,
+            revision_instructions=instructions, inferred_assumptions=generated.get("inferred_assumptions", []),
+            warnings=warnings + [f"Not run: this computer cannot run the Parent Paper's method: {reason}."],
+            notes=f"Stopped early before running. This computer: {hardware.describe(hw)}.",
+            stop_early=True, hardware=hw, resources=resources, generated_by=[generated.get("generated_by") or ""],
+        )
+    if _number(resources.get("estimated_hours")):
+        print(f"[Replication Agent] The script's own estimate: about {resources['estimated_hours']} hour(s) on "
+              "this computer. There is no time limit.")
+
     requested_libs = set(generated.get("libraries_required") or [])
     rejected_libs = sorted(requested_libs - DEPENDENCY_ALLOWLIST)
     if rejected_libs:
@@ -1154,8 +1260,19 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
             notes="Could not create an isolated environment for the reconstructed script.",
         )
 
+    torch_info = {}
+    if "torch" in libraries:
+        # First, so the other installs keep this build (and use the GPU when there is one).
+        torch_info = _install_torch(venv_dir, recon_dir, hw)
+        libraries = [lib for lib in libraries if lib != "torch"]
+        if torch_info.get("note"):
+            warnings.append(torch_info["note"])
+        print(f"[Replication Agent] PyTorch {torch_info.get('build') or 'not installed'}; "
+              f"GPU available: {torch_info.get('cuda_available')}.")
     print(f"[Replication Agent] Installing {', '.join(libraries)} into {venv_dir}...")
     installed_libs, failed_libs = _install_libraries(venv_dir, recon_dir, libraries)
+    if torch_info:
+        (installed_libs if torch_info.get("installed") else failed_libs).append("torch")
     if failed_libs:
         warnings.append(f"Could not install: {', '.join(failed_libs)}.")
 
@@ -1164,7 +1281,8 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
 
     script_path = recon_dir / "train.py"
     command = [str(_venv_python(venv_dir)), str(script_path)]
-    env = data_env(cleaning_result)
+    # The script picks its device from this, so it never hard-codes a GPU.
+    env = {**data_env(cleaning_result), "REPLICATION_GPU": "1" if hardware.has_gpu(hw) else "0"}
     code = generated["code"]
     attempts = 0
     run_result = None
@@ -1188,6 +1306,10 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
             # (judged now, before any repair can make the attempt pass).
             from src.memory import learning
             learning.report_fast_mode_failure(generated.get("fast_mode_usage_id"), generated["fast_mode_from"])
+        if run_result.get("hung"):
+            # Not a code error a repair can see: Master Agent diagnoses it.
+            warnings.append(_hung_warning(run_result))
+            break
         if run_result["timed_out"] or (run_result["exit_code"] == 0 and metrics):
             break
         if run_result["exit_code"] == 0:
@@ -1219,10 +1341,15 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
         "Venv": f"{venv_dir} (deleted when the run ends; pip_freeze.txt lists its packages)",
         "Data environment": ", ".join(f"{k}={v}" for k, v in env.items()) or "none",
         "Libraries installed": ", ".join(installed_libs) or "none",
+        "PyTorch": (f"{torch_info.get('build')}, GPU available: {torch_info.get('cuda_available')}"
+                    if torch_info else "not used"),
+        "This computer": hardware.describe(hw),
         "Script generated/repaired by (in order)": ", ".join(generated_by) or "unknown",
     })
 
-    if run_result["timed_out"]:
+    if run_result.get("hung"):
+        status = "HUNG"
+    elif run_result["timed_out"]:
         status = "TIMEOUT"
     elif run_result["exit_code"] == 0 and metrics:
         status = "OK"
@@ -1243,7 +1370,8 @@ def _replicate_by_reconstruction(parent_paper: dict, cleaning_result: dict, revi
         exit_code=run_result["exit_code"], stdout_path=stdout_path, stderr_path=stderr_path,
         duration_seconds=run_result["duration_seconds"], pip_freeze_path=str(pip_freeze_path),
         inferred_assumptions=generated.get("inferred_assumptions", []), warnings=warnings,
-        notes=f"Repair attempts: {attempts}.", generated_by=generated_by,
+        notes=f"Repair attempts: {attempts}.", generated_by=generated_by, hardware=hw, resources=resources,
+        torch=torch_info,
         paper_text_status=paper.get("status", ""), revision_round=revision_round,
         revision_instructions=instructions, fast_mode_from=generated.get("fast_mode_from"),
     )

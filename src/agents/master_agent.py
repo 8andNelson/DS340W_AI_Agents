@@ -887,7 +887,10 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
             _print_entry(b)
         _append_log(blockers)
 
-        if attempt < last:
+        # A stage that says a retry cannot help (e.g. this computer cannot run
+        # the Parent Paper's method) stops here, with its reason.
+        stop_early = isinstance(output, dict) and output.get("stop_early") is True
+        if attempt < last and not stop_early:
             diagnosis = _diagnose(agent_name, attempt, failure, report_text, notes)
             notes.append(diagnosis["note"])
             report_text += (f"\n\n--- Master Agent diagnosis ---\nCause: {diagnosis['cause']}\n"
@@ -917,13 +920,17 @@ def _supervise(agent_name: str, run_fn, checker_fn, report_fn, max_attempts: int
                            memory=_memory_check(agent_name, inv))
             final = _log_entry(
                 "Correction", agent_name,
-                f"{agent_name} still failing after {max_attempts} error(s), each diagnosed and retried. "
-                f"See the issues above and the reports in {REPORT_DIR}.",
+                (f"{agent_name} stopped early and was not retried, since a retry cannot change this: "
+                 + "; ".join(output.get("warnings") or []) if stop_early else
+                 f"{agent_name} still failing after {max_attempts} error(s), each diagnosed and retried. ")
+                + f" See the reports in {REPORT_DIR}.",
                 "Rejected",
                 final_next,
             )
             _print_entry(final)
             _append_log([final])
+            if stop_early:
+                break
 
     run_context.end_invocation()
     return output, blockers

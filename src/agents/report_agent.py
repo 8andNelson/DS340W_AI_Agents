@@ -716,6 +716,9 @@ def render(facts: dict, sections: dict, removed: list, figures: dict, prose_erro
         known.append("The data was subsampled to the local row budget.")
     if rep["source"] != "cloned_repository":
         known.append("The baseline is a reconstruction from the paper, not the authors' code.")
+    if rep.get("status") == "INFEASIBLE":
+        known.append("The baseline was not run: this computer cannot run the Parent Paper's method ("
+                     + "; ".join(rep.get("warnings") or ["reason not recorded"]) + ").")
     if parent["paper_text_status"] == "ABSTRACT_ONLY":
         known.append("Only the Parent Paper's abstract and metadata could be read, not its full text.")
     if lit["verified_count"] < lit["count"]:

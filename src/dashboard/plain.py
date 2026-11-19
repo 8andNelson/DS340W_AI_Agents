@@ -208,6 +208,13 @@ def _code(o: dict) -> dict:
 
 
 def _replication(o: dict) -> dict:
+    if o.get("status") == "INFEASIBLE":
+        # Stopped before running: this computer cannot run the paper's method.
+        return {"headline": "This computer cannot run the paper's method",
+                "points": [_first_sentence(w, 400) for w in (o.get("warnings") or [])[-1:]]
+                + [_first_sentence(o.get("notes"), 300)],
+                "next": "The run goes on without a baseline, and the report says why. A more powerful computer "
+                        "(more memory, or a GPU) could run it."}
     source = ("the authors' own code" if o.get("source") == "cloned_repository"
               else "code rebuilt from the paper's description")
     ok = o.get("status") == "OK"

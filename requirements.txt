@@ -1,3 +1,6 @@
+# The project's own packages (agents, dashboard). PyTorch is not listed on purpose:
+# the Replication Agent installs it per run, as the CUDA build with an NVIDIA GPU or
+# the CPU build without one (see README, "GPU (optional)"). No GPU: nothing to do.
 anthropic
 python-dotenv
 requests
@@ -6,6 +9,7 @@ beautifulsoup4
 pandas
 pyarrow
 pypdf
+psutil
 flask
 psycopg[binary]==3.3.9
 python-pptx==1.0.2
