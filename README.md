@@ -262,6 +262,8 @@ Useful optional settings:
 - `MEMORY_CONTRIBUTOR=<your short name>`: recorded with each run's metrics.
 - `MEMORY_BACKEND=sqlite` (default, local only), `postgres` (the team's
   hosted store; needs `MEMORY_DATABASE_URL` from the team), or `off`.
+  To join or create the team's PostgreSQL database, see
+  [docs/MEMORY_DATABASE_SETUP.md](docs/MEMORY_DATABASE_SETUP.md).
 - `AGENTS_OFF=experiment,report,presentation`: skip optional agents for a faster test run.
 - `CAMOUFOX_ENABLED=false`: turn off the browser fallback.
 
@@ -430,4 +432,5 @@ be verified stays `UNVERIFIED`.
 ### Project documentation
 
 - `docs/PROJECT_STATUS.md`: what is built and what is open
+- `docs/MEMORY_DATABASE_SETUP.md`: set up or join the shared PostgreSQL memory database
 - `docs/CLAUDE_BACKEND_PLAN.md`: memory and metrics design
