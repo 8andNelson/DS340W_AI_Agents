@@ -24,6 +24,7 @@ This guide takes you from an empty machine to a working copy. Do the steps in or
 | **Git** | clone this repo and FreeLLMAPI | https://git-scm.com/downloads |
 | **Python 3.11 or newer** (tested on 3.14) | runs the pipeline | https://www.python.org/downloads/ (Windows: select **"Add python.exe to PATH"**) |
 | **Docker Desktop** | runs FreeLLMAPI and the sandbox for cloned repositories | https://www.docker.com/products/docker-desktop/ |
+| **FreeLLMAPI** | free LLM router: pools many providers' free tiers (set up in [step 3](#3-set-up-freellmapi-free-llm-router)) | https://github.com/tashfeenahmed/freellmapi |
 | VS Code (optional) | the dashboard's "Open in VS Code" button | https://code.visualstudio.com/ |
 | NVIDIA GPU driver (optional) | lets replication scripts train on an NVIDIA GPU | https://www.nvidia.com/Download/index.aspx |
 
@@ -138,38 +139,74 @@ OpenAI-compatible router. It pools the free tiers of many LLM providers and
 switches to another provider on rate limits. This is the recommended
 provider for full runs, because one run makes many LLM calls.
 
-Clone it **outside** this repo (for example next to it), then make its
-`.env` with an encryption key and start it.
+FreeLLMAPI is a separate project with its own repository. You need Git
+and Docker Desktop (steps 0 and 1); you do not need Node.js, because it
+runs as a ready-made Docker image.
 
-**Windows (PowerShell):**
+### 3.1 Pull the FreeLLMAPI repository
+
+Clone it **outside** this repo, for example next to it. Start from this
+repo's folder:
 
 ```powershell
 cd ..
 git clone https://github.com/tashfeenahmed/freellmapi.git
 cd freellmapi
+```
+
+You now have a `freellmapi` folder next to `DS340W_AI_Agents`. The clone
+holds its `docker-compose.yml`, which is all Docker needs.
+
+### 3.2 Make its `.env` file
+
+FreeLLMAPI encrypts the provider keys you give it, so its `.env` needs an
+`ENCRYPTION_KEY` (64 random hex characters). Run this **in the `freellmapi`
+folder**. This `.env` is FreeLLMAPI's own file; it is not this repo's `.env`.
+
+**Windows (PowerShell):**
+
+```powershell
 $Bytes = New-Object Byte[] 32
 [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($Bytes)
 $KEY = -join ($Bytes | ForEach-Object { "{0:x2}" -f $_ })
 [IO.File]::WriteAllText("$PWD\.env", "ENCRYPTION_KEY=$KEY`nPORT=3001`n")
-docker compose up -d
 ```
 
 (`WriteAllText` writes the file without a byte-order mark, so the first
-variable is read correctly.)
+variable is read correctly. `Out-File -Encoding utf8` in Windows PowerShell
+adds one, and then `ENCRYPTION_KEY` is not found.)
 
 **macOS / Linux:**
 
 ```bash
-cd ..
-git clone https://github.com/tashfeenahmed/freellmapi.git
-cd freellmapi
 printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$(openssl rand -hex 32)" > .env
+```
+
+Keep this key. If it changes, FreeLLMAPI can no longer read the provider
+keys it stored.
+
+### 3.3 Start it
+
+```powershell
 docker compose up -d
 ```
 
-Then:
+The first start downloads the image (`ghcr.io/tashfeenahmed/freellmapi:latest`),
+which takes a minute or two. The router listens on `127.0.0.1:3001` only, so
+other computers cannot reach it. Check that it answers:
 
-1. Open http://localhost:3001 in a browser.
+```powershell
+curl.exe http://localhost:3001/api/ping
+```
+
+You should see `{"status":"ok",...}`. If not, wait a few seconds, or look
+at the log: `docker compose logs -f freellmapi`.
+
+### 3.4 First visit: account, provider keys, unified key
+
+1. Open http://localhost:3001 in a browser. On the first visit, create the
+   dashboard account (an email and a password). It is stored only in this
+   FreeLLMAPI install.
 2. On the **Keys** page, add free API keys for the providers it lists.
    Each provider's page links to where you sign up. More providers means
    fewer rate-limit stops.
@@ -179,17 +216,31 @@ Then:
    `C:\Users\you\Desktop\freellmapi`). It goes in `.env` as
    `FREELLMAPI_COMPOSE_DIR`, so the dashboard can start and stop the router for you.
 
-Useful commands (run in the `freellmapi` folder):
+### 3.5 Daily use and updates
+
+Run these in the `freellmapi` folder:
 
 ```powershell
 docker compose ps                   # is it running?
 docker compose logs -f freellmapi   # server log
 docker compose down                 # stop it (keeps your keys)
+docker compose up -d                # start it again
+```
+
+With `FREELLMAPI_COMPOSE_DIR` set, the dashboard (step 7) starts the router
+for you, so you rarely need these.
+
+To update FreeLLMAPI to its newest version (your keys and `.env` are kept):
+
+```powershell
+git pull
+docker compose pull
+docker compose up -d
 ```
 
 Do **not** run `docker compose down -v` unless you want to delete all its saved keys.
 
-Install guide: https://github.com/tashfeenahmed/freellmapi/blob/main/docs/en/install/01-install.md
+FreeLLMAPI's own install guide: https://github.com/tashfeenahmed/freellmapi/blob/main/docs/en/install/01-install.md
 
 Go back to this repo when you are done: `cd ..\DS340W_AI_Agents`
 
