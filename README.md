@@ -308,9 +308,19 @@ emailed. Find it with
 
 #### Step 3: Add provider keys and copy the unified key
 
-1. On the **Keys** page, add free API keys for the providers it lists.
-   Each provider's page links to where you sign up. More providers means
-   fewer rate-limit stops.
+1. Sign up for these four providers and create a free API key on each. They
+   serve the models the agents use (`FREELLMAPI_AGENT_MODELS` in
+   `src/config.py`), and almost all of this project's calls. You do not need
+   the other providers FreeLLMAPI lists.
+
+   | Provider | Get a key | What the agents use it for |
+   |---|---|---|
+   | **Google AI Studio** (Gemini) | https://aistudio.google.com/apikey | `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.7-flash`: the main model of most agents |
+   | **NVIDIA** | https://build.nvidia.com/settings/api-keys | most `auto` / `auto:smart` calls: Master Agent and the fallback when other models are down |
+   | **Groq** | https://console.groq.com/keys | `qwen3.8-27b`: the Cleaning and Experiment Agents, and a backup for others |
+   | **Kilo** | https://app.kilo.ai | `dots3-note-preview`: the Validation and Evaluation Agents |
+
+2. On FreeLLMAPI's **Keys** page, add each key under its provider.
 3. Copy the **unified API key** shown in the header of the Keys page. It
    goes in this repo's `.env` as `FREELLMAPI_API_KEY` (step 5).
 4. Note the full path of the `freellmapi` folder (for example
